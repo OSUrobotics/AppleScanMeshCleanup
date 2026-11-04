@@ -1,0 +1,83 @@
+<!DOCTYPE FilterScript>
+<FilterScript>
+ <filter name="Merge Close Vertices">
+  <Param type="RichAbsPerc" name="Threshold" tooltip="All the vertices that closer than this threshold are merged together. Use very small values, default values is 1/10000 of bounding box diagonal. " value="0.011927" min="0" max="1.19275" description="Merging distance"/>
+ </filter>
+ <filter name="Remove T-Vertices">
+  <Param type="RichEnum" enum_val0="Edge Collapse" enum_val1="Edge Flip" enum_cardinality="2" name="method" tooltip="Selects whether to remove t-vertices by edge collapse or edge flip." value="0" description="Method"/>
+  <Param type="RichFloat" name="Threshold" tooltip="Detects faces where the base/height ratio is lower than this value" value="40" description="Ratio"/>
+  <Param type="RichBool" name="Repeat" tooltip="Iterates the algorithm until it reaches convergence" value="true" description="Iterate until convergence"/>
+ </filter>
+ <filter name="Repair non Manifold Vertices by splitting">
+  <Param type="RichFloat" name="VertDispRatio" tooltip="This parameter denote the ratio ⍺ of displacement of a vertex. When a vertex &lt;i>v&lt;/i> is split, it is moved towards the barycenter &lt;i>b&lt;/i> of the FF connected faces sharing it of a (&lt;i>v&lt;/i>-&lt;i>b&lt;/i>)*⍺. When ⍺ is zero vertex is not displaced. When ⍺ is 0.5 the new vertex is half away toward the barycenter of the face. Reasonable values are in the [0 .. 0.1] range." value="0" description="Vertex Displacement Ratio"/>
+ </filter>
+ <filter name="Repair non Manifold Edges">
+  <Param type="RichEnum" enum_val0="Remove Faces" enum_val1="Split Vertices" enum_cardinality="2" name="method" tooltip="Selects whether to remove non manifold edges by removing faces or by splitting vertices." value="0" description="Method"/>
+ </filter>
+ <filter name="Remove Zero Area Faces"/>
+ <filter name="Remove Isolated pieces (wrt Diameter)">
+  <Param type="RichAbsPerc" name="MinComponentDiag" tooltip="Delete all the connected components (floating pieces) with a diameter smaller than the specified one" value="11.9275" min="0" max="119.275" description="Enter max diameter of isolated pieces"/>
+  <Param type="RichBool" name="removeUnref" tooltip="if true, the unreferenced vertices remaining after the face deletion are removed." value="true" description="Remove unfreferenced vertices"/>
+ </filter>
+ <filter name="Remove Isolated Folded Faces by Edge Flip"/>
+ <filter name="Remove Duplicate Vertices"/>
+ <filter name="Remove Duplicate Faces"/>
+ <filter name="Merge Close Vertices">
+  <Param type="RichAbsPerc" name="Threshold" tooltip="All the vertices that closer than this threshold are merged together. Use very small values, default values is 1/10000 of bounding box diagonal. " value="0.011927" min="0" max="1.19275" description="Merging distance"/>
+ </filter>
+ <filter name="Repair non Manifold Edges">
+  <Param type="RichEnum" enum_val0="Remove Faces" enum_val1="Split Vertices" enum_cardinality="2" name="method" tooltip="Selects whether to remove non manifold edges by removing faces or by splitting vertices." value="0" description="Method"/>
+ </filter>
+ <filter name="Simplification: Quadric Edge Collapse Decimation (with texture)">
+  <Param type="RichInt" name="TargetFaceNum" tooltip="" value="1302345" description="Target number of faces"/>
+  <Param type="RichFloat" name="TargetPerc" tooltip="If non zero, this parameter specifies the desired final size of the mesh as a percentage of the initial mesh." value="0.1" description="Percentage reduction (0..1)"/>
+  <Param type="RichFloat" name="QualityThr" tooltip="Quality threshold for penalizing bad shaped faces.&lt;br>The value is in the range [0..1]&#xa; 0 accept any kind of face (no penalties),&#xa; 0.5  penalize faces with quality &lt; 0.5, proportionally to their shape&#xa;" value="0.3" description="Quality threshold"/>
+  <Param type="RichFloat" name="Extratcoordw" tooltip="Additional weight for each extra Texture Coordinates for every (selected) vertex" value="1" description="Texture Weight"/>
+  <Param type="RichBool" name="PreserveBoundary" tooltip="The simplification process tries not to destroy mesh boundaries" value="false" description="Preserve Boundary of the mesh"/>
+  <Param type="RichFloat" name="BoundaryWeight" tooltip="The importance of the boundary during simplification. Default (1.0) means that the boundary has the same importance of the rest. Values greater than 1.0 raise boundary importance and has the effect of removing less vertices on the border. Admitted range of values (0,+inf). " value="1" description="Boundary Preserving Weight"/>
+  <Param type="RichBool" name="OptimalPlacement" tooltip="Each collapsed vertex is placed in the position minimizing the quadric error.&#xa; It can fail (creating bad spikes) in case of very flat areas. &#xa;If disabled edges are collapsed onto one of the two original vertices and the final mesh is composed by a subset of the original vertices. " value="true" description="Optimal position of simplified vertices"/>
+  <Param type="RichBool" name="PreserveNormal" tooltip="Try to avoid face flipping effects and try to preserve the original orientation of the surface" value="false" description="Preserve Normal"/>
+  <Param type="RichBool" name="PlanarQuadric" tooltip="Add additional simplification constraints that improves the quality of the simplification of the planar portion of the mesh." value="false" description="Planar Simplification"/>
+  <Param type="RichBool" name="Selected" tooltip="The simplification is applied only to the selected set of faces.&#xa; Take care of the target number of faces!" value="false" description="Simplify only selected faces"/>
+ </filter>
+ <filter name="Merge Close Vertices">
+  <Param type="RichAbsPerc" name="Threshold" tooltip="All the vertices that closer than this threshold are merged together. Use very small values, default values is 1/10000 of bounding box diagonal. " value="0.011926" min="0" max="1.19264" description="Merging distance"/>
+ </filter>
+ <filter name="Remove T-Vertices">
+  <Param type="RichEnum" enum_val0="Edge Collapse" enum_val1="Edge Flip" enum_cardinality="2" name="method" tooltip="Selects whether to remove t-vertices by edge collapse or edge flip." value="0" description="Method"/>
+  <Param type="RichFloat" name="Threshold" tooltip="Detects faces where the base/height ratio is lower than this value" value="40" description="Ratio"/>
+  <Param type="RichBool" name="Repeat" tooltip="Iterates the algorithm until it reaches convergence" value="true" description="Iterate until convergence"/>
+ </filter>
+ <filter name="Repair non Manifold Edges">
+  <Param type="RichEnum" enum_val0="Remove Faces" enum_val1="Split Vertices" enum_cardinality="2" name="method" tooltip="Selects whether to remove non manifold edges by removing faces or by splitting vertices." value="0" description="Method"/>
+ </filter>
+ <filter name="Repair non Manifold Vertices by splitting">
+  <Param type="RichFloat" name="VertDispRatio" tooltip="This parameter denote the ratio ⍺ of displacement of a vertex. When a vertex &lt;i>v&lt;/i> is split, it is moved towards the barycenter &lt;i>b&lt;/i> of the FF connected faces sharing it of a (&lt;i>v&lt;/i>-&lt;i>b&lt;/i>)*⍺. When ⍺ is zero vertex is not displaced. When ⍺ is 0.5 the new vertex is half away toward the barycenter of the face. Reasonable values are in the [0 .. 0.1] range." value="0" description="Vertex Displacement Ratio"/>
+ </filter>
+ <filter name="Remove Isolated pieces (wrt Diameter)">
+  <Param type="RichAbsPerc" name="MinComponentDiag" tooltip="Delete all the connected components (floating pieces) with a diameter smaller than the specified one" value="11.9264" min="0" max="119.264" description="Enter max diameter of isolated pieces"/>
+  <Param type="RichBool" name="removeUnref" tooltip="if true, the unreferenced vertices remaining after the face deletion are removed." value="true" description="Remove unfreferenced vertices"/>
+ </filter>
+ <filter name="Remove Isolated pieces (wrt Diameter)">
+  <Param type="RichAbsPerc" name="MinComponentDiag" tooltip="Delete all the connected components (floating pieces) with a diameter smaller than the specified one" value="11.9264" min="0" max="119.264" description="Enter max diameter of isolated pieces"/>
+  <Param type="RichBool" name="removeUnref" tooltip="if true, the unreferenced vertices remaining after the face deletion are removed." value="true" description="Remove unfreferenced vertices"/>
+ </filter>
+ <filter name="Remove Isolated Folded Faces by Edge Flip"/>
+ <filter name="Remove Isolated pieces (wrt Diameter)">
+  <Param type="RichAbsPerc" name="MinComponentDiag" tooltip="Delete all the connected components (floating pieces) with a diameter smaller than the specified one" value="11.9264" min="0" max="119.264" description="Enter max diameter of isolated pieces"/>
+  <Param type="RichBool" name="removeUnref" tooltip="if true, the unreferenced vertices remaining after the face deletion are removed." value="true" description="Remove unfreferenced vertices"/>
+ </filter>
+ <filter name="Close Holes">
+  <Param type="RichInt" name="MaxHoleSize" tooltip="The size is expressed as number of edges composing the hole boundary" value="30" description="Max size to be closed "/>
+  <Param type="RichBool" name="Selected" tooltip="Only the holes with at least one of the boundary faces selected are closed" value="false" description="Close holes with selected faces"/>
+  <Param type="RichBool" name="NewFaceSelected" tooltip="After closing a hole the faces that have been created are left selected. Any previous selection is lost. Useful for example for smoothing the newly created holes." value="true" description="Select the newly created faces"/>
+  <Param type="RichBool" name="SelfIntersection" tooltip="When closing an holes it tries to prevent the creation of faces that intersect faces adjacent to the boundary of the hole. It is an heuristic, non intersetcting hole filling can be NP-complete." value="true" description="Prevent creation of selfIntersecting faces"/>
+  <Param type="RichBool" name="RefineHole" tooltip="After closing the hole it will refine the newly created triangles to make the surface more smooth and the triangulation more evenly spaced" value="false" description="Refine Filled Hole"/>
+  <Param type="RichAbsPerc" name="RefineHoleEdgeLen" tooltip="The target edge lenght of the triangulation inside the filled hole." value="3.5779" min="0" max="119.264" description="Hole Refinement Edge Len"/>
+ </filter>
+ <filter name="Laplacian Smooth (surface preserving)">
+  <Param type="RichBool" name="selection" tooltip="Apply laplacian smooth on selected faces only" value="false" description="Update selection"/>
+  <Param type="RichFloat" name="AngleDeg" tooltip="maximum mean normal angle displacement (degrees) from old to new faces" value="0.5" description="Max Normal Dev (deg)"/>
+  <Param type="RichInt" name="iterations" tooltip="number of laplacian smooth iterations in every run" value="1" description="Iterations"/>
+ </filter>
+</FilterScript>
