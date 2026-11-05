@@ -1,0 +1,8 @@
+# .copilotignore
+node_modules/
+dist/
+build/
+*.log
+venv/
+.git/
+__pycache__
