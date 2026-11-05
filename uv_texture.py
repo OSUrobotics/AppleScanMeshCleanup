@@ -17,10 +17,13 @@ Approximate algorithm:
   """
 
 import heapq
+from collections import deque
 from pathlib import Path
 import struct
 import zlib
 
+import os
+import csv
 import numpy as np
 import pymeshlab
 import trimesh
@@ -59,6 +62,46 @@ def _write_material_file(material_path: Path, texture_filename: str):
         f"map_Kd {texture_filename}\n",
         encoding="utf-8",
     )
+
+
+def _export_obj_with_uv(
+    mesh: trimesh.Trimesh,
+    vmapping: np.ndarray,
+    indices: np.ndarray,
+    uvs: np.ndarray,
+    output_path: Path,
+):
+    if vmapping.ndim != 1 or uvs.ndim != 2 or uvs.shape[1] != 2:
+        raise ValueError("Expected one-dimensional vertex mapping and an (N, 2) UV array.")
+    if len(vmapping) != len(uvs):
+        raise ValueError(
+            f"Parameterizer returned {len(vmapping)} vertex mappings but {len(uvs)} UV coordinates."
+        )
+    if vmapping.size and (vmapping.min() < 0 or vmapping.max() >= len(mesh.vertices)):
+        raise ValueError("Vertex mapping contains indices outside the source mesh.")
+    output_vertex_ids = vmapping
+    if indices.ndim != 2 or indices.shape[1] != 3:
+        raise ValueError("OBJ UV export expects triangular faces.")
+    if indices.size and (indices.min() < 0 or indices.max() >= len(output_vertex_ids)):
+        raise ValueError("Face indices are outside the output vertex/UV arrays.")
+
+    material_path = output_path.with_suffix(".mtl")
+    texture_path = output_path.with_suffix(".png")
+    _write_blank_texture(texture_path)
+    _write_material_file(material_path, texture_path.name)
+
+    with output_path.open("w", encoding="utf-8", newline="\n") as obj_file:
+        obj_file.write(f"mtllib {material_path.name}\n")
+        for x, y, z in mesh.vertices:
+            obj_file.write(f"v {x:.9g} {y:.9g} {z:.9g}\n")
+        for u, v in uvs:
+            obj_file.write(f"vt {u:.9g} {v:.9g}\n")
+        obj_file.write("usemtl material_0\n")
+        for face in indices:
+            corners = " ".join(
+                f"{int(output_vertex_ids[index]) + 1}/{int(index) + 1}" for index in face
+            )
+            obj_file.write(f"f {corners}\n")
 
 
 def _load_mesh(input_path: Path):
@@ -111,7 +154,7 @@ def _geodesic(mesh: trimesh.Trimesh, v1: int, v2: int):
     return vertex_path, seam_edges
 
 
-def _define_seam(mesh: trimesh.Trimesh, perc_top_bottom: float = 0.9, perc_width: float=0.75):
+def _define_seam(mesh: trimesh.Trimesh, perc_top_bottom: float, perc_width: float, pt_center: np.array):
     """ Define a ring of connected edges on the top (or bottom) of the mesh
     Also return the first v point; we'll use that to do the side seam"""
 
@@ -129,15 +172,12 @@ def _define_seam(mesh: trimesh.Trimesh, perc_top_bottom: float = 0.9, perc_width
     diameter = float(np.max(horizontal_extents))
     y_min = float(np.min(vertices[:, 1]))
     height = float(np.max(vertices[:, 1]) - y_min)
-    target_y = y_min + perc_top_bottom * height
+    target_y = 0.2 * pt_center[1] + 0.8 * (y_min + perc_top_bottom * height)
     radius = diameter * perc_width / 2.0
-
-    # Center of the mesh - should be close to 0,0,0
-    pt_center = np.median(mesh.vertices, axis=0)
 
     # Place eight evenly spaced targets around the ring and choose the
     # closest unused mesh vertex to each target.
-    angles = np.linspace(0.0, 2.0 * np.pi, num=8, endpoint=False)
+    angles = np.linspace(0.0, 2.0 * np.pi, num=16, endpoint=False)
     key_points = np.column_stack((
         pt_center[0] + radius * np.cos(angles),
         np.full(angles.shape, target_y),
@@ -178,212 +218,93 @@ def _side_seam(mesh: trimesh.Trimesh, v1, v2):
     return side_verts, side_seam
 
 
-def _split_vertex_ring(mesh : trimesh.Trimesh, 
-                       orig_vert: int, 
-                       new_vert: int, 
-                       edge_prev: tuple[int, int] | int, 
-                       edge_next: tuple[int, int] | int,
-                       faces: np.ndarray,
-                       incident_faces: list[int]):
-    """ Create a vertex ring around the vertex, then sort the faces into those to the left and those
-        to the right. Replace the face to the left with the new vertex"""
-    if orig_vert < 0 or orig_vert >= len(mesh.vertices):
-        raise ValueError(f"Vertex index {orig_vert} is outside the mesh.")
-    if new_vert < 0:
-        raise ValueError(f"Duplicate vertex index {new_vert} is invalid.")
-
-    def normalize_edge(edge):
-        if isinstance(edge, (int, np.integer)) and edge == -1:
-            return None
-        if len(edge) != 2 or orig_vert not in edge:
-            raise ValueError(f"Edge {edge!r} is not incident to vertex {orig_vert}.")
-        return tuple(sorted(map(int, edge)))
-
-    prev_key = normalize_edge(edge_prev)
-    next_key = normalize_edge(edge_next)
-    seam_keys = {key for key in (prev_key, next_key) if key is not None}
-    if not seam_keys:
-        raise ValueError("At least one adjacent seam edge is required.")
-
-    if not incident_faces:
-        raise ValueError(f"Vertex {orig_vert} is not referenced by any face.")
-
-    ring_edges = {}
-    for face_id in incident_faces:
-        face = mesh.faces[face_id]
-        for u, v in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
-            if orig_vert in (u, v):
-                ring_edges.setdefault(tuple(sorted((int(u), int(v)))), []).append(face_id)
-
-    for edge in seam_keys:
-        if edge not in ring_edges:
-            raise ValueError(f"Seam edge {edge} is not present at vertex {orig_vert}.")
-        if len(ring_edges[edge]) > 2:
-            raise ValueError(f"Cannot split non-manifold edge {edge}.")
-
-    # Find the face to the left of an oriented seam edge. For a boundary end,
-    # use whichever of the two seam edges is present.
-    directed_edges = []
-    if edge_prev != -1:
-        directed_edges.append(tuple(map(int, edge_prev)))
-    if edge_next != -1:
-        directed_edges.append(tuple(map(int, edge_next)))
-
-    start_face = None
-    for directed in directed_edges:
-        for face_id in ring_edges[tuple(sorted(directed))]:
-            face = mesh.faces[face_id]
-            oriented_face_edges = (
-                (int(face[0]), int(face[1])),
-                (int(face[1]), int(face[2])),
-                (int(face[2]), int(face[0])),
-            )
-            if directed in oriented_face_edges:
-                start_face = face_id
-                break
-        if start_face is not None:
-            break
-    if start_face is None:
-        start_face = ring_edges[next(iter(seam_keys))][0]
-
-    # Walk the face fan without crossing either seam edge. This identifies
-    # exactly the faces on one side of the cut.
-    adjacency = {face_id: set() for face_id in incident_faces}
-    for edge, edge_face_ids in ring_edges.items():
-        if edge in seam_keys:
-            continue
-        for face_id in edge_face_ids:
-            adjacency[face_id].update(other for other in edge_face_ids if other != face_id)
-
-    left_faces = {start_face}
-    stack = [start_face]
-    while stack:
-        face_id = stack.pop()
-        for neighbor in adjacency[face_id] - left_faces:
-            left_faces.add(neighbor)
-            stack.append(neighbor)
-
-    for face_id in left_faces:
-        for corner, vertex_id in enumerate(mesh.faces[face_id]):
-            if int(vertex_id) == orig_vert:
-                faces[face_id, corner] = new_vert
-                break
-
-
-def cut_mesh_along_edges(mesh, vs_seam: list[int], es_seam:list[tuple[int, int]]):
-    """
-    Physically splits a trimesh along an explicit list of edge pairs,
-    creating open boundaries matching the seam lines.
-    
-    Parameters:
-    - mesh: trimesh.Trimesh object
-    - vs_seam: list of vertices
-    - es_seam: List or array of coordinate tuples/lists, e.g., [[v0, v1], [v2, v3], ...]
-    """
-    vertices = mesh.vertices
-    new_faces = mesh.faces.copy()
-    vertex_faces = [[] for _ in vertices]
+def _label_seam_faces(mesh: trimesh.Trimesh,
+                      side_seam_vs: set,
+                      faces_component,
+                      face_neighbors,
+                      ):
+        # Now get the ones in the middle mesh
+    faces_left_seam = set()
+    faces_right_seam = set()
+    faces_vert_seam = set()
     for face_id, face in enumerate(mesh.faces):
-        for vertex_id in face:
-            vertex_faces[int(vertex_id)].append(face_id)
+        if not face_id in faces_component:
+            continue
 
-    for indx, edge in enumerate(es_seam):
-        if len(edge) != 2:
-            raise ValueError(f"Expected an edge with two vertex indices, got {edge!r}.")
-        u, v = map(int, edge)  # Left and right vertices
-        if u == v or min(u, v) < 0 or max(u, v) >= len(vertices):
-            raise ValueError(f"Invalid mesh vertex in mesh edge: {edge!r}.")
+        b_found_v = False
+        b_found_e = False
+        for indx, vid in enumerate(face):
+            # Get a list of all of the faces that are adjacent to one of the side seam vertices
+            # They are either a left face, a right face, or just touching
+            if vid in side_seam_vs:
+                b_found_v = True
+                indx_in_side_seam = side_seam_vs[vid]
+                v_prev_indx = face[(indx+2)%3]
+                if v_prev_indx in side_seam_vs:
+                    indx_in_side_seam_prev = side_seam_vs[v_prev_indx]
+                    if indx_in_side_seam == indx_in_side_seam_prev + 1:
+                        faces_left_seam.add(face_id)
+                        b_found_e = True
+                    elif indx_in_side_seam == indx_in_side_seam_prev - 1:
+                        faces_right_seam.add(face_id)
+                        b_found_e = True
+        if b_found_v and not b_found_e:
+            faces_vert_seam.add(face_id)
 
-        if u != vs_seam[indx]:
-            raise ValueError(f"Vertex and edge chains incorrect {vs_seam[indx]} {u}")
-        if v != vs_seam[indx+1]:
-            raise ValueError(f"Vertex and edge chains incorrect {vs_seam[indx]} {u}")
-        assert vs_seam[indx] == u
+    neigh_side = {}
+    for face in faces_left_seam:
+        neigh_side[face] = "Left"
+    for face in faces_right_seam:
+        neigh_side[face] = "Right"
+    faces_vert_seam.difference_update(faces_left_seam | faces_right_seam)
+    search_queue = deque(sorted(neigh_side))
+    done = False
+    while search_queue and not done:
+        face_id = search_queue.popleft()
+        for neighbor in face_neighbors[face_id]:
+            if neighbor not in neigh_side:
+                neigh_side[neighbor] = neigh_side[face_id]
+                search_queue.append(neighbor)
+        done = True
+        for face_id in faces_vert_seam:
+            if face_id not in neigh_side:
+                done = False
+                break
 
-    # Duplicate each seam vertex once, then use the copies on one face side
-    # of each seam edge to open the cut.
-    # Copy original
-    new_vertices = [vertex.copy() for vertex in vertices]
-    duplicated_vertex = {}
-    for vertex_id in dict.fromkeys(vs_seam):
-        duplicated_vertex[vertex_id] = len(new_vertices)
-        new_vertices.append(vertices[vertex_id].copy())
+    for face_id in faces_vert_seam:
+        side = neigh_side.get(face_id)
+        if side == "Left":
+            faces_left_seam.add(face_id)
+        elif side == "Right":
+            faces_right_seam.add(face_id)
 
-    b_is_loop = vs_seam[0] == vs_seam[-1]
-    vertex_count = len(vs_seam) - 1 if b_is_loop else len(vs_seam)
-    for indx in range(vertex_count):
-        vert = vs_seam[indx]
-        edge_prev = es_seam[indx - 1] if indx > 0 else (es_seam[-1] if b_is_loop else -1)
-        edge_next = es_seam[indx] if indx < len(es_seam) else (es_seam[0] if b_is_loop else -1)
-        _split_vertex_ring(mesh=mesh, 
-                           orig_vert=vert, 
-                           new_vert=duplicated_vertex[vert], 
-                           edge_prev=edge_prev,
-                           edge_next=edge_next,
-                           faces=new_faces,
-                           incident_faces=vertex_faces[vert])
-
-    vertex_colors = np.full((len(new_vertices), 4), [160, 160, 160, 255], dtype=np.uint8)
-    vertex_colors[len(vertices):] = [255, 0, 0, 255]
-    return trimesh.Trimesh(
-        vertices=np.asarray(new_vertices),
-        faces=new_faces,
-        visual=trimesh.visual.ColorVisuals(vertex_colors=vertex_colors),
-        process=False,
-    ), duplicated_vertex
-
-
-def _export_obj_with_uv(
-    mesh: trimesh.Trimesh,
-    vmapping: np.ndarray,
-    indices: np.ndarray,
-    uvs: np.ndarray,
-    output_path: Path,
-):
-    if vmapping.ndim != 1 or uvs.ndim != 2 or uvs.shape[1] != 2:
-        raise ValueError("Expected one-dimensional vertex mapping and an (N, 2) UV array.")
-    if len(vmapping) != len(uvs):
-        raise ValueError(
-            f"Parameterizer returned {len(vmapping)} vertex mappings but {len(uvs)} UV coordinates."
-        )
-    if vmapping.size and (vmapping.min() < 0 or vmapping.max() >= len(mesh.vertices)):
-        raise ValueError("Vertex mapping contains indices outside the source mesh.")
-    output_vertex_ids = vmapping
-    if indices.ndim != 2 or indices.shape[1] != 3:
-        raise ValueError("OBJ UV export expects triangular faces.")
-    if indices.size and (indices.min() < 0 or indices.max() >= len(output_vertex_ids)):
-        raise ValueError("Face indices are outside the output vertex/UV arrays.")
-
-    material_path = output_path.with_suffix(".mtl")
-    texture_path = output_path.with_suffix(".png")
-    _write_blank_texture(texture_path)
-    _write_material_file(material_path, texture_path.name)
-
-    with output_path.open("w", encoding="utf-8", newline="\n") as obj_file:
-        obj_file.write(f"mtllib {material_path.name}\n")
-        for x, y, z in mesh.vertices:
-            obj_file.write(f"v {x:.9g} {y:.9g} {z:.9g}\n")
-        for u, v in uvs:
-            obj_file.write(f"vt {u:.9g} {v:.9g}\n")
-        obj_file.write("usemtl material_0\n")
-        for face in indices:
-            corners = " ".join(
-                f"{int(output_vertex_ids[index]) + 1}/{int(index) + 1}" for index in face
-            )
-            obj_file.write(f"f {corners}\n")
+    return faces_left_seam, faces_right_seam
 
 
 def _parameterize_cut_mesh(
     mesh: trimesh.Trimesh,
     seam_edges: list[tuple[int, int]],
-    four_corners: list[int],
+    side_seam_vertices: list[int],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Parameterize each manually cut face component without introducing new seams."""
-    if len(four_corners) != 4:
-        raise ValueError(f"Expected four cutout corner vertices, got {len(four_corners)}.")
-    if any(vertex_id < 0 or vertex_id >= len(mesh.vertices) for vertex_id in four_corners):
-        raise ValueError("A cutout corner vertex index is outside the mesh.")
-    corner_ids = set(four_corners)
+    
+    """Partition the mesh into three components using the edge seams provide.
+       Essentially breadth first search on connected faces, skipping faces connected over seam edges
+       Once the component face lists are created, need to flatten them out.
+        Then adjust the uv coordinates so that they fit in the texture map.
+         The large center unwrap gets flattened into a rectangle that stretches diagonally
+          The top and bottom caps get placed in the upper left and lower right corners """
+
+    if len(side_seam_vertices) < 2:
+        raise ValueError("Expected at least two vertices along the side seam.")
+    if len(set(side_seam_vertices)) != len(side_seam_vertices):
+        raise ValueError("Side-seam vertices must not contain duplicates.")
+    if any(vertex_id < 0 or vertex_id >= len(mesh.vertices) for vertex_id in side_seam_vertices):
+        raise ValueError("A side-seam vertex index is outside the mesh.")
+    endpoint_ids = {side_seam_vertices[0], side_seam_vertices[-1]}
+    side_seam_vs = {}
+    for indx, vid in enumerate(side_seam_vertices):
+        side_seam_vs[vid] = indx
+
     seam_edge_ids = set()
     for edge in seam_edges:
         if len(edge) != 2:
@@ -393,14 +314,19 @@ def _parameterize_cut_mesh(
             raise ValueError(f"Invalid seam edge: {edge!r}.")
         seam_edge_ids.add(tuple(sorted((u, v))))
 
+    # Loop through all the faces and assign each one to an edge.
+    #.  Edges are defined by a tuple sorted by vertex index id
     edge_faces = {}
     for face_id, face in enumerate(mesh.faces):
         for u, v in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
             edge_faces.setdefault(tuple(sorted((int(u), int(v)))), []).append(face_id)
 
+    # Create a face neighbor structure, skipping any edges that are in the seams
     face_neighbors = [set() for _ in mesh.faces]
+    boundary_face_ids = set()
     for edge, incident_faces in edge_faces.items():
         if edge in seam_edge_ids:
+            boundary_face_ids.update(incident_faces)
             continue
         for face_id in incident_faces:
             face_neighbors[face_id].update(other for other in incident_faces if other != face_id)
@@ -408,6 +334,7 @@ def _parameterize_cut_mesh(
     if missing_seam_edges:
         raise ValueError(f"Seam edges are not present in the mesh: {sorted(missing_seam_edges)}.")
 
+    # Do the breadth first search
     components = []
     unseen = set(range(len(mesh.faces)))
     while unseen:
@@ -425,82 +352,57 @@ def _parameterize_cut_mesh(
     if not components:
         raise ValueError("Cannot parameterize a mesh with no faces.")
 
+    if len(components) != 3:
+        raise ValueError(f"Should have three components: top, bottom, middle, got {len(components)}")
+        
     chart_data = []
     for component_faces in components:
+        component_vertex_ids = set(map(int, mesh.faces[component_faces].ravel()))
+        is_middle_component = endpoint_ids.issubset(component_vertex_ids)
         source_faces = mesh.faces[component_faces]
-        component_face_ids = set(map(int, component_faces))
-        incident_faces_by_vertex = {}
-        for face_id, face in zip(component_faces, source_faces):
-            for vertex_id in face:
-                incident_faces_by_vertex.setdefault(int(vertex_id), set()).add(int(face_id))
-
-        vertex_face_neighbors = {
-            vertex_id: {face_id: set() for face_id in incident_face_ids}
-            for vertex_id, incident_face_ids in incident_faces_by_vertex.items()
-        }
-        for edge, incident_face_ids in edge_faces.items():
-            if edge in seam_edge_ids:
-                continue
-            component_incident_faces = component_face_ids.intersection(incident_face_ids)
-            for vertex_id in edge:
-                for face_id in component_incident_faces:
-                    vertex_face_neighbors[vertex_id][face_id].update(
-                        component_incident_faces - {face_id}
+        source_vertices = np.unique(source_faces)
+        local_index = {int(vertex_id): index for index, vertex_id in enumerate(source_vertices)}
+        local_corners = None
+        if is_middle_component:
+            faces_left_seam, faces_right_seam = _label_seam_faces(mesh=mesh, side_seam_vs=side_seam_vs, faces_component=component_faces, face_neighbors=face_neighbors)
+            duplicated_local_indices = {}
+            for vertex_id in side_seam_vertices:
+                if vertex_id not in local_index:
+                    raise ValueError(
+                        f"Side-seam vertex {vertex_id} is missing from the middle component."
                     )
+                duplicated_local_indices[vertex_id] = len(source_vertices) + len(duplicated_local_indices)
+            source_vertices = np.concatenate(
+                (source_vertices, np.asarray(side_seam_vertices, dtype=np.int64))
+            )
 
-        local_index_by_face_vertex = {}
-        source_vertices = []
-        local_indices_by_source_vertex = {}
-        for vertex_id in sorted(incident_faces_by_vertex):
-            unseen_vertex_faces = set(incident_faces_by_vertex[vertex_id])
-            while unseen_vertex_faces:
-                start_face = unseen_vertex_faces.pop()
-                fan_faces = {start_face}
-                stack = [start_face]
-                while stack:
-                    face_id = stack.pop()
-                    connected_faces = vertex_face_neighbors[vertex_id][face_id] & unseen_vertex_faces
-                    unseen_vertex_faces.difference_update(connected_faces)
-                    fan_faces.update(connected_faces)
-                    stack.extend(connected_faces)
-
-                local_vertex_id = len(source_vertices)
-                source_vertices.append(vertex_id)
-                local_indices_by_source_vertex.setdefault(vertex_id, []).append(local_vertex_id)
-                for face_id in fan_faces:
-                    local_index_by_face_vertex[(face_id, vertex_id)] = local_vertex_id
-
-        local_faces = np.asarray(
-            [
+            local_faces = np.asarray(
                 [
-                    local_index_by_face_vertex[(int(face_id), int(vertex_id))]
-                    for vertex_id in face
-                ]
-                for face_id, face in zip(component_faces, source_faces)
-            ],
-            dtype=np.int32,
-        )
-        source_vertices = np.asarray(source_vertices, dtype=np.int64)
+                    [
+                        duplicated_local_indices.get(int(vertex_id), local_index[int(vertex_id)])
+                        if int(face_id) in faces_right_seam
+                        else local_index[int(vertex_id)]
+                        for vertex_id in face
+                    ]
+                    for face_id, face in zip(component_faces, source_faces)
+                ],
+                dtype=np.int32,
+            )
+            local_corners = [
+                local_index[side_seam_vertices[0]],
+                local_index[side_seam_vertices[-1]],
+                duplicated_local_indices[side_seam_vertices[-1]],
+                duplicated_local_indices[side_seam_vertices[0]],
+            ]
+        else:
+            local_faces = np.asarray(
+                [[local_index[int(vertex_id)] for vertex_id in face] for face in source_faces],
+                dtype=np.int32,
+            )
+
         local_vertices = np.asarray(mesh.vertices[source_vertices], dtype=np.float64)
         component_area = float(np.sum(trimesh.triangles.area(local_vertices[local_faces])))
         print(f"Component with {len(component_faces)} faces has area {component_area:.6g}.")
-        corner_fan_counts_match = all(
-            len(local_indices_by_source_vertex.get(vertex_id, []))
-            == four_corners.count(vertex_id)
-            for vertex_id in corner_ids
-        )
-        local_corners = (
-            [
-                local_index
-                for vertex_id in corner_ids
-                for local_index in local_indices_by_source_vertex[vertex_id]
-            ]
-            if corner_ids.issubset(local_indices_by_source_vertex)
-            and corner_fan_counts_match
-            else None
-        )
-        if local_corners is not None and len(local_corners) != 4:
-            local_corners = None
 
         if len(local_faces) == 1:
             p0, p1, p2 = local_vertices[local_faces[0]]
@@ -536,9 +438,9 @@ def _parameterize_cut_mesh(
 
     cutout_charts = [chart for chart in chart_data if chart[1] is not None]
     if not cutout_charts:
-        raise ValueError("The four corner vertices are not all part of one cutout component.")
+        raise ValueError("Both side-seam endpoints must belong to one middle component.")
     if len(cutout_charts) > 1:
-        raise ValueError("The four corner vertices ambiguously identify multiple components.")
+        raise ValueError("The side-seam endpoints ambiguously identify multiple components.")
 
     if len(chart_data) != 3:
         raise ValueError(
@@ -555,7 +457,8 @@ def _parameterize_cut_mesh(
     vertex_offset = 0
     # Putting the pixels at the corners slightly inside
     pad = 3.0 / 1024.0
-    for chart_id, (_, local_corners, source_vertices, local_faces, local_uvs) in enumerate(chart_data):
+    chart_id = 1
+    for (_, local_corners, source_vertices, local_faces, local_uvs) in chart_data:
         if local_corners is not None:
             corner_uvs = local_uvs[local_corners]
             corner_center = corner_uvs.mean(axis=0)
@@ -611,6 +514,7 @@ def _parameterize_cut_mesh(
             normalized_uvs = (local_uvs - uv_min) * scale
             if chart_id == 1:
                 packed_uvs = normalized_uvs + [pad, 0.8 - pad]
+                chart_id += 1
             else:
                 packed_uvs = normalized_uvs + [0.8 - pad, pad]
 
@@ -630,26 +534,56 @@ def _parameterize_cut_mesh(
     )
 
 
+def _find_centers(input_path: Path, mesh: trimesh.Trimesh):
+    input_path_endpts = input_path.with_name(input_path.name.replace("NoStemHiRes", ""))
+    input_path_endpts = input_path_endpts.with_suffix(".txt")
+
+    end_pts = []
+    if os.path.exists(input_path_endpts):
+        with open(str(input_path_endpts), mode="r", encoding="utf-8") as file:
+            end_pts = list(csv.reader(file))
+
+        return [
+            np.asarray([float(value) for value in point], dtype=np.float64)
+            for point in end_pts
+        ]
+    vertices = mesh.vertices
+    
+    # Y is the vertical axis; the ring lies in the XZ plane.
+    horizontal_extents = np.ptp(vertices[:, [0, 2]], axis=0)
+    diameter = float(np.max(horizontal_extents))
+    y_min = float(np.min(vertices[:, 1]))
+    height = float(np.max(vertices[:, 1]) - y_min)
+    radius = 0.5 * diameter
+
+    # Center of the mesh - should be close to 0,0,0
+    pt_center = np.median(mesh.vertices, axis=0)
+    verts_center = vertices[np.logical_and(np.abs(vertices[:, 0] - pt_center[0]) < 0.5 * radius,
+                                        np.abs(vertices[:, 2] - pt_center[2]) < 0.5 * radius)]
+
+    verts_top = verts_center[verts_center[:, 1] > y_min + height * 0.8]
+    pt_center_top = verts_top[np.argmin(verts_top[:, 1])]
+
+    verts_bot = verts_center[verts_center[:, 1] < y_min + height * 0.2]
+    pt_center_bot = verts_bot[np.argnax(verts_bot[:, 1])]
+    return [pt_center_top, pt_center_bot]
+
+
 def uv_texture(input_path: Path, output_path: Path):
     """Slice open the top and the bottom and unwrap the middle"""
     mesh = _load_mesh(input_path)
 
-    top_seam_vs, top_seam_es = _define_seam(mesh, perc_top_bottom=0.95, perc_width=0.5)
-    bottom_seam_vs, bottom_seam_es = _define_seam(mesh, perc_top_bottom=0.05, perc_width=0.5)
+    centers = _find_centers(input_path=input_path, mesh=mesh)
+
+    top_seam_vs, top_seam_es = _define_seam(mesh, perc_top_bottom=0.95, perc_width=0.5, pt_center=centers[0])
+    bottom_seam_vs, bottom_seam_es = _define_seam(mesh, perc_top_bottom=0.05, perc_width=0.6, pt_center=centers[1])
     side_seam_vs, side_seam_es = _side_seam(
         mesh, top_seam_vs[0], bottom_seam_vs[0]
     )
 
     seam_edges = top_seam_es + bottom_seam_es + side_seam_es
-    four_corners = [
-        side_seam_vs[0],
-        side_seam_vs[-1],
-        side_seam_vs[-1],
-        side_seam_vs[0],
-    ]
-
     print("Parameterizing the mesh with the requested seam boundaries...")
-    vmapping, indices, uvs = _parameterize_cut_mesh(mesh, seam_edges, four_corners)
+    vmapping, indices, uvs = _parameterize_cut_mesh(mesh, seam_edges, side_seam_vs)
 
     # ==========================================
     # 5. EXPORT THE ASSET

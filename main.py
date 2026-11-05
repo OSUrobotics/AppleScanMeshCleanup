@@ -5,33 +5,36 @@ from pathlib import Path
 """ Going from oroginal Revo scans to consistantly parameterized, topologically spherical meshes with a cylindrical parameterization
 Directories
    OriginalRevoScans : The original output meshes, labeled Apple#FullRes.obj
-   MeshLabCleaned : Derived from the Revo scans by filteringg and downsampling
-   BlenderTextured : Manually cut out the stem and regenerate/repair the top texture using smart UV mapping
-   Remeshed : Generate a new, clean mesh using voxelization
-   BlenderRemeshedTextured : Manually create the cylindrical texture mapping and bake the new texture in
-   MeshLabDownsampled : Downsample the remeshed texture
+   MeshLabCleaned : Derived from the Revo scans by automatic filtering and downsampling
+           - it is safe to overwrite these 
+   BlenderStemRemoved : Manually cut out the stem 
+   Voxelized : Generate a new, clean mesh using voxelization and build the cylindrical parameterization. Runs on BlenderStemRemoved
+           - it is safe to overwrite these
+   BlenderTextured : Manually Bake the texture map from the meshlabcleaned and clean up the stem texture
+   Final : Generate Hi and Low res meshees from BlenderTextured.
    """
 from MeshLabCleanup import (
     cleanup_mesh,
     downsample_mesh,
-    fix_tunnels_mesh,
     process_meshes,
     voxelize_mesh
 )
+
+from uv_texture import uv_texture
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MLX_SCRIPTS = {
     "cleanup": SCRIPT_DIR / "MeshLabScripts" / "MeshLabCleanup.mlx",
-    "downsample": SCRIPT_DIR / "MeshLabScripts" / "downsample.mlx",
-    "fixtunnels": SCRIPT_DIR / "MeshLabScripts" / "post_tunnel.mlx",
+    "downsample_lowres": SCRIPT_DIR / "MeshLabScripts" / "downsample_lowres.mlx",
+    "downsample_hires": SCRIPT_DIR / "MeshLabScripts" / "downsample_hires.mlx",
     "voxelize": SCRIPT_DIR / "MeshLabScripts" / "post_tunnel.mlx",
 }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Clean up, downsample, voxelize, or fix tunnels in meshes."
+        description="Clean up, downsample_lowres, downsample_hires, or voxelize."
     )
     parser.add_argument(
         "--operation",
@@ -60,42 +63,37 @@ def main():
     if args.operation == "cleanup":
         # Takes the original scans from Revo and runs 
         #.  - the MeshLabCleanup.mlx to get rid of duplicate vertices, etc, then downsample
-        #.  - remove tunnels
-        #.  - the post_tunnel.mlx to clean up holes
         # Starts with xFullResx and puts xFullResx into the cleaned directory
         input_dir = root_dir / "OriginalRevoScans"
         output_dir = root_dir / "MeshLabCleaned"
         process_file = partial(
             cleanup_mesh,
             mlx_script_path=MLX_SCRIPTS["cleanup"],
-            post_tunnel_mlx_script_path=MLX_SCRIPTS["fixtunnels"],
         )
-    elif args.operation == "fixtunnels":
-        # The meshes in MeshCleaned up are currently being hand cleaned up and put in Blender Textured
-        #.  - this is meant to fix tunnels on those hand cleaned up meshes. It should not be required
-        #.    after this round of clean up
-        input_dir = root_dir / "BlenderTextured"
-        output_dir = root_dir / "BlenderTexturedFixed"
-        process_file = partial(
-            fix_tunnels_mesh,
-            post_tunnel_mlx_script_path=MLX_SCRIPTS["fixtunnels"],
-        )
+        check_existing = True
     elif args.operation == "voxelize":
-        # The meshes in MeshCleaned up are currently being hand cleaned up and put in Blender Textured
-        #.  - this is meant to re-mesh those hand cleaned up meshes. 
-        input_dir = root_dir / "BlenderTextured"
-        output_dir = root_dir / "BlenderTexturedFixed"
+        # The meshes in MeshCleaned up are currently being hand cleaned with the stem removed and put in BlenderStemRemoved
+        #.  - this re-meshes those hand cleaned up meshes and splits the texturemap
+        input_dir = root_dir / "BlenderStemRemoved"
+        output_dir = root_dir / "Voxelized"
         process_file = partial(
             voxelize_mesh,
-            post_tunnel_mlx_script_path=MLX_SCRIPTS["fixtunnels"],
         )
-    elif args.operation == "downsample":
+    elif args.operation == "downsample_lowres":
         #
         input_dir = root_dir / "BlenderTextured"
-        output_dir = root_dir / "MeshLabDownsample"
+        output_dir = root_dir / "Final"
         process_file = partial(
             downsample_mesh,
-            mlx_script_path=MLX_SCRIPTS["downsample"],
+            mlx_script_path=MLX_SCRIPTS["downsample_lowres"],
+        )
+    elif args.operation == "downsample_hiures":
+        #
+        input_dir = root_dir / "BlenderTextured"
+        output_dir = root_dir / "Final"
+        process_file = partial(
+            downsample_mesh,
+            mlx_script_path=MLX_SCRIPTS["downsample_hires"],
         )
 
     process_meshes(

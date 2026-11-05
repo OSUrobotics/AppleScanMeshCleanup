@@ -11,6 +11,7 @@ from MeshLibCleanup import (
     remove_small_tunnels,
 )
 
+from uv_texture import uv_texture
 
 MeshProcessor = Callable[[Path, Path], Path]
 
@@ -48,21 +49,12 @@ def cleanup_mesh(
     input_path: Path,
     output_path: Path,
     mlx_script_path: Path,
-    post_tunnel_mlx_script_path: Path,
 ) -> Path:
     print("Original Revo scan mesh topology")
     print_mesh_topology(input_path)
 
     _process_mesh(input_path, output_path, mlx_script_path)
     print("After MeshLab cleanup mesh topology")
-    print_mesh_topology(output_path)
-
-    remove_small_tunnels(output_path, output_path)
-    print("After removing small tunnels mesh topology")
-    print_mesh_topology(output_path)
-
-    _process_mesh(output_path, output_path, post_tunnel_mlx_script_path)
-    print("After post-tunnel MeshLab processing mesh topology")
     print_mesh_topology(output_path)
     return output_path
 
@@ -72,7 +64,8 @@ def downsample_mesh(
 ) -> Path:
     print("Original textured mesh topology")
     print_mesh_topology(input_path)
-    output_path = output_path.with_name(output_path.name.replace("HiRes", "LowRes"))
+    if "low_res" in mlx_script_path:
+        output_path = output_path.with_name(output_path.name.replace("HiRes", "LowRes"))
     _process_mesh(input_path, output_path, mlx_script_path)
     print("Downsampled textured mesh topology")
     print_mesh_topology(output_path)
@@ -92,9 +85,7 @@ def fix_tunnels_mesh(
     return output_path
 
 
-def voxelize_mesh(
-    input_path: Path, output_path: Path, post_tunnel_mlx_script_path: Path
-) -> Path:
+def voxelize_mesh(input_path: Path, output_path: Path) -> Path:
     print("Original mesh topology")
     print_mesh_topology(input_path)
 
@@ -118,10 +109,9 @@ def voxelize_mesh(
     print("voxel fixed topology")
     print_mesh_topology(output_path)
 
-    _process_mesh(output_path, output_path, post_tunnel_mlx_script_path)
-    print("voxel fixed topology")
-    print_mesh_topology(output_path)
-    print("\n")
+    path_uv = output_path.with_name(f"{output_path.stem}_uv{output_path.suffix}")
+
+    uv_texture(input_path=output_path, output_path=path_uv)
 
 
 def process_meshes(

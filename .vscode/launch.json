@@ -11,7 +11,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": ["--input-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
-                     "--operation", "voxelize",
+                     "--operation", "cleanup",
                     "--prompt-overwrite-older"]
         }
     ]
