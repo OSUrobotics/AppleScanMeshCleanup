@@ -367,6 +367,11 @@ def _parameterize_cut_mesh(
     for component_faces in components:
         component_vertex_ids = set(map(int, mesh.faces[component_faces].ravel()))
         is_middle_component = endpoint_ids.issubset(component_vertex_ids)
+        is_top_component = side_seam_vertices[0] in component_vertex_ids
+        is_bot_component = side_seam_vertices[-1] in component_vertex_ids
+        if not is_middle_component and not is_top_component and not is_bot_component:
+            raise ValueError(f"End vertices not in component")
+        
         source_faces = mesh.faces[component_faces]
         source_vertices = np.unique(source_faces)
         local_index = {int(vertex_id): index for index, vertex_id in enumerate(source_vertices)}
@@ -469,7 +474,7 @@ def _parameterize_cut_mesh(
                 )
 
         chart_data.append(
-            (component_area, local_corners, source_vertices, local_faces, local_uvs)
+            (component_area, local_corners, source_vertices, local_faces, local_uvs, is_middle_component, is_top_component, is_bot_component)
         )
 
     cutout_charts = [chart for chart in chart_data if chart[1] is not None]
@@ -482,10 +487,6 @@ def _parameterize_cut_mesh(
         raise ValueError(
             f"Expected the cutout and two cap components, found {len(chart_data)} components."
         )
-    chart_data.sort(
-        key=lambda chart: (chart[1] is not None, chart[0]),
-        reverse=True,
-    )
 
     output_mapping = []
     output_faces = []
@@ -494,7 +495,7 @@ def _parameterize_cut_mesh(
     # Putting the pixels at the corners slightly inside
     pad = 3.0 / 1024.0
     chart_id = 1
-    for (_, local_corners, source_vertices, local_faces, local_uvs) in chart_data:
+    for (_, local_corners, source_vertices, local_faces, local_uvs, is_middle, is_top, is_bottom) in chart_data:
         if local_corners is not None:
             corner_uvs = local_uvs[local_corners]
             corner_center = corner_uvs.mean(axis=0)
@@ -548,7 +549,7 @@ def _parameterize_cut_mesh(
             available_size = 0.2 - 2 * pad
             scale = min(available_size / uv_size[0], available_size / uv_size[1])
             normalized_uvs = (local_uvs - uv_min) * scale
-            if chart_id == 1:
+            if is_bottom:
                 packed_uvs = normalized_uvs + [pad, 0.8 - pad]
                 chart_id += 1
             else:
