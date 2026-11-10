@@ -79,22 +79,25 @@ def main():
         process_file = partial(
             voxelize_mesh,
         )
+        check_existing = True
     elif args.operation == "downsample_lowres":
         #
-        input_dir = root_dir / "BlenderTextured"
+        input_dir = root_dir / "BlenderRebaked"
         output_dir = root_dir / "Final"
         process_file = partial(
             downsample_mesh,
             mlx_script_path=MLX_SCRIPTS["downsample_lowres"],
         )
-    elif args.operation == "downsample_hiures":
+    elif args.operation == "downsample_hires":
         #
-        input_dir = root_dir / "BlenderTextured"
+        input_dir = root_dir / "BlenderRebaked"
         output_dir = root_dir / "Final"
         process_file = partial(
             downsample_mesh,
             mlx_script_path=MLX_SCRIPTS["downsample_hires"],
         )
+    else:
+        raise ValueError(f"No valid command {args.operation}")
 
     process_meshes(
         input_dir,

@@ -111,17 +111,21 @@ def _load_mesh(input_path: Path):
     return mesh
 
 
-def _geodesic(mesh: trimesh.Trimesh, v1: int, v2: int):
-    """Find the shortest path between two vertices along mesh edges."""
-    if not 0 <= v1 < len(mesh.vertices) or not 0 <= v2 < len(mesh.vertices):
-        raise ValueError(f"Vertex indices must be between 0 and {len(mesh.vertices) - 1}.")
-
+def _create_adjacency_structure(mesh: trimesh.Trimesh):
+    """Create the edge adjacency structure."""
     adjacency = [[] for _ in mesh.vertices]
+
     for (u, v), length in zip(mesh.edges_unique, mesh.edges_unique_length):
         u, v = int(u), int(v)
         weight = float(length)
+
         adjacency[u].append((v, weight))
         adjacency[v].append((u, weight))
+    return adjacency
+
+
+def _geodesic(adjacency: list[tuple[int, float]], v1: int, v2: int, no_cross_vs: list[int]):
+    """Find the shortest path between two vertices along mesh edges."""
 
     if v1 == v2:
         return [v1], []
@@ -133,6 +137,8 @@ def _geodesic(mesh: trimesh.Trimesh, v1: int, v2: int):
         distance_so_far, vertex = heapq.heappop(queue)
         if vertex == v2:
             break
+        if vertex in no_cross_vs:
+            continue
         if distance_so_far > distances[vertex]:
             continue
         for neighbor, edge_length in adjacency[vertex]:
@@ -154,7 +160,12 @@ def _geodesic(mesh: trimesh.Trimesh, v1: int, v2: int):
     return vertex_path, seam_edges
 
 
-def _define_seam(mesh: trimesh.Trimesh, perc_top_bottom: float, perc_width: float, pt_center: np.array):
+def _define_seam(mesh: trimesh.Trimesh, 
+                 adjacency: list[tuple[int, float]], 
+                 no_cross_vs: list[int],
+                 perc_top_bottom: float, 
+                 perc_width: float, 
+                 pt_center: np.array):
     """ Define a ring of connected edges on the top (or bottom) of the mesh
     Also return the first v point; we'll use that to do the side seam"""
 
@@ -201,7 +212,7 @@ def _define_seam(mesh: trimesh.Trimesh, perc_top_bottom: float, perc_width: floa
     seam_edges = []
     seam_vertices = []
     for v1, v2 in zip(vs[0:-1], vs[1:]):
-        connect_vs, connect_edges = _geodesic(mesh, v1, v2)
+        connect_vs, connect_edges = _geodesic(adjacency=adjacency, v1=v1, v2=v2, no_cross_vs=no_cross_vs)
         # Always one more vertex then edge, drop the last one
         seam_vertices.extend(connect_vs[0:-1])
         seam_edges.extend(connect_edges)
@@ -210,11 +221,11 @@ def _define_seam(mesh: trimesh.Trimesh, perc_top_bottom: float, perc_width: floa
     return seam_vertices, seam_edges
 
 
-def _side_seam(mesh: trimesh.Trimesh, v1, v2):
+def _side_seam(adjacency: list[tuple[int, float]], v1: int, v2: int, no_cross_vs: list[int]):
     """ The top and bottom seam are given as edges in the mesh. Connect them"""
     # Find a list of edges that connects the top seam to the bottom one along the x = 0 plane
 
-    side_verts, side_seam = _geodesic(mesh, v1, v2)
+    side_verts, side_seam = _geodesic(adjacency=adjacency, v1=v1, v2=v2, no_cross_vs=no_cross_vs)
     return side_verts, side_seam
 
 
@@ -351,9 +362,6 @@ def _parameterize_cut_mesh(
 
     if not components:
         raise ValueError("Cannot parameterize a mesh with no faces.")
-
-    if len(components) != 3:
-        raise ValueError(f"Should have three components: top, bottom, middle, got {len(components)}")
         
     chart_data = []
     for component_faces in components:
@@ -374,7 +382,7 @@ def _parameterize_cut_mesh(
                 duplicated_local_indices[vertex_id] = len(source_vertices) + len(duplicated_local_indices)
             source_vertices = np.concatenate(
                 (source_vertices, np.asarray(side_seam_vertices, dtype=np.int64))
-            )
+            )            
 
             local_faces = np.asarray(
                 [
@@ -388,6 +396,24 @@ def _parameterize_cut_mesh(
                 ],
                 dtype=np.int32,
             )
+
+            seam_local_indices = {
+                local_index[vertex_id] for vertex_id in side_seam_vertices
+            } | set(duplicated_local_indices.values())
+            referenced_local_indices = set(map(int, local_faces.ravel()))
+            unreferenced_seam_indices = sorted(
+                seam_local_indices - referenced_local_indices
+            )
+            if unreferenced_seam_indices:
+                unreferenced_vertices = [
+                    (local_id, int(source_vertices[local_id]))
+                    for local_id in unreferenced_seam_indices
+                ]
+                raise ValueError(
+                    "Unreferenced side-seam vertices in middle chart "
+                    f"(local index, source vertex): {unreferenced_vertices}"
+                )
+
             local_corners = [
                 local_index[side_seam_vertices[0]],
                 local_index[side_seam_vertices[-1]],
@@ -401,7 +427,16 @@ def _parameterize_cut_mesh(
             )
 
         local_vertices = np.asarray(mesh.vertices[source_vertices], dtype=np.float64)
-        component_area = float(np.sum(trimesh.triangles.area(local_vertices[local_faces])))
+        face_areas = trimesh.triangles.area(local_vertices[local_faces])
+        zero_area_rows = np.flatnonzero(face_areas == 0.0)
+        if zero_area_rows.size:
+            source_face_ids = component_faces[zero_area_rows].tolist()
+            raise ValueError(
+                "Zero-area faces in chart: "
+                f"local rows {zero_area_rows.tolist()}, "
+                f"source mesh faces {source_face_ids}."
+            )
+        component_area = float(np.sum(face_areas))
         print(f"Component with {len(component_faces)} faces has area {component_area:.6g}.")
 
         if len(local_faces) == 1:
@@ -421,6 +456,7 @@ def _parameterize_cut_mesh(
             local_uvs[local_faces[0, 2]] = (x, y)
         else:
             mesh_set = pymeshlab.MeshSet()
+            
             mesh_set.add_mesh(
                 pymeshlab.Mesh(vertex_matrix=local_vertices, face_matrix=local_faces)
             )
@@ -534,21 +570,12 @@ def _parameterize_cut_mesh(
     )
 
 
-def _find_centers(input_path: Path, mesh: trimesh.Trimesh):
+def _find_centers(input_path: Path, vertices: np.ndarray):
     input_path_endpts = input_path.with_name(input_path.name.replace("NoStemHiRes", ""))
     input_path_endpts = input_path_endpts.with_suffix(".txt")
 
-    end_pts = []
-    if os.path.exists(input_path_endpts):
-        with open(str(input_path_endpts), mode="r", encoding="utf-8") as file:
-            end_pts = list(csv.reader(file))
+    vertices = np.asarray(vertices, dtype=np.float64)
 
-        return [
-            np.asarray([float(value) for value in point], dtype=np.float64)
-            for point in end_pts
-        ]
-    vertices = mesh.vertices
-    
     # Y is the vertical axis; the ring lies in the XZ plane.
     horizontal_extents = np.ptp(vertices[:, [0, 2]], axis=0)
     diameter = float(np.max(horizontal_extents))
@@ -557,7 +584,7 @@ def _find_centers(input_path: Path, mesh: trimesh.Trimesh):
     radius = 0.5 * diameter
 
     # Center of the mesh - should be close to 0,0,0
-    pt_center = np.median(mesh.vertices, axis=0)
+    pt_center = np.median(vertices, axis=0)
     verts_center = vertices[np.logical_and(np.abs(vertices[:, 0] - pt_center[0]) < 0.5 * radius,
                                         np.abs(vertices[:, 2] - pt_center[2]) < 0.5 * radius)]
 
@@ -565,21 +592,67 @@ def _find_centers(input_path: Path, mesh: trimesh.Trimesh):
     pt_center_top = verts_top[np.argmin(verts_top[:, 1])]
 
     verts_bot = verts_center[verts_center[:, 1] < y_min + height * 0.2]
-    pt_center_bot = verts_bot[np.argnax(verts_bot[:, 1])]
+    pt_center_bot = verts_bot[np.argmax(verts_bot[:, 1])]
+
+    print(f"center top and bottom{pt_center_top}, {pt_center_bot}")
+
+    end_pts = []
+    if os.path.exists(input_path_endpts):
+        with open(str(input_path_endpts), mode="r", encoding="utf-8") as file:
+            end_pts = list(csv.reader(file))
+
+        print(f"End points from text file {end_pts}")
+        return [
+            np.asarray([float(value) for value in point], dtype=np.float64)
+            for point in end_pts
+        ]
     return [pt_center_top, pt_center_bot]
+
+
+def _write_seam_mesh(mesh: trimesh.Trimesh, vs: list[int], output_path: Path):
+    seam_mesh = mesh.copy()
+    vertex_colors = np.full((len(seam_mesh.vertices), 4), 255, dtype=np.uint8)
+    seam_vertex_ids = np.asarray(vs, dtype=np.int64)
+    if seam_vertex_ids.size and (seam_vertex_ids.min() < 0 or seam_vertex_ids.max() >= len(seam_mesh.vertices)):
+        raise ValueError("Seam vertex indices are outside the mesh vertex array.")
+    vertex_colors[seam_vertex_ids] = [0, 0, 0, 255]
+    seam_mesh.visual.vertex_colors = vertex_colors
+
+    seam_output_path = output_path.with_name(f"{output_path.stem}_seam.ply")
+    seam_mesh.export(str(seam_output_path), file_type="ply")
 
 
 def uv_texture(input_path: Path, output_path: Path):
     """Slice open the top and the bottom and unwrap the middle"""
     mesh = _load_mesh(input_path)
 
-    centers = _find_centers(input_path=input_path, mesh=mesh)
+    centers = _find_centers(input_path=input_path, vertices=mesh.vertices)
 
-    top_seam_vs, top_seam_es = _define_seam(mesh, perc_top_bottom=0.95, perc_width=0.5, pt_center=centers[0])
-    bottom_seam_vs, bottom_seam_es = _define_seam(mesh, perc_top_bottom=0.05, perc_width=0.6, pt_center=centers[1])
-    side_seam_vs, side_seam_es = _side_seam(
-        mesh, top_seam_vs[0], bottom_seam_vs[0]
-    )
+    adjacency = _create_adjacency_structure(mesh=mesh)
+    no_cross_vs = set()
+    top_seam_vs, top_seam_es = _define_seam(mesh=mesh, adjacency=adjacency, no_cross_vs=no_cross_vs,
+                                            perc_top_bottom=0.95, perc_width=0.5, pt_center=centers[0])
+    _write_seam_mesh(mesh=mesh, vs=top_seam_vs, output_path=output_path)    
+    for v in top_seam_vs:
+        no_cross_vs.add(v)
+    bottom_seam_vs, bottom_seam_es = _define_seam(mesh=mesh, adjacency=adjacency, no_cross_vs=no_cross_vs, 
+                                                  perc_top_bottom=0.05, perc_width=0.6, pt_center=centers[1])
+    _write_seam_mesh(mesh=mesh, vs=top_seam_vs + bottom_seam_vs, output_path=output_path)    
+    for v in bottom_seam_vs:
+        no_cross_vs.add(v)
+
+    for indx in range(0, min(len(top_seam_vs), len(bottom_seam_vs))):
+        no_cross_vs.remove(top_seam_vs[indx])
+        no_cross_vs.remove(bottom_seam_vs[indx])
+        try:
+            side_seam_vs, side_seam_es = _side_seam(adjacency=adjacency, v1=top_seam_vs[indx], v2=bottom_seam_vs[indx], no_cross_vs=no_cross_vs)
+            break
+        except:
+            no_cross_vs.add(top_seam_vs[indx])
+            no_cross_vs.add(bottom_seam_vs[indx])
+
+    seam_vs = top_seam_vs + bottom_seam_vs + side_seam_vs
+    _write_seam_mesh(mesh=mesh, vs=seam_vs, output_path=output_path)    
 
     seam_edges = top_seam_es + bottom_seam_es + side_seam_es
     print("Parameterizing the mesh with the requested seam boundaries...")
