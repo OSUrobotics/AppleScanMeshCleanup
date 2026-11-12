@@ -1,3 +1,6 @@
 meshlib>=3.1.4.297,<4
 pymeshlab>=2025.7.post1
 cgal>=5.6
+numpy
+scipy
+Pillow

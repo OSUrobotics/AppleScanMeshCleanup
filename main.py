@@ -11,6 +11,7 @@ Directories
    Voxelized : Generate a new, clean mesh using voxelization and build the cylindrical parameterization. Runs on BlenderStemRemoved
            - it is safe to overwrite these
    BlenderTextured : Manually Bake the texture map from the meshlabcleaned and clean up the stem texture
+   NormalizedTexture : Normalize UV charts and warp the rebaked texture using seams from Voxelized
    Final : Generate Hi and Low res meshees from BlenderTextured.
    """
 from MeshLabCleanup import (
@@ -21,6 +22,7 @@ from MeshLabCleanup import (
 )
 
 from uv_texture import uv_texture
+from normalize_uv_projection import normalize_uv_projection
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -34,13 +36,13 @@ MLX_SCRIPTS = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Clean up, downsample_lowres, downsample_hires, or voxelize."
+        description="Clean up, downsample, voxelize, or normalize UV textures."
     )
     parser.add_argument(
         "--operation",
         required=True,
-        choices=MLX_SCRIPTS,
-        help="Operation to run; selects the corresponding .mlx script and input/output directories.",
+        choices=(*MLX_SCRIPTS, "normalize"),
+        help="Operation to run; selects the input/output directories.",
     )
     parser.add_argument(
         "--input-dir",
@@ -96,16 +98,35 @@ def main():
             downsample_mesh,
             mlx_script_path=MLX_SCRIPTS["downsample_hires"],
         )
+    elif args.operation == "normalize":
+        input_dir = root_dir / "BlenderRebaked"
+        seam_dir = root_dir / "Voxelized"
+        output_dir = root_dir / "NormalizedTexture"
+
+        def process_file(input_path: Path, output_path: Path) -> Path:
+            seam_name = input_path.stem.replace("NoStemHiRes", "") + "_seam.csv"
+            return normalize_uv_projection(input_path, seam_dir / seam_name, output_path)
     else:
         raise ValueError(f"No valid command {args.operation}")
 
-    process_meshes(
+    processed_files = process_meshes(
         input_dir,
         output_dir,
         process_file,
         prompt_overwrite_older=args.prompt_overwrite_older,
         check_existing_outputs=check_existing,
+        input_extensions=(".obj",) if args.operation == "normalize" else (".obj", ".ply", ".stl"),
     )
+    if args.operation == "normalize":
+        expected_count = sum(
+            path.is_file() and path.suffix.lower() == ".obj"
+            for path in input_dir.iterdir()
+        )
+        if len(processed_files) != expected_count:
+            raise RuntimeError(
+                f"Normalized {len(processed_files)} of {expected_count} OBJ files; "
+                "see the errors above for details."
+            )
 
 
 if __name__ == "__main__":

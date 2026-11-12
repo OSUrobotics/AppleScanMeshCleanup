@@ -234,6 +234,7 @@ def process_meshes(
     process_file: MeshProcessor,
     prompt_overwrite_older=False,
     check_existing_outputs=True,
+    input_extensions=(".obj", ".ply", ".stl"),
 ):
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
@@ -250,7 +251,7 @@ def process_meshes(
     no_outputs = set()
     if check_existing_outputs:
         for filename in filenames:
-            if not filename.lower().endswith((".obj", ".ply", ".stl")):
+            if not filename.lower().endswith(input_extensions):
                 continue
 
             input_path = input_dir / filename
@@ -267,7 +268,7 @@ def process_meshes(
                 print(f"  {str(output_path.name)}")
 
     for filename in filenames:
-        if not filename.lower().endswith((".obj", ".ply", ".stl")):
+        if not filename.lower().endswith(input_extensions):
             continue
 
         input_path = input_dir / filename
