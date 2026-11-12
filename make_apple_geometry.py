@@ -92,8 +92,8 @@ def _create_apple_body(
         raise ValueError("n_samples must be at least 3.")
 
     ms = _MeshAssembly()
-    latitudes = [-80.0 + 160.0 * i / n_samples for i in range(n_samples + 1)]
-    latitude_step = 160.0 / n_samples
+    latitudes = [-70.0 + 140.0 * i / n_samples for i in range(n_samples + 1)]
+    latitude_step = 140.0 / n_samples
     adjacent_ring_latitude = (latitudes[0] + latitudes[1]) / 2.0
     latitudes.insert(1, adjacent_ring_latitude)
     rings = [
@@ -117,15 +117,19 @@ def _create_apple_top(
     top_ring: list[int],
     n_samples: int,
 ) -> tuple[int, int]:
-    """Place a grid of vertices across the top hemisphere of the apple mesh."""
+    """Subdivide the spherical cap with rings matching the body sampling density."""
     first_face = len(ms.triangles)
-    cap_step = min(5.0, 80.0 / n_samples)
-    cap_ring = _add_ring(
-        ms,
-        90.0 - cap_step,
-        _longitude_count(90.0 - cap_step, cap_step),
-    )
-    _connect_rings(ms, top_ring, cap_ring)
+    x, y, z = ms.points[top_ring[0]]
+    start_latitude = math.degrees(math.atan2(y, math.hypot(x, z)))
+    body_step = 140.0 / n_samples
+    intervals = max(1, math.ceil((90.0 - start_latitude) / body_step))
+    cap_step = (90.0 - start_latitude) / intervals
+    cap_ring = top_ring
+    for index in range(1, intervals):
+        latitude = start_latitude + index * cap_step
+        next_ring = _add_ring(ms, latitude, _longitude_count(latitude, cap_step))
+        _connect_rings(ms, cap_ring, next_ring)
+        cap_ring = next_ring
 
     pole = len(ms.points)
     ms.points.append((0.0, 0.5, 0.0))
@@ -290,6 +294,10 @@ def _middle_uv(
     return 0.5 + 0.5 * (longitude - height), 0.5 * (longitude + height)
 
 
+def _longitude(point: tuple[float, float, float]) -> float:
+    return (math.atan2(-point[2], point[0]) % (2 * math.pi)) / (2 * math.pi)
+
+
 def _write_texture_map(texture_path: Path) -> None:
     image = bytearray()
     for row in range(_TEXTURE_SIZE):
@@ -328,11 +336,13 @@ def _write_texture_map(texture_path: Path) -> None:
 def _write_material_file(material_path: Path, texture_filename: str) -> None:
     material_path.write_text(
         "newmtl apple\n"
-        "Ka 1.000000 1.000000 1.000000\n"
-        "Kd 1.000000 1.000000 1.000000\n"
-        "Ks 0.000000 0.000000 0.000000\n"
+        "Ka 0.150000 0.030000 0.030000\n"
+        "Kd 0.6500000 0.120000 0.100000\n"
+        "Ks 0.1800000 0.180000 0.180000\n"
+        "Ns 30.000000\n"
+        "Ni 1.4500000\n"
         "d 1.000000\n"
-        "illum 1\n"
+        "illum 2\n"
         f"map_Kd {texture_filename}\n",
         encoding="utf-8",
     )
@@ -347,7 +357,12 @@ def _write_seam_csv(
     top_radius: float,
     bottom_radius: float,
 ) -> None:
-    """Write top and bottom ring rows, then the four middle-diamond sides."""
+    """Write vertex, U and V rows for both rings and the four body-chart sides."""
+    def write_rows(writer, vertices, uvs):
+        writer.writerow(vertices)
+        writer.writerow([uv[0] for uv in uvs])
+        writer.writerow([uv[1] for uv in uvs])
+
     def write_ring_rows(
         writer,
         ring: list[int],
@@ -356,22 +371,33 @@ def _write_seam_csv(
     ) -> None:
         closed_ring = [*ring, ring[0]]
         uvs = [_circle_uv(ms.points[vertex], center, radius) for vertex in closed_ring]
-        writer.writerow(closed_ring)
-        writer.writerow([uv[0] for uv in uvs])
-        writer.writerow([uv[1] for uv in uvs])
+        write_rows(writer, closed_ring, uvs)
 
     top_side = [*top_ring, top_ring[0]]
     right_side = list(reversed(side_seam))
     bottom_side = [bottom_ring[0], *reversed(bottom_ring[1:]), bottom_ring[0]]
     left_side = side_seam
+    bottom_y = ms.points[bottom_ring[0]][1]
+    top_y = ms.points[top_ring[0]][1]
+
+    side_longitudes = [
+        [*[_longitude(ms.points[vertex]) for vertex in top_ring], 1.0],
+        [1.0] * len(right_side),
+        [1.0, *[_longitude(ms.points[vertex]) for vertex in reversed(bottom_ring[1:])], 0.0],
+        [0.0] * len(left_side),
+    ]
     with csv_path.open("w", encoding="utf-8", newline="") as seam_file:
         writer = csv.writer(seam_file)
         write_ring_rows(writer, top_ring, _TOP_UV_CENTER, top_radius)
         write_ring_rows(writer, bottom_ring, _BOTTOM_UV_CENTER, bottom_radius)
-        writer.writerow(top_side)
-        writer.writerow(right_side)
-        writer.writerow(bottom_side)
-        writer.writerow(left_side)
+        for side, longitudes in zip(
+            (top_side, right_side, bottom_side, left_side), side_longitudes
+        ):
+            uvs = [
+                _middle_uv(ms.points[vertex], angle, bottom_y, top_y)
+                for vertex, angle in zip(side, longitudes)
+            ]
+            write_rows(writer, side, uvs)
 
 
 def _write_obj_with_uv(
@@ -413,11 +439,7 @@ def _write_obj_with_uv(
         for face_index, face in enumerate(ms.triangles):
             is_top = top_faces[0] <= face_index < top_faces[1]
             is_bottom = bottom_faces[0] <= face_index < bottom_faces[1]
-            longitudes = [
-                (math.atan2(-ms.points[vertex][2], ms.points[vertex][0]) % (2 * math.pi))
-                / (2 * math.pi)
-                for vertex in face
-            ]
+            longitudes = [_longitude(ms.points[vertex]) for vertex in face]
             if not is_top and not is_bottom and max(longitudes) - min(longitudes) > 0.5:
                 longitudes = [
                     longitude + 1.0 if longitude < 0.5 else longitude
@@ -480,7 +502,7 @@ def _main(argv=None):
     parser = argparse.ArgumentParser(description='Generate a procedural apple mesh with a calyx.')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--variety', default='random', help='random or a named cultivar')
-    parser.add_argument('--n_samples', default=32, type=int)
+    parser.add_argument('--n_samples', default=64, type=int)
     parser.add_argument('--blemishes', type=float, default=0.20)
     parser.add_argument('--output-file', default='/Users/cindygrimm/PycharmProjects/data/ScannedModels/apple.obj', help='Path to the output OBJ mesh')
     args = parser.parse_args(argv)

@@ -105,12 +105,13 @@ def _write_material_file(material_path: Path, texture_filename: str):
         "# www.blender.org\n"
         "\n"
         "newmtl material_0\n"
-        "Ns 0.000000\n"
-        "Ka 1.000000 1.000000 1.000000\n"
-        "Ks 1.000000 1.000000 1.000000\n"
-        "Ke 0.000000 0.000000 0.000000\n"
-        "Ni 1.500000\n"
+        "Ka 0.150000 0.030000 0.030000\n"
+        "Kd 0.6500000 0.120000 0.100000\n"
+        "Ks 0.1800000 0.180000 0.180000\n"
+        "Ns 30.000000\n"
+        "Ni 1.4500000\n"
         "d 1.000000\n"
+        "illum 2\n"
         "illum 2\n"
         f"map_Kd {texture_filename}\n",
         encoding="utf-8",
