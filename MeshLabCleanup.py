@@ -1,3 +1,18 @@
+""" Clean up meshes
+  Clean up 1 (process_mesh): run a MeshLab filter script on the input mesh and save the result.
+     - this takes out non-manifold edges, disconnected components, fills holes, and does a downsample
+     - this uses the pymeshlab librar
+  Clean up 2 (voxelize): Use voxelization to remove small tunnels from the mesh. Also removes disconnected components and faces with zero area
+     - After voxelization the mesh is parameterized for UV texture mapping
+        - the middle of the mesh is unrolled into a cylindrical texture map placed diagonally
+        - the top and bottom of the mesh are mapped to circular regions (top left and bottom right)
+    - this operation uses meshlib (which is not smart enough to keep texture map coords, etc)
+    - After the uv parameterization pymeshlab is used to write out the uv coordinates
+  Clean up 3 (downsample to final): Uses pymesnlab and a meshlab script to reduce the mesh to the target counts. 
+    - After downsample, the clicked end points are used to orient the mesh so that the stem is at 0, 0. This reorientation 
+      is done with pymeshlab.
+
+"""
 import os
 from pathlib import Path
 from typing import Callable
@@ -208,7 +223,7 @@ def voxelize_mesh(input_path: Path, output_path: Path) -> Path:
     print("voxel fixed topology")
     print_mesh_topology(output_path)
 
-    path_uv = output_path.with_name(f"{output_path.stem}_uv{output_path.suffix}")
+    path_uv = output_path.with_name(input_path.name.replace("NoStemHiRes", ""))
 
     uv_texture(input_path=output_path, output_path=path_uv)
 
@@ -249,7 +264,7 @@ def process_meshes(
         if already_done:
             print("Output files that are already done:")
             for output_path in sorted(already_done):
-                print(f"  {output_path.name}")
+                print(f"  {str(output_path.name)}")
 
     for filename in filenames:
         if not filename.lower().endswith((".obj", ".ply", ".stl")):

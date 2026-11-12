@@ -29,17 +29,70 @@ import pymeshlab
 import trimesh
 
 
-def _write_blank_texture(texture_path: Path):
-    """Write a solid-white 1024x1024 RGB PNG without external image dependencies."""
+def _write_blank_texture(n_vs: int, seam_vs: list[list[list[int]]], uvs: np.ndarray, texture_path: Path):
+    """Write a white 1024x1024 RGB PNG with the top seam marked in green, the bottom in blue, and the side seams in black.
+      The first set of vs in the top seam are the edge of the middle mesh
+      The first set of vs in the bottom seam are the left edge of the middle mesh
+      The two triplets are the duplicated corners of the middle mesh"""
+    image_size = 1024
+
+    image_data = np.full((image_size, image_size, 3), 255, dtype=np.uint8)
+    # Color all the pixels that belong to vertices grey
+    pixels = np.clip(uvs * image_size, 0, image_size - 1).astype(np.uint)
+    image_data[pixels[:, 1], pixels[:, 0]] = (128, 128, 128)
+
+    def color_pixels(uv_locs: np.ndarray, color: tuple[int, int, int]) -> None:
+        pixels = np.clip(uv_locs * image_size, 0, image_size - 1).astype(np.uint)
+        if pixels.ndim == 1:
+            image_data[pixels[1], pixels[0]] = color
+        else:
+            image_data[pixels[:, 1], pixels[:, 0]] = color
+
+    def color_seam(seam_vertices: list[list[int]], uvs: np.ndarray, color: tuple[int, int, int]) -> None:
+        seam_vs_side1 = []
+        seam_vs_side2 = []
+        for vs in seam_vertices:
+            seam_vs_side1.append(vs[0])
+            seam_vs_side2.append(vs[1])
+            
+        uv_locs = uvs[seam_vs_side1]
+        color_pixels(uv_locs, color)
+            
+        uv_locs = uvs[seam_vs_side2]
+        color_pixels(uv_locs, (color[0] // 2, color[1] // 2, color[2] // 2))
+
+    if len(seam_vs) != 3:
+        raise ValueError("Expected top, bottom, and side seam vertex lists.")
+    color_seam(seam_vs[0], uvs, (0, 255, 0))
+    color_seam(seam_vs[1], uvs, (0, 0, 255))
+    color_seam(seam_vs[2], uvs, (255, 0, 0))
+
+    # Corners
+    print(f"Corner vs: {seam_vs[2][0]}, {seam_vs[2][-1]}")
+    """
+    corner_v1 = seam_vs[2][0]
+    corner_v2 = seam_vs[2][-1]
+    for col, corners in zip([(255, 255, 0), (0, 255, 255)], [corner_v1, corner_v2]):
+        for corner in corners:
+            color_pixels(uvs[corner, :], col)
+    """
+    corner_v1 = seam_vs[2][0][1]
+    corner_v2 = seam_vs[2][-1][1]
+    color_pixels(uvs[corner_v1, :], (255, 255, 0))
+    color_pixels(uvs[corner_v2, :], (0, 255, 255))
+
+    scanlines = np.empty((image_size, image_size * 3 + 1), dtype=np.uint8)
+    scanlines[:, 0] = 0
+    scanlines[:, 1:] = image_data.reshape(image_size, image_size * 3)
+    compressed_data = zlib.compress(scanlines.tobytes())
+
     def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
         chunk = chunk_type + data
         return struct.pack(">I", len(data)) + chunk + struct.pack(">I", zlib.crc32(chunk))
 
-    image_data = b"\x00" + b"\xff" * (1024 * 3)
-    compressed_data = zlib.compress(image_data * 1024)
     png_data = (
         b"\x89PNG\r\n\x1a\n"
-        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1024, 1024, 8, 2, 0, 0, 0))
+        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", image_size, image_size, 8, 2, 0, 0, 0))
         + png_chunk(b"IDAT", compressed_data)
         + png_chunk(b"IEND", b"")
     )
@@ -66,11 +119,17 @@ def _write_material_file(material_path: Path, texture_filename: str):
 
 def _export_obj_with_uv(
     mesh: trimesh.Trimesh,
+    seam_vs: list[list[list[int]]],
     vmapping: np.ndarray,
-    indices: np.ndarray,
+    face_indices: np.ndarray,
     uvs: np.ndarray,
     output_path: Path,
 ):
+    """ Keeps the original vertices in mesh
+        The texture map coordinates are in uvs. There are more texture map coords than vertices
+        face_indices is a list of face indices
+        vmapping is the mapping from the face vertex ids (which has the duplicate vertex ids) to the original vertices
+        """
     if vmapping.ndim != 1 or uvs.ndim != 2 or uvs.shape[1] != 2:
         raise ValueError("Expected one-dimensional vertex mapping and an (N, 2) UV array.")
     if len(vmapping) != len(uvs):
@@ -79,15 +138,15 @@ def _export_obj_with_uv(
         )
     if vmapping.size and (vmapping.min() < 0 or vmapping.max() >= len(mesh.vertices)):
         raise ValueError("Vertex mapping contains indices outside the source mesh.")
-    output_vertex_ids = vmapping
-    if indices.ndim != 2 or indices.shape[1] != 3:
+
+    if face_indices.ndim != 2 or face_indices.shape[1] != 3:
         raise ValueError("OBJ UV export expects triangular faces.")
-    if indices.size and (indices.min() < 0 or indices.max() >= len(output_vertex_ids)):
+    if face_indices.size and (face_indices.min() < 0 or face_indices.max() >= len(vmapping)):
         raise ValueError("Face indices are outside the output vertex/UV arrays.")
 
     material_path = output_path.with_suffix(".mtl")
     texture_path = output_path.with_suffix(".png")
-    _write_blank_texture(texture_path)
+    _write_blank_texture(n_vs=len(mesh.vertices), seam_vs=seam_vs, uvs=uvs, texture_path=texture_path)
     _write_material_file(material_path, texture_path.name)
 
     with output_path.open("w", encoding="utf-8", newline="\n") as obj_file:
@@ -97,9 +156,9 @@ def _export_obj_with_uv(
         for u, v in uvs:
             obj_file.write(f"vt {u:.9g} {v:.9g}\n")
         obj_file.write("usemtl material_0\n")
-        for face in indices:
+        for face in face_indices:
             corners = " ".join(
-                f"{int(output_vertex_ids[index]) + 1}/{int(index) + 1}" for index in face
+                f"{int(vmapping[index]) + 1}/{int(index) + 1}" for index in face
             )
             obj_file.write(f"f {corners}\n")
 
@@ -444,34 +503,18 @@ def _parameterize_cut_mesh(
         component_area = float(np.sum(face_areas))
         print(f"Component with {len(component_faces)} faces has area {component_area:.6g}.")
 
-        if len(local_faces) == 1:
-            p0, p1, p2 = local_vertices[local_faces[0]]
-            edge = p1 - p0
-            edge_length = float(np.linalg.norm(edge))
-            if edge_length == 0:
-                raise ValueError("Cannot parameterize a degenerate triangle.")
-            axis = edge / edge_length
-            third = p2 - p0
-            x = float(np.dot(third, axis))
-            y = float(np.linalg.norm(third - x * axis))
-            if y == 0:
-                raise ValueError("Cannot parameterize a degenerate triangle.")
-            local_uvs = np.zeros((len(source_vertices), 2), dtype=np.float64)
-            local_uvs[local_faces[0, 1]] = (edge_length, 0.0)
-            local_uvs[local_faces[0, 2]] = (x, y)
-        else:
-            mesh_set = pymeshlab.MeshSet()
-            
-            mesh_set.add_mesh(
-                pymeshlab.Mesh(vertex_matrix=local_vertices, face_matrix=local_faces)
+        mesh_set = pymeshlab.MeshSet()
+        
+        mesh_set.add_mesh(
+            pymeshlab.Mesh(vertex_matrix=local_vertices, face_matrix=local_faces)
+        )
+        mesh_set.compute_texcoord_parametrization_least_squares_conformal_maps()
+        local_uvs = np.asarray(mesh_set.current_mesh().vertex_tex_coord_matrix(), dtype=np.float64)
+        if local_uvs.shape != (len(source_vertices), 2):
+            raise ValueError(
+                "PyMeshLab returned unexpected UV dimensions "
+                f"{local_uvs.shape} for {len(source_vertices)} vertices."
             )
-            mesh_set.compute_texcoord_parametrization_least_squares_conformal_maps()
-            local_uvs = np.asarray(mesh_set.current_mesh().vertex_tex_coord_matrix(), dtype=np.float64)
-            if local_uvs.shape != (len(source_vertices), 2):
-                raise ValueError(
-                    "PyMeshLab returned unexpected UV dimensions "
-                    f"{local_uvs.shape} for {len(source_vertices)} vertices."
-                )
 
         chart_data.append(
             (component_area, local_corners, source_vertices, local_faces, local_uvs, is_middle_component, is_top_component, is_bot_component)
@@ -496,7 +539,10 @@ def _parameterize_cut_mesh(
     pad = 3.0 / 1024.0
     chart_id = 1
     for (_, local_corners, source_vertices, local_faces, local_uvs, is_middle, is_top, is_bottom) in chart_data:
-        if local_corners is not None:
+        if is_middle:
+            if local_corners is None:
+                raise ValueError(f"Middle chart did not have the corner vertices")
+
             corner_uvs = local_uvs[local_corners]
             corner_center = corner_uvs.mean(axis=0)
             corner_order = sorted(
@@ -552,8 +598,10 @@ def _parameterize_cut_mesh(
             if is_bottom:
                 packed_uvs = normalized_uvs + [pad, 0.8 - pad]
                 chart_id += 1
-            else:
+            elif is_top:
                 packed_uvs = normalized_uvs + [0.8 - pad, pad]
+            else:
+                raise ValueError(f"Was not top, bottom, or middle")
 
         if np.any(packed_uvs < -1e-10) or np.any(packed_uvs > 1.0 + 1e-10):
             raise ValueError(f"Chart {chart_id} produced UV coordinates outside [0, 1].")
@@ -623,6 +671,55 @@ def _write_seam_mesh(mesh: trimesh.Trimesh, vs: list[int], output_path: Path):
     seam_mesh.export(str(seam_output_path), file_type="ply")
 
 
+def _write_seams_as_txt_file(seams: list[list[int]], seams_uv: list[list[list[int]]], uvs: np.ndarray, output_path: Path):
+    """ Write out the seam locations. For each seam write
+       - the vertex coordinates in the mesh of the seam
+       - the uv coordinates of the seam on the top/bottom
+       - the uv coordinates of the seam on the side for the top/bottom seam
+       - the uv coordinates of the two parts of the side seam"""
+    seam_output_path = output_path.with_name(f"{output_path.stem}_seam.csv")
+
+    with open(str(seam_output_path), 'w') as fp:
+        # Write the top and bottom seam vertices and their UV coordinates
+        # These are circles
+        for seam_indx in range(0, 2):
+            v_str = ""
+            for v in seams[seam_indx]:
+                v_str += f"{v}, "
+            fp.write(v_str + "\n")
+
+            # u then v
+            for indx in [0, 1]:
+                v_str = ""
+                for vindx in seams_uv[seam_indx]:
+                    uv = uvs[vindx[-1]]
+                    v_str += f"{uv[indx]}, "
+                fp.write(v_str + "\n")
+
+        # Now write the four sides of the middle mesh seams
+        for seam_index, indx_offset, b_reverse in [(0, 0, False), (2, 0, False), (1, 0, True), (2, 1, True)]:
+            v_str = ""
+            if b_reverse:
+                seam_list = list(reversed(seams[seam_index]))
+            else:
+                seam_list = seams[seam_index]
+            for v in seam_list:
+                v_str += f"{v}, "
+            fp.write(v_str + "\n")
+
+            # u then v
+            for indx in [0, 1]:
+                v_str = ""
+                if b_reverse:
+                    seams_uv_list = list(reversed(seams_uv[seam_index]))
+                else:
+                    seams_uv_list = seams_uv[seam_index]
+                for vindx in seams_uv_list:
+                    uv = uvs[vindx[indx_offset]]
+                    v_str += f"{uv[indx]}, "
+                fp.write(v_str + "\n")
+                 
+    
 def uv_texture(input_path: Path, output_path: Path):
     """Slice open the top and the bottom and unwrap the middle"""
     mesh = _load_mesh(input_path)
@@ -652,17 +749,35 @@ def uv_texture(input_path: Path, output_path: Path):
             no_cross_vs.add(top_seam_vs[indx])
             no_cross_vs.add(bottom_seam_vs[indx])
 
-    seam_vs = top_seam_vs + bottom_seam_vs + side_seam_vs
-    _write_seam_mesh(mesh=mesh, vs=seam_vs, output_path=output_path)    
+    seam_vs_flat = top_seam_vs + bottom_seam_vs + side_seam_vs
+    _write_seam_mesh(mesh=mesh, vs=seam_vs_flat, output_path=output_path)    
 
     seam_edges = top_seam_es + bottom_seam_es + side_seam_es
     print("Parameterizing the mesh with the requested seam boundaries...")
-    vmapping, indices, uvs = _parameterize_cut_mesh(mesh, seam_edges, side_seam_vs)
+    vmapping, indices, uvs = _parameterize_cut_mesh(mesh, seam_edges, side_seam_vertices=side_seam_vs)
 
-    # ==========================================
-    # 5. EXPORT THE ASSET
-    # ==========================================
-    _export_obj_with_uv(mesh, vmapping, indices, uvs, output_path)
+    # Export the mesh with the uv coordinates, create an image with the seams/vertices marked, and export the seams
+    # This is the reverse of vmapping - it says which original vertices correspond to each mapped vertex.
+    #.  Since the seam vertices were duplicated, there should be 2 for each original seam vertex, and 4 for the corners of the middle mesh
+    map_vs_back = {}
+    for indx in range(0, vmapping.shape[0]):
+        v_map = vmapping[indx]
+        if v_map not in map_vs_back:
+            map_vs_back[v_map] = []
+        map_vs_back[v_map].append(indx)
+        
+    # Figure out where each of the seam vertices went. 
+    seam_vs_mapped = []
+    seam_vs = [top_seam_vs[1:-1], bottom_seam_vs[1:-1], side_seam_vs]
+    for seam in seam_vs:
+        seam_mapped = [map_vs_back[v] for v in seam]
+        seam_vs_mapped.append(seam_mapped)
+
+    _export_obj_with_uv(mesh=mesh, seam_vs=seam_vs_mapped, vmapping=vmapping, face_indices=indices, uvs=uvs, output_path=output_path)    
+    _write_seams_as_txt_file(seams=seam_vs, 
+                             seams_uv=seam_vs_mapped,
+                             uvs=uvs,
+                             output_path=output_path)
     print(f"✓ Asset exported with manual UV seams to: {output_path}")
 
 
