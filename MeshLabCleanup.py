@@ -15,19 +15,116 @@
 """
 import os
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Callable
 
 import numpy as np
 import pymeshlab as pml
 from meshlib import mrmeshpy as mm
 
-from MeshLibCleanup import (
-    print_mesh_topology,
-)
+from MeshLibCleanup import print_mesh_topology
 
 from uv_texture import uv_texture, _find_centers
 
 MeshProcessor = Callable[[Path, Path], Path]
+
+
+def _write_material_file(material_path: Path, texture_filename: str):
+    if "Envy" in os.path.basename(material_path):
+        Ka = (0.15, 0.03, 0.03)
+        Kd = (0.65, 0.12, 0.10)
+        Ks = (0.18, 0.18, 0.18)
+    elif "Gala" in os.path.basename(material_path):
+        Ka = (0.18, 0.06, 0.03)
+        Kd = (0.78, 0.28, 0.12)
+        Ks = (0.15, 0.15, 0.15)
+    elif "PinkLady" in os.path.basename(material_path):
+        Ka = (0.19, 0.07, 0.07)
+        Kd = (0.82, 0.30, 0.32)
+        Ks = (0.15, 0.18, 0.15)
+    elif "CosmicCrisp" in os.path.basename(material_path):
+        Ka = (0.10, 0.02, 0.02)
+        Kd = (0.42, 0.07, 0.09)
+        Ks = (0.15, 0.15, 0.15)
+    elif "HoneyCrisp" in os.path.basename(material_path):
+        Ka = (0.17, 0.05, 0.03)
+        Kd = (0.74, 0.22, 0.14)
+        Ks = (0.15, 0.15, 0.15)
+    else:
+        Ka = (0.15, 0.03, 0.03)
+        Kd = (0.65, 0.12, 0.10)
+        Ks = (0.18, 0.18, 0.18)
+
+    material_path.write_text(
+        "# Blender 5.0.1 MTL File: 'process_apples.blend'\n"
+        "# www.blender.org\n"
+        "\n"
+        "newmtl material_0\n"
+        f"Ka {Ka[0]} {Ka[1]} {Ka[2]}\n"
+        f"Kd {Kd[0]} {Kd[1]} {Kd[2]}\n"
+        f"Ks {Ks[0]} {Ks[1]} {Ks[2]}\n"
+        "Ns 30.000000\n"
+        "Ni 1.4500000\n"
+        "d 1.000000\n"
+        "illum 2\n"
+        f"map_Kd {texture_filename}\n",
+        encoding="utf-8",
+    )
+
+
+def _rename_mesh(input_path: Path, output_path: Path, use_original_material_file: bool) -> None:
+    """ Copy the obj file over and update material references if needed."""
+    new_lines = []
+    mtl_name = ""
+    tex_name = ""
+    with open(input_path, "r") as fIn:
+        data = fIn.read()
+        for s in data.splitlines():
+            if ".mtl" in s:
+                mtl_pieces = s.split(" ")
+                mtl_name = mtl_pieces[-1]
+                s = "mtllib " + output_path.with_suffix(".mtl").name
+            elif "usemtl" in s and not use_original_material_file:
+                s = "usemtl material_0"
+            elif len(s) > 0 and s[0] == "o":
+                mtl_pieces = s.split(" ")
+                tex_name = mtl_pieces[-1]
+                s = "o " + output_path.with_suffix("").name
+            new_lines.append(s)
+
+    with open(output_path, "w") as fOut:
+        fOut.write("\n".join(new_lines))
+
+    # Copy the texture file if it exists
+    if tex_name == "":
+        tex_name = input_path.name.rsplit(".", 1)[0]
+    for ext in [".png", ".jpg", ".jpeg"]:
+        if os.path.exists(input_path.with_name(tex_name + ext)):
+            tex_name += ext
+            break   
+    tex_path = input_path.with_name(tex_name)
+    if os.path.exists(tex_path):
+        shutil.copy(tex_path, output_path.with_suffix(tex_path.suffix))
+
+    if use_original_material_file and os.path.exists(input_path.basename + mtl_name):
+        if os.path.exists(input_path.basename + mtl_name):
+            new_lines = []
+            with open(input_path.basename + mtl_name, "r") as fIn:
+                data = fIn.read()
+                for s in data.splitlines():
+                    if "map_Kd" in s:
+                        tex_pieces = s.split(" ")
+                        s = f"map_Kd {tex_pieces[-1]}"
+                    new_lines.append(s)
+
+            with open(output_path.with_suffix(".mtl"), "w") as fOut:
+                fOut.write("\n".join(new_lines))
+    else:
+        output_tex_name = output_path.name.replace(output_path.suffix, tex_path.suffix)
+        _write_material_file(output_path.with_suffix(".mtl"), output_tex_name)
+
+    print(f"Renaming mesh {input_path} to {output_path}, texture: {tex_name}, material: {mtl_name}")
 
 
 def _process_mesh(input_path: Path, output_path: Path, mlx_script_path: Path) -> None:
@@ -37,15 +134,27 @@ def _process_mesh(input_path: Path, output_path: Path, mlx_script_path: Path) ->
     print(f"Trying mesh {input_path}")
     ms.load_filter_script(str(mlx_script_path))
     ms.apply_filter_script()
-    ms.save_current_mesh(
-        str(output_path),
-        save_textures=True,
-        save_vertex_color=True,
-        save_vertex_normal=True,
-        save_face_color=True,
-        save_wedge_texcoord=True,
-        save_wedge_normal=True,
-    )
+
+    textures = ms.current_mesh().textures()
+    if len(textures) > 1:
+        raise ValueError(f"Expected at most one texture in {input_path}, found {len(textures)}.")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        if textures:
+            texture_name, texture = next(iter(textures.items()))
+            renamed_texture = Path(temporary) / output_path.with_suffix(Path(texture_name).suffix).name
+            texture.save(str(renamed_texture))
+            ms.set_texture_per_mesh(textname=str(renamed_texture))
+
+        ms.save_current_mesh(
+            str(output_path),
+            save_textures=True,
+            save_vertex_color=True,
+            save_vertex_normal=True,
+            save_face_color=True,
+            save_wedge_texcoord=True,
+            save_wedge_normal=True,
+        )
 
     print(f"Processed and saved: {output_path.name}")
 
@@ -228,10 +337,29 @@ def voxelize_mesh(input_path: Path, output_path: Path) -> Path:
     uv_texture(input_path=output_path, output_path=path_uv)
 
 
+def _split_filename_into_apple_type_and_number(filename: str) -> tuple[str, int]:
+    # Get the apple name part of the filename
+    apple_name = ""
+    for c in filename:
+        if c.isdigit() or c == "_":
+            break
+        apple_name += c
+    
+    # Get the number out of the filename
+
+    import re
+    match = re.search(r"(\d+)", filename)
+    if not match:
+        raise ValueError(f"Filename does not match expected pattern: {filename}")
+    number = int(match.group(1))
+    return apple_name, number
+
+
 def process_meshes(
     input_dir,
     output_dir,
     process_file: MeshProcessor,
+    new_tag_output_filename=None,
     prompt_overwrite_older=False,
     check_existing_outputs=True,
     input_extensions=(".obj", ".ply", ".stl"),
@@ -256,6 +384,12 @@ def process_meshes(
 
             input_path = input_dir / filename
             output_path = output_dir / filename
+            if new_tag_output_filename:
+                # first strip out everything past the apple name and number by splitting file name at the end of the number
+                apple_name, number = _split_filename_into_apple_type_and_number(filename)
+                output_filename = f"{apple_name}_{number:03d}_{new_tag_output_filename}"
+
+                output_path = output_path.with_name(output_filename + output_path.suffix)   
             if input_path.is_file() and output_path.is_file():
                 if output_path.stat().st_mtime_ns > input_path.stat().st_mtime_ns:
                     already_done.add(output_path)
@@ -273,6 +407,13 @@ def process_meshes(
 
         input_path = input_dir / filename
         output_path = output_dir / filename
+
+        if new_tag_output_filename:
+            # first strip out everything past the apple name and number by splitting file name at the end of the number
+            apple_name, number = _split_filename_into_apple_type_and_number(filename)
+            output_filename = f"{apple_name}_{number:03d}_{new_tag_output_filename}"
+
+            output_path = output_path.with_name(output_filename + output_path.suffix)   
 
         if check_existing_outputs and output_path.exists():
             if output_path in already_done:

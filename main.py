@@ -18,7 +18,8 @@ from MeshLabCleanup import (
     cleanup_mesh,
     downsample_mesh,
     process_meshes,
-    voxelize_mesh
+    voxelize_mesh,
+    _rename_mesh
 )
 
 from uv_texture import uv_texture
@@ -31,6 +32,7 @@ MLX_SCRIPTS = {
     "downsample_lowres": SCRIPT_DIR / "MeshLabScripts" / "downsample_lowres.mlx",
     "downsample_hires": SCRIPT_DIR / "MeshLabScripts" / "downsample_hires.mlx",
     "voxelize": SCRIPT_DIR / "MeshLabScripts" / "post_tunnel.mlx",
+    "rename": SCRIPT_DIR / "MeshLabScripts" / "MeshLabCleanup.mlx",
 }
 
 
@@ -45,12 +47,40 @@ def parse_args():
         help="Operation to run; selects the input/output directories.",
     )
     parser.add_argument(
-        "--input-dir",
+        "--root-dir",
         required=True,
         help="Top-level folder containing OriginalRevoScans, MeshLabCleaned, MeshLabDownsampled, and BlenderTextures.",
     )
     parser.add_argument(
+        "--source-dir",
+        required=False,
+        help="One of the subdirectories: OriginalRevoScans, MeshLabCleaned, MeshLabDownsampled, and BlenderTextures.",
+    )
+    parser.add_argument(
+        "--dest-dir",
+        required=False,
+        help="One of the subdirectories: MeshLabCleaned, MeshLabDownsampled, BlenderStemRemoved, Voxelized, BlenderRebaked, NormalizedTexture, and Final.",
+    )
+    parser.add_argument(
+        "--dest-name",
+        required=False,
+        help="What to append after Apple# for the file name.",
+    )
+    parser.add_argument(
+        "--use_smart_uv",
+        required=False,
+        action="store_true",
+        help="Use Blender's smart uv projection to create uv texture coordinates",
+    )
+    parser.add_argument(
+        "--use_original_material_file",
+        required=False,
+        action="store_true",
+        help="Whether to use the original material file for the mesh.",
+    )
+    parser.add_argument(
         "--prompt-overwrite-older",
+        required=False,
         action="store_true",
         help="List outputs older than their matching inputs and prompt before overwriting.",
     )
@@ -59,7 +89,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    root_dir = Path(args.input_dir)
+    root_dir = Path(args.root_dir)
 
     check_existing = False
     if args.operation == "cleanup":
@@ -106,6 +136,15 @@ def main():
         def process_file(input_path: Path, output_path: Path) -> Path:
             seam_name = input_path.stem.replace("NoStemHiRes", "") + "_seam.csv"
             return normalize_uv_projection(input_path, seam_dir / seam_name, output_path)
+    elif args.operation == "rename":
+        input_dir = root_dir / args.source_dir
+        output_dir = root_dir / args.dest_dir
+        if not args.source_dir or not args.dest_dir:
+            raise ValueError("Both --source-dir and --dest-dir must be specified for the rename operation.")
+        process_file = partial(
+            _rename_mesh,
+            use_original_material_file=args.use_original_material_file,
+        )
     else:
         raise ValueError(f"No valid command {args.operation}")
 
@@ -115,7 +154,8 @@ def main():
         process_file,
         prompt_overwrite_older=args.prompt_overwrite_older,
         check_existing_outputs=check_existing,
-        input_extensions=(".obj",) if args.operation == "normalize" else (".obj", ".ply", ".stl"),
+        new_tag_output_filename=args.dest_name,
+        input_extensions=(".obj",),
     )
     if args.operation == "normalize":
         expected_count = sum(

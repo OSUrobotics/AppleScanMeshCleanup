@@ -21,7 +21,6 @@ from collections import deque
 from pathlib import Path
 import struct
 import zlib
-
 import os
 import csv
 import numpy as np
@@ -97,25 +96,6 @@ def _write_blank_texture(n_vs: int, seam_vs: list[list[list[int]]], uvs: np.ndar
         + png_chunk(b"IEND", b"")
     )
     texture_path.write_bytes(png_data)
-
-
-def _write_material_file(material_path: Path, texture_filename: str):
-    material_path.write_text(
-        "# Blender 5.0.1 MTL File: 'process_apples.blend'\n"
-        "# www.blender.org\n"
-        "\n"
-        "newmtl material_0\n"
-        "Ka 0.150000 0.030000 0.030000\n"
-        "Kd 0.6500000 0.120000 0.100000\n"
-        "Ks 0.1800000 0.180000 0.180000\n"
-        "Ns 30.000000\n"
-        "Ni 1.4500000\n"
-        "d 1.000000\n"
-        "illum 2\n"
-        "illum 2\n"
-        f"map_Kd {texture_filename}\n",
-        encoding="utf-8",
-    )
 
 
 def _export_obj_with_uv(

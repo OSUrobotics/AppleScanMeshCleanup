@@ -84,6 +84,27 @@ class NormalizeUVProjectionTests(unittest.TestCase):
             self.assertLess(abs(pixel[1] - 126), 5)
             self.assertEqual(pixel[2], 100)
 
+    def test_normalized_seam_csv_preserves_ids_and_uses_output_uvs(self):
+        normalize_uv_projection(self.input_path, self.seam_path, self.output_path)
+        output_seam = self.output_path.with_name(self.output_path.stem + "_seam.csv")
+        input_records = normalization._read_seam_records(self.seam_path)
+        output_records = normalization._read_seam_records(output_seam)
+        _, before, _, _ = _read_obj(self.input_path)
+        _, after, _, _ = _read_obj(self.output_path)
+        indices = normalization._match_seam_uvs(before, [uv for _, uv in input_records])
+        self.assertEqual(len(output_records), 6)
+        for (old_ids, _), (new_ids, actual), uv_indices in zip(input_records, output_records, indices):
+            self.assertEqual(new_ids, old_ids)
+            np.testing.assert_allclose(actual, after[uv_indices], atol=1e-8)
+
+    def test_refuses_to_overwrite_source_seam(self):
+        self.seam_path = self.input_dir / "result_seam.csv"
+        self.seam_path.write_text((self.seam_dir / "Apple_seam.csv").read_text())
+        original = self.seam_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "must not overwrite"):
+            normalize_uv_projection(self.input_path, self.seam_path, self.input_dir / "result.obj")
+        self.assertEqual(self.seam_path.read_bytes(), original)
+
     def test_rejects_mismatched_seam(self):
         with self.seam_path.open(encoding="utf-8", newline="") as seam_file:
             rows = list(csv.reader(seam_file))
@@ -93,6 +114,31 @@ class NormalizeUVProjectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match"):
             normalize_uv_projection(self.input_path, self.seam_path, self.output_path)
         self.assertFalse(self.output_path.exists())
+
+    def test_ring_first_vertices_are_on_positive_u_axis_and_texture_follows(self):
+        with self.seam_path.open(encoding="utf-8", newline="") as stream:
+            rows = list(csv.reader(stream))
+        for start, offset in ((0, 1), (3, 2)):
+            for row in range(start, start + 3):
+                rows[row] = rows[row][offset:] + rows[row][:offset]
+        with self.seam_path.open("w", encoding="utf-8", newline="") as stream:
+            csv.writer(stream).writerows(rows)
+
+        normalize_uv_projection(self.input_path, self.seam_path, self.output_path)
+        _, uvs, _, _ = _read_obj(self.output_path)
+        np.testing.assert_allclose(uvs[1], (1.0, 0.1), atol=1e-8)
+        np.testing.assert_allclose(uvs[7], (0.2, 0.9), atol=1e-8)
+        with Image.open(self.output_path.with_suffix(".png")) as result:
+            for destination, source in (
+                ((0.95, 0.1), (0.9, 0.14)),
+                ((0.15, 0.9), (0.055, 0.9)),
+            ):
+                x = round(destination[0] * 127)
+                y = round((1 - destination[1]) * 127)
+                pixel = np.asarray(result.getpixel((x, y)))
+                expected = np.array([source[0] * 127 * 2, (1 - source[1]) * 127 * 2])
+                np.testing.assert_allclose(pixel[:2], expected, atol=6)
+                self.assertEqual(pixel[3], 255)
 
     def test_main_normalize_uses_voxelized_seams(self):
         with patch.object(sys, "argv", ["main.py", "--operation", "normalize", "--input-dir", str(self.root)]):

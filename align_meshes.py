@@ -635,7 +635,7 @@ def main() -> None:
     parser.add_argument("input_seams", nargs="?", type=Path, default=scan / "Voxelized/Envy1_seam.csv")
     parser.add_argument("canonical_seams", nargs="?", type=Path, default=root / "apple_seam.csv")
     parser.add_argument("endpoints", nargs="?", type=Path, default=scan / "Voxelized/Envy1.txt")
-    parser.add_argument("output", nargs="?", type=Path, default=scan / "Aligned/Envy1NoStemHiRes.obj")
+    parser.add_argument("output", nargs="?", type=Path, default=scan / "Aligned/Envy1Aligned.obj")
     args = parser.parse_args()
     align_meshes(args.input, args.canonical, args.input_seams, args.canonical_seams, args.endpoints, args.output)
 

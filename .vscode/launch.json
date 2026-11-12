@@ -5,13 +5,35 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Debugger: Current File with Arguments",
+            "name": "Debug Voxelize",
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
             "console": "internalConsole",
-            "args": ["--input-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
                      "--operation", "voxelize"]
+        },
+        {
+            "name": "Debug rename",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "internalConsole",
+            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                     "--operation", "rename",
+                     "--source-dir", "MeshLabCleaned",
+                     "--dest-dir", "MeshLabCleaned_temp",
+                     "--dest-name", "FullRes"]
+        },
+        {
+            "name": "Debug cleanup",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "internalConsole",
+            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                     "--operation", "cleanup",
+                     "--dest-name", "FullRes"]
         }
     ]
 }

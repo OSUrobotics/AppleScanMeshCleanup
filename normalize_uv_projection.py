@@ -5,7 +5,9 @@ The top and bottom boundaries become circles of radius 0.1 centered at
 corners (0.5, 0), (1, 0.5), (0.5, 1), and (0, 0.5). The seam CSV contains
 six groups of three rows: vertex indices, U coordinates, and V coordinates,
 for the top, bottom, and the four clockwise sides of the body.
+Each circular chart's first seam vertex lies on the positive U axis.
 The warped texture is padded by four pixels outside the rasterized charts.
+The output OBJ has a companion <output stem>_seam.csv with normalized UVs.
 """
 
 import argparse
@@ -90,7 +92,7 @@ def _read_texture(material_path: Path) -> Path:
     return textures[0]
 
 
-def _read_seams(seam_path: Path) -> list[np.ndarray]:
+def _read_seam_records(seam_path: Path) -> list[tuple[list[int], np.ndarray]]:
     with seam_path.open(encoding="utf-8", newline="") as seam_file:
         rows = [[entry.strip() for entry in row] for row in csv.reader(seam_file)]
     if len(rows) != 18:
@@ -109,8 +111,41 @@ def _read_seams(seam_path: Path) -> list[np.ndarray]:
         ))
         if not np.isfinite(points).all():
             raise ValueError(f"Non-finite seam coordinates in {seam_path}.")
-        seams.append(points)
+        seams.append((ids, points))
     return seams
+
+
+def _read_seams(seam_path: Path) -> list[np.ndarray]:
+    return [uv for _, uv in _read_seam_records(seam_path)]
+
+
+def _match_seam_uvs(original_uvs: np.ndarray, seams: list[np.ndarray]) -> list[np.ndarray]:
+    seam_indices = []
+    uv_tree = cKDTree(original_uvs)
+    for index, seam in enumerate(seams):
+        distances, matches = uv_tree.query(seam)
+        if np.max(distances) > _SEAM_TOLERANCE:
+            raise ValueError(
+                f"Seam {index + 1} does not match the OBJ UVs "
+                f"(maximum error {np.max(distances):.6g}); use the matching voxelized CSV."
+            )
+        seam_indices.append(matches)
+    return seam_indices
+
+
+def _write_seam_csv(
+    output_path: Path,
+    records: list[tuple[list[int], np.ndarray]],
+    seam_indices: list[np.ndarray],
+    normalized_uvs: np.ndarray,
+) -> None:
+    with output_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        for (ids, _), indices in zip(records, seam_indices):
+            coordinates = normalized_uvs[indices]
+            writer.writerow(ids)
+            writer.writerow([f"{u:.9g}" for u in coordinates[:, 0]])
+            writer.writerow([f"{v:.9g}" for v in coordinates[:, 1]])
 
 
 def _ordered_boundary(edges: np.ndarray) -> list[int]:
@@ -157,16 +192,7 @@ def _parameterize(
     component_count, labels = connected_components(graph, directed=False)
     if component_count != 3:
         raise ValueError(f"Expected three connected UV charts, found {component_count}.")
-    seam_indices = []
-    uv_tree = cKDTree(original_uvs)
-    for index, seam in enumerate(seams):
-        distances, matches = uv_tree.query(seam)
-        if np.max(distances) > _SEAM_TOLERANCE:
-            raise ValueError(
-                f"Seam {index + 1} does not match the OBJ UVs "
-                f"(maximum error {np.max(distances):.6g}); use the matching voxelized CSV."
-            )
-        seam_indices.append(matches)
+    seam_indices = _match_seam_uvs(original_uvs, seams)
     chart_labels = []
     for seam in seam_indices:
         unique = np.unique(labels[seam])
@@ -198,8 +224,9 @@ def _parameterize(
                 raise ValueError("A circular chart has a zero-length boundary edge.")
             angles = np.r_[0.0, np.cumsum(lengths[:-1])] / lengths.sum() * (2 * math.pi)
             angles *= 1 if signed_area > 0 else -1
-            start_angle = math.atan2(source[0, 1] - center[1], source[0, 0] - center[0])
-            target = center + 0.1 * np.column_stack((np.cos(start_angle + angles), np.sin(start_angle + angles)))
+            anchor = boundary.index(int(seam_indices[chart_index][0]))
+            angles -= angles[anchor]
+            target = center + 0.1 * np.column_stack((np.cos(angles), np.sin(angles)))
         else:
             corner_indices = [
                 int(np.argmin(np.linalg.norm(source - corner, axis=1)))
@@ -309,15 +336,19 @@ def normalize_uv_projection(input_path: Path, seam_path: Path, output_path: Path
     texture_path = _read_texture(material_path)
     if np.any(original_uvs < -1e-8) or np.any(original_uvs > 1.0 + 1e-8):
         raise ValueError("The input UVs must lie within the texture image; tiled UVs are not supported.")
-    seams = _read_seams(seam_path)
+    records = _read_seam_records(seam_path)
+    seams = [uv for _, uv in records]
     normalized_uvs = _parameterize(original_uvs, faces, seams)
+    seam_indices = _match_seam_uvs(original_uvs, seams)
     output_texture = output_path.with_suffix(".png")
     output_material = output_path.with_suffix(".mtl")
+    output_seams = output_path.with_name(output_path.stem + "_seam.csv")
     sources = {input_path.resolve(), seam_path.resolve(), material_path.resolve(), texture_path.resolve()}
-    if any(path.resolve() in sources for path in (output_path, output_material, output_texture)):
+    if any(path.resolve() in sources for path in (output_path, output_material, output_texture, output_seams)):
         raise ValueError("Output files must not overwrite the input mesh, seam, material, or texture.")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _warp_texture(texture_path, output_texture, original_uvs, normalized_uvs, faces)
+    _write_seam_csv(output_seams, records, seam_indices, normalized_uvs)
     material_lines = material_path.read_text(encoding="utf-8").splitlines()
     with output_material.open("w", encoding="utf-8", newline="\n") as material_file:
         for line in material_lines:

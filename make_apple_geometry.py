@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import zlib
 from meshlib import mrmeshpy as mm
+from MeshLabCleanup import _write_material_file
 
 
 _TEXTURE_SIZE = 1024
@@ -272,6 +273,37 @@ def _create_apple_bottom(
     for i, lobe in enumerate(lobe_vertices):
         next_lobe = lobe_vertices[(i + 1) % lobe_count]
         subdivide_cone_face(pole, next_lobe, lobe, subdivide_base=True)
+
+    boundary_edges = {
+        tuple(sorted((vertex, bottom_ring[(i + 1) % len(bottom_ring)])))
+        for i, vertex in enumerate(bottom_ring)
+    }
+    for _ in range(2):
+        midpoints: dict[tuple[int, int], int] = {}
+        refined = []
+
+        def midpoint(a: int, b: int) -> int:
+            edge = tuple(sorted((a, b)))
+            if edge not in midpoints:
+                midpoints[edge] = len(ms.points)
+                ms.points.append(tuple((x + y) / 2 for x, y in zip(ms.points[a], ms.points[b])))
+            return midpoints[edge]
+
+        for a, b, c in ms.triangles[first_face:]:
+            edges = [(a, b), (b, c), (c, a)]
+            fixed = [i for i, edge in enumerate(edges) if tuple(sorted(edge)) in boundary_edges]
+            if fixed:
+                if len(fixed) != 1:
+                    raise ValueError("A calyx triangle has multiple boundary edges.")
+                vertices = (a, b, c)
+                i = fixed[0]
+                a, b, c = vertices[i], vertices[(i + 1) % 3], vertices[(i + 2) % 3]
+                bc, ca = midpoint(b, c), midpoint(c, a)
+                refined.extend(((a, b, bc), (a, bc, ca), (ca, bc, c)))
+            else:
+                ab, bc, ca = midpoint(a, b), midpoint(b, c), midpoint(c, a)
+                refined.extend(((a, ab, ca), (ab, b, bc), (ca, bc, c), (ab, bc, ca)))
+        ms.triangles[first_face:] = refined
     return first_face, len(ms.triangles)
 
 
@@ -291,7 +323,14 @@ def _middle_uv(
     top_y: float,
 ) -> tuple[float, float]:
     height = (top_y - point[1]) / (top_y - bottom_y)
-    return 0.5 + 0.5 * (longitude - height), 0.5 * (longitude + height)
+    return 0.5 + 0.5 * (longitude - height), 1.0 - 0.5 * (longitude + height)
+
+
+def _bottom_uv(
+    point: tuple[float, float, float], ring_radius: float,
+) -> tuple[float, float]:
+    u, v = _circle_uv(point, _BOTTOM_UV_CENTER, ring_radius)
+    return u, 2 * _BOTTOM_UV_CENTER[1] - v
 
 
 def _longitude(point: tuple[float, float, float]) -> float:
@@ -333,21 +372,6 @@ def _write_texture_map(texture_path: Path) -> None:
     )
 
 
-def _write_material_file(material_path: Path, texture_filename: str) -> None:
-    material_path.write_text(
-        "newmtl apple\n"
-        "Ka 0.150000 0.030000 0.030000\n"
-        "Kd 0.6500000 0.120000 0.100000\n"
-        "Ks 0.1800000 0.180000 0.180000\n"
-        "Ns 30.000000\n"
-        "Ni 1.4500000\n"
-        "d 1.000000\n"
-        "illum 2\n"
-        f"map_Kd {texture_filename}\n",
-        encoding="utf-8",
-    )
-
-
 def _write_seam_csv(
     csv_path: Path,
     ms: _MeshAssembly,
@@ -369,22 +393,26 @@ def _write_seam_csv(
         center: tuple[float, float],
         radius: float,
     ) -> None:
-        closed_ring = [*ring, ring[0]]
-        uvs = [_circle_uv(ms.points[vertex], center, radius) for vertex in closed_ring]
+        closed_ring = [ring[0], *reversed(ring[1:]), ring[0]]
+        uvs = [
+            _bottom_uv(ms.points[vertex], radius)
+            if center == _BOTTOM_UV_CENTER else _circle_uv(ms.points[vertex], center, radius)
+            for vertex in closed_ring
+        ]
         write_rows(writer, closed_ring, uvs)
 
-    top_side = [*top_ring, top_ring[0]]
+    top_side = [top_ring[0], *reversed(top_ring[1:]), top_ring[0]]
     right_side = list(reversed(side_seam))
-    bottom_side = [bottom_ring[0], *reversed(bottom_ring[1:]), bottom_ring[0]]
+    bottom_side = [*bottom_ring, bottom_ring[0]]
     left_side = side_seam
     bottom_y = ms.points[bottom_ring[0]][1]
     top_y = ms.points[top_ring[0]][1]
 
     side_longitudes = [
-        [*[_longitude(ms.points[vertex]) for vertex in top_ring], 1.0],
-        [1.0] * len(right_side),
-        [1.0, *[_longitude(ms.points[vertex]) for vertex in reversed(bottom_ring[1:])], 0.0],
-        [0.0] * len(left_side),
+        [1.0, *[_longitude(ms.points[vertex]) for vertex in reversed(top_ring[1:])], 0.0],
+        [0.0] * len(right_side),
+        [*[_longitude(ms.points[vertex]) for vertex in bottom_ring], 1.0],
+        [1.0] * len(left_side),
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as seam_file:
         writer = csv.writer(seam_file)
@@ -452,7 +480,7 @@ def _write_obj_with_uv(
                 if is_top:
                     uv = _circle_uv(point, _TOP_UV_CENTER, top_radius)
                 elif is_bottom:
-                    uv = _circle_uv(point, _BOTTOM_UV_CENTER, bottom_radius)
+                    uv = _bottom_uv(point, bottom_radius)
                 else:
                     uv = _middle_uv(point, longitudes[corner], bottom_y, top_y)
                 face_uvs.append(uv)
