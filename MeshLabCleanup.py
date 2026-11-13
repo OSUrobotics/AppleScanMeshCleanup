@@ -26,51 +26,9 @@ from meshlib import mrmeshpy as mm
 from MeshLibCleanup import print_mesh_topology
 
 from uv_texture import uv_texture, _find_centers
+from filename_fixing import _write_material_file, _apple_name_base
 
 MeshProcessor = Callable[[Path, Path], Path]
-
-
-def _write_material_file(material_path: Path, texture_filename: str):
-    if "Envy" in os.path.basename(material_path):
-        Ka = (0.15, 0.03, 0.03)
-        Kd = (0.65, 0.12, 0.10)
-        Ks = (0.18, 0.18, 0.18)
-    elif "Gala" in os.path.basename(material_path):
-        Ka = (0.18, 0.06, 0.03)
-        Kd = (0.78, 0.28, 0.12)
-        Ks = (0.15, 0.15, 0.15)
-    elif "PinkLady" in os.path.basename(material_path):
-        Ka = (0.19, 0.07, 0.07)
-        Kd = (0.82, 0.30, 0.32)
-        Ks = (0.15, 0.18, 0.15)
-    elif "CosmicCrisp" in os.path.basename(material_path):
-        Ka = (0.10, 0.02, 0.02)
-        Kd = (0.42, 0.07, 0.09)
-        Ks = (0.15, 0.15, 0.15)
-    elif "HoneyCrisp" in os.path.basename(material_path):
-        Ka = (0.17, 0.05, 0.03)
-        Kd = (0.74, 0.22, 0.14)
-        Ks = (0.15, 0.15, 0.15)
-    else:
-        Ka = (0.15, 0.03, 0.03)
-        Kd = (0.65, 0.12, 0.10)
-        Ks = (0.18, 0.18, 0.18)
-
-    material_path.write_text(
-        "# Blender 5.0.1 MTL File: 'process_apples.blend'\n"
-        "# www.blender.org\n"
-        "\n"
-        "newmtl material_0\n"
-        f"Ka {Ka[0]} {Ka[1]} {Ka[2]}\n"
-        f"Kd {Kd[0]} {Kd[1]} {Kd[2]}\n"
-        f"Ks {Ks[0]} {Ks[1]} {Ks[2]}\n"
-        "Ns 30.000000\n"
-        "Ni 1.4500000\n"
-        "d 1.000000\n"
-        "illum 2\n"
-        f"map_Kd {texture_filename}\n",
-        encoding="utf-8",
-    )
 
 
 def _rename_mesh(input_path: Path, output_path: Path, use_original_material_file: bool) -> None:
@@ -224,10 +182,14 @@ def downsample_mesh(
 ) -> Path:
     print("Original textured mesh topology")
     print_mesh_topology(input_path)
+
+    tag = mlx_script_path.name.split("_")[-1]
+    apple_name = _apple_name_base(output_path.name) + "_" + tag + ".obj"
+    output_path = output_path.with_name(output_path.stem + apple_name)
     
-    if "lowres" in str(mlx_script_path):
-        output_path = output_path.with_name(output_path.name.replace("HiRes", "LowRes"))
     _process_mesh(input_path, output_path, mlx_script_path)
+
+    # The centers text file is in BlenderStemRemoved
     path_reorient = input_path.parent.with_name(
         input_path.parent.name.replace("BlenderRebaked", "BlenderStemRemoved")
     ) / input_path.name
@@ -337,24 +299,6 @@ def voxelize_mesh(input_path: Path, output_path: Path) -> Path:
     uv_texture(input_path=output_path, output_path=path_uv)
 
 
-def _split_filename_into_apple_type_and_number(filename: str) -> tuple[str, int]:
-    # Get the apple name part of the filename
-    apple_name = ""
-    for c in filename:
-        if c.isdigit() or c == "_":
-            break
-        apple_name += c
-    
-    # Get the number out of the filename
-
-    import re
-    match = re.search(r"(\d+)", filename)
-    if not match:
-        raise ValueError(f"Filename does not match expected pattern: {filename}")
-    number = int(match.group(1))
-    return apple_name, number
-
-
 def process_meshes(
     input_dir,
     output_dir,
@@ -386,8 +330,8 @@ def process_meshes(
             output_path = output_dir / filename
             if new_tag_output_filename:
                 # first strip out everything past the apple name and number by splitting file name at the end of the number
-                apple_name, number = _split_filename_into_apple_type_and_number(filename)
-                output_filename = f"{apple_name}_{number:03d}_{new_tag_output_filename}"
+                apple_name = _apple_name_base(filename)
+                output_filename = f"{apple_name}_{new_tag_output_filename}"
 
                 output_path = output_path.with_name(output_filename + output_path.suffix)   
             if input_path.is_file() and output_path.is_file():
@@ -410,8 +354,8 @@ def process_meshes(
 
         if new_tag_output_filename:
             # first strip out everything past the apple name and number by splitting file name at the end of the number
-            apple_name, number = _split_filename_into_apple_type_and_number(filename)
-            output_filename = f"{apple_name}_{number:03d}_{new_tag_output_filename}"
+            apple_name = _apple_name_base(filename)
+            output_filename = f"{apple_name}_{new_tag_output_filename}"
 
             output_path = output_path.with_name(output_filename + output_path.suffix)   
 

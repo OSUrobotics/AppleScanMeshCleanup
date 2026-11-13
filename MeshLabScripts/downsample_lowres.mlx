@@ -12,4 +12,9 @@
   <Param name="PlanarQuadric" description="Planar Simplification" value="false" type="RichBool" tooltip="Add additional simplification constraints that improves the quality of the simplification of the planar portion of the mesh."/>
   <Param name="Selected" description="Simplify only selected faces" value="false" type="RichBool" tooltip="The simplification is applied only to the selected set of faces.&#xa; Take care of the target number of faces!"/>
  </filter>
+ <filter name="Laplacian Smooth (surface preserving)">
+  <Param type="RichBool" name="selection" tooltip="Apply laplacian smooth on selected faces only" value="false" description="Update selection"/>
+  <Param type="RichFloat" name="AngleDeg" tooltip="maximum mean normal angle displacement (degrees) from old to new faces" value="0.5" description="Max Normal Dev (deg)"/>
+  <Param type="RichInt" name="iterations" tooltip="number of laplacian smooth iterations in every run" value="1" description="Iterations"/>
+ </filter>
 </FilterScript>

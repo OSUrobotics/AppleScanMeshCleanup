@@ -20,13 +20,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import zlib
 from meshlib import mrmeshpy as mm
-from MeshLabCleanup import _write_material_file
+from filename_fixing import _write_material_file
 
 
 _TEXTURE_SIZE = 1024
 _TOP_UV_CENTER = (0.9, 0.1)
 _BOTTOM_UV_CENTER = (0.1, 0.9)
 _UV_RADIUS = 0.1
+_CENTER_DOT_RADIUS = 0.012
+_AXIS_LINE_HALF_WIDTH = 0.004
+_SEAM_LINE_HALF_WIDTH = 0.004
+_PEAK_DOT_RADIUS = 0.008
 
 
 @dataclass
@@ -337,7 +341,10 @@ def _longitude(point: tuple[float, float, float]) -> float:
     return (math.atan2(-point[2], point[0]) % (2 * math.pi)) / (2 * math.pi)
 
 
-def _write_texture_map(texture_path: Path) -> None:
+def _write_texture_map(
+    texture_path: Path,
+    peak_uvs: tuple[tuple[float, float], ...] = (),
+) -> None:
     image = bytearray()
     for row in range(_TEXTURE_SIZE):
         v = 1.0 - (row + 0.5) / _TEXTURE_SIZE
@@ -347,10 +354,31 @@ def _write_texture_map(texture_path: Path) -> None:
             color = (255, 255, 255)
             if abs(u - 0.5) + abs(v - 0.5) <= 0.5:
                 color = (255, 0, 0)
+            # The side seam maps to the lower-right (u - v = 0.5) and upper-left (v - u = 0.5) diamond edges.
+            if (
+                abs(abs(u - v) - 0.5) <= _SEAM_LINE_HALF_WIDTH * math.sqrt(2)
+                and abs(u - 0.5) + abs(v - 0.5) <= 0.5 + 2 * _SEAM_LINE_HALF_WIDTH
+            ):
+                color = (0, 0, 0)
+            # The top ring seam is the upper-right edge (u + v = 1.5), the bottom ring seam the lower-left edge (u + v = 0.5).
+            if abs(u - 0.5) + abs(v - 0.5) <= 0.5 + 2 * _SEAM_LINE_HALF_WIDTH:
+                if abs(u + v - 1.5) <= _SEAM_LINE_HALF_WIDTH * math.sqrt(2):
+                    color = (144, 238, 144)
+                elif abs(u + v - 0.5) <= _SEAM_LINE_HALF_WIDTH * math.sqrt(2):
+                    color = (173, 216, 230)
             if (u - _TOP_UV_CENTER[0]) ** 2 + (v - _TOP_UV_CENTER[1]) ** 2 <= _UV_RADIUS**2:
                 color = (0, 255, 0)
             if (u - _BOTTOM_UV_CENTER[0]) ** 2 + (v - _BOTTOM_UV_CENTER[1]) ** 2 <= _UV_RADIUS**2:
-                color = (0, 0, 255)
+                color = (0, 0, 128)
+            for center in (_TOP_UV_CENTER, _BOTTOM_UV_CENTER):
+                du, dv = u - center[0], v - center[1]
+                if du * du + dv * dv <= _CENTER_DOT_RADIUS**2:
+                    color = (128, 128, 128)
+                elif 0.0 < du <= _UV_RADIUS and abs(dv) <= _AXIS_LINE_HALF_WIDTH:
+                    color = (0, 0, 0)
+            for peak_u, peak_v in peak_uvs:
+                if (u - peak_u) ** 2 + (v - peak_v) ** 2 <= _PEAK_DOT_RADIUS**2:
+                    color = (0, 255, 255)
             image.extend(color)
 
     def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
@@ -447,7 +475,13 @@ def _write_obj_with_uv(
     material_path = output_path.with_suffix(".mtl")
     texture_path = output_path.with_suffix(".png")
     seam_path = output_path.with_name(f"{output_path.stem}_seam.csv")
-    _write_texture_map(texture_path)
+    lowest_y = min(point[1] for point in ms.points)
+    peak_uvs = tuple(
+        _bottom_uv(point, bottom_radius)
+        for point in ms.points
+        if point[1] <= lowest_y + 1e-6
+    )
+    _write_texture_map(texture_path, peak_uvs)
     _write_material_file(material_path, texture_path.name)
     _write_seam_csv(
         seam_path,
@@ -463,7 +497,7 @@ def _write_obj_with_uv(
         obj_file.write(f"mtllib {material_path.name}\n")
         for x, y, z in ms.points:
             obj_file.write(f"v {x:.9g} {y:.9g} {z:.9g}\n")
-        obj_file.write("usemtl apple\n")
+        obj_file.write("usemtl material_0\n")
         for face_index, face in enumerate(ms.triangles):
             is_top = top_faces[0] <= face_index < top_faces[1]
             is_bottom = bottom_faces[0] <= face_index < bottom_faces[1]

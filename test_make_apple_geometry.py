@@ -19,6 +19,53 @@ _ENVY_NORMALIZED = Path(
 
 
 class AppleGeometryUVTests(unittest.TestCase):
+    def test_texture_marks_calyx_peaks_with_cyan_dots(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as directory:
+            obj_path = Path(directory) / "apple.obj"
+            geometry._create_apple(16, obj_path)
+            image = Image.open(obj_path.with_suffix(".png")).convert("RGB")
+            vertices = np.array([
+                [float(value) for value in line.split()[1:4]]
+                for line in obj_path.read_text(encoding="utf-8").splitlines()
+                if line.startswith("v ")
+            ])
+        lowest = vertices[:, 1].min()
+        peaks = np.flatnonzero(vertices[:, 1] <= lowest + 1e-6)
+        self.assertEqual(len(peaks), 5)
+        bottom_radius = math.hypot(*vertices[peaks[0]][[0, 2]]) / 0.45
+        for peak in peaks:
+            u, v = geometry._bottom_uv(tuple(vertices[peak]), bottom_radius)
+            self.assertEqual(
+                image.getpixel((int(u * image.width), int((1 - v) * image.height))),
+                (0, 255, 255),
+            )
+
+    def test_texture_circles_have_grey_center_and_positive_x_line(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "texture.png"
+            geometry._write_texture_map(path)
+            image = Image.open(path).convert("RGB")
+        size = image.width
+
+        def pixel(u, v):
+            return image.getpixel((int(u * size), int((1 - v) * size)))
+
+        for (cu, cv), base in (((0.9, 0.1), (0, 255, 0)), ((0.1, 0.9), (0, 0, 128))):
+            self.assertEqual(pixel(cu, cv), (128, 128, 128))
+            self.assertEqual(pixel(cu + 0.05, cv), (0, 0, 0))
+            self.assertEqual(pixel(cu - 0.05, cv), base)
+            self.assertEqual(pixel(cu, cv + 0.05), base)
+        self.assertEqual(pixel(0.5, 0.5), (255, 0, 0))
+        self.assertEqual(pixel(0.75, 0.25), (0, 0, 0))
+        self.assertEqual(pixel(0.25, 0.75), (0, 0, 0))
+        self.assertEqual(pixel(0.5, 0.25), (255, 0, 0))
+        self.assertEqual(pixel(0.75, 0.75), (144, 238, 144))
+        self.assertEqual(pixel(0.25, 0.25), (173, 216, 230))
+
     def test_calyx_is_refined_twice_without_splitting_seam(self):
         baseline_faces = {3: 225, 12: 303, 32: 537, 64: 901}
         for samples, original_faces in baseline_faces.items():

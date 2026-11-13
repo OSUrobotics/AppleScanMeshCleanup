@@ -16,6 +16,17 @@
                      "--dest-name", "FullRes"]
         },
         {
+            "name": "Debug stem removal bake",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "internalConsole",
+            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                     "--operation", "bake_textures",
+                     "--dest-name", "FullRes",
+                     "--use_smart_uv"]
+        },
+        {
             "name": "Debug voxelize",
             "type": "debugpy",
             "request": "launch",
