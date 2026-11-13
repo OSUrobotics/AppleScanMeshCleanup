@@ -21,8 +21,8 @@ from MeshLabCleanup import (
     voxelize_mesh,
     _rename_mesh
 )
+from bake_textures import bake_textures
 
-from uv_texture import uv_texture
 from normalize_uv_projection import normalize_uv_projection
 
 
@@ -83,6 +83,18 @@ def parse_args():
         required=False,
         action="store_true",
         help="List outputs older than their matching inputs and prompt before overwriting.",
+    )
+    parser.add_argument(
+        "--blender",
+        required=False,
+        default="/Applications/Blender.app/Contents/MacOS/Blender",
+        help="Path to the Blender executable.",
+    )
+    parser.add_argument(
+        "--use_smart_uv",
+        required=False,
+        action="store_true",
+        help="Use Blender's smart uv projection to override existing uv texture coordinates.",
     )
     return parser.parse_args()
 
@@ -145,6 +157,27 @@ def main():
             _rename_mesh,
             use_original_material_file=args.use_original_material_file,
         )
+    elif args.operation == "bake_textures":
+        input_dir = root_dir / args.source_dir
+        output_dir = root_dir / args.dest_dir
+        if not args.source_dir or not args.dest_dir:
+            raise ValueError("Both --source-dir and --dest-dir must be specified for the bake_textures operation.")
+        process_file = partial(
+            bake_textures,
+            blender_executable=args.blender,
+            use_smart_uv=args.use_smart_uv,
+        )
+    elif args.operation == "normalize":
+        input_dir = root_dir / "BlenderRebaked"
+        seam_dir = root_dir / "Voxelized"
+        output_dir = root_dir / "NormalizedTexture"
+
+        process_file = partial(
+            normalize_uv_projection,
+            input_dir=input_dir,
+            seam_dir=seam_dir,
+            output_dir=output_dir,
+        )
     else:
         raise ValueError(f"No valid command {args.operation}")
 
@@ -157,16 +190,6 @@ def main():
         new_tag_output_filename=args.dest_name,
         input_extensions=(".obj",),
     )
-    if args.operation == "normalize":
-        expected_count = sum(
-            path.is_file() and path.suffix.lower() == ".obj"
-            for path in input_dir.iterdir()
-        )
-        if len(processed_files) != expected_count:
-            raise RuntimeError(
-                f"Normalized {len(processed_files)} of {expected_count} OBJ files; "
-                "see the errors above for details."
-            )
 
 
 if __name__ == "__main__":
