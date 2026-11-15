@@ -3,14 +3,14 @@ Input:
     - mesh: The input mesh to be aligned.
     - canonical_mesh: The reference canonical mesh.
     - seam files, that define the top, bottom, and side seams of both meshes
-    - a text file that has the two polar endpoint locations on the original mesh
+    - the input seam CSV ends with the two polar endpoint locations on the input mesh
 
 Output:
     - correspondence: A mapping from vertices of the input mesh to the canonical mesh.
     - The canonical mesh re-shaped to be the same shape as the input mesh
 
-Objective: The top conical polar vertex should go to the point on the mesh that is closest to the point given in the endpoint file
-The bottom conical polar vertex should go to the point on the mesh that is closest to the other point given in the endpoint file.
+Objective: The top and bottom conical polar vertices should go to the input
+mesh vertices closest to the endpoints in the input seam CSV.
 The seams should go to the corresponding seams on the canonical mesh, preserving the alignment defined by the seam files.
 
 There are five cone peaks in the canonical mesh at the bottom (the calyx). As best as possible these should go to the points on the
@@ -18,8 +18,7 @@ bottom of the input mesh that have high curvature and stick out.
 The other objective is to minimize the distortion of the canonical mesh as it is reshaped to match the input mesh.
 
 Run with optional positional arguments:
-    python align_meshes.py [input.obj [canonical.obj [input_seam.csv
-        [canonical_seam.csv [endpoints.txt [output.obj]]]]]]
+    python align_meshes.py [input.obj [canonical.obj [output.obj]]]
 The default input is in NormalizedTexture. The output retains the canonical
 material and texture. The companion _correspondence.csv contains zero-based
 input vertex and canonical face indices followed by three barycentric weights.
@@ -38,7 +37,7 @@ from scipy.sparse import coo_matrix, diags
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
-from normalize_uv_projection import _read_obj, _read_texture
+from normalize_uv_projection import _read_obj, _read_seam_data, _read_texture
 
 
 def _mesh(path: Path):
@@ -83,13 +82,9 @@ def _seam_ids(path: Path, vertex_count: int) -> list[list[int]]:
 
 
 def _endpoints(path: Path) -> np.ndarray:
-    with path.open(encoding="utf-8", newline="") as stream:
-        points = np.asarray(
-            [[float(value.strip()) for value in row] for row in csv.reader(stream) if row],
-            dtype=np.float64,
-        )
-    if points.shape != (2, 3) or not np.isfinite(points).all():
-        raise ValueError(f"Expected top and bottom XYZ coordinates in {path}.")
+    _, points = _read_seam_data(path)
+    if points is None:
+        raise ValueError(f"Expected top and bottom XYZ coordinates at the end of {path}.")
     if np.linalg.norm(points[0] - points[1]) == 0:
         raise ValueError("The top and bottom endpoints must differ.")
     return points
@@ -223,6 +218,18 @@ def _vertex_uvs(vertices: np.ndarray, faces: np.ndarray, uv: np.ndarray, uv_face
     if any(not mappings for mappings in per_vertex):
         raise ValueError("Mesh contains vertices not referenced by any textured face.")
     return per_vertex
+
+
+def _validate_normalized_seams(seams, mappings, path: Path) -> None:
+    for chart, center in enumerate((np.array([0.9, 0.1]), np.array([0.1, 0.9]))):
+        for vertex in seams[chart]:
+            coord = next((uv for candidate, uv in mappings[vertex] if candidate == chart), None)
+            if coord is None or not np.isclose(np.linalg.norm(coord - center), 0.1, atol=1e-5, rtol=0):
+                raise ValueError(
+                    f"Input mesh {path} does not have normalized UV seams: "
+                    f"vertex {vertex} is not on the boundary of chart {chart}. "
+                    "Run UV normalization and align the mesh from NormalizedTexture."
+                )
 
 
 def _oriented_seams(seams: list[list[int]], points: np.ndarray, faces: np.ndarray) -> list[list[int]]:
@@ -452,29 +459,28 @@ def _match_calyx_peaks(
 
 def align_meshes(
     input_path: Path,
-    canonical_path: Path,
-    input_seams_path: Path,
-    canonical_seams_path: Path,
-    endpoints_path: Path,
     output_path: Path,
+    canonical_path: Path,
 ) -> Path:
     """Fit the canonical mesh to the normalized scan and write input-to-canonical correspondence."""
     input_path, canonical_path = Path(input_path), Path(canonical_path)
     output_path = Path(output_path)
+    canonical_seams_path = canonical_path.with_name(canonical_path.stem + "_seam.csv")
+    input_seams_path = input_path.parent.parent / "Voxelized" / (input_path.stem + "_seam.csv")
     _, points, faces, uv, uv_faces, input_material = _mesh(input_path)
     lines, template, template_faces, template_uv, template_uv_faces, material_path = _mesh(canonical_path)
     scan_seams = _seam_ids(Path(input_seams_path), len(points))
     template_seams = _seam_ids(Path(canonical_seams_path), len(template))
     scan_seams = _oriented_seams(scan_seams, points, faces)
     template_seams = _oriented_seams(template_seams, template, template_faces)
-    endpoints = _endpoints(Path(endpoints_path))
+    endpoints = _endpoints(Path(input_seams_path))
     texture_path = _read_texture(material_path)
     output_material = output_path.with_suffix(".mtl")
     output_texture = output_path.with_suffix(texture_path.suffix)
     correspondence_path = output_path.with_name(output_path.stem + "_correspondence.csv")
     sources = {
         p.resolve() for p in (input_path, canonical_path, input_seams_path,
-                              canonical_seams_path, endpoints_path, input_material,
+                              canonical_seams_path, input_material,
                               _read_texture(input_material), material_path, texture_path)
     }
     if output_path.suffix.lower() != ".obj" or any(
@@ -486,6 +492,7 @@ def align_meshes(
     canonical_locator = _UVLocator(template_uv, template_uv_faces)
     canonical_uvs = _vertex_uvs(template, template_faces, template_uv, template_uv_faces)
     scan_uvs = _vertex_uvs(points, faces, uv, uv_faces)
+    _validate_normalized_seams(scan_seams, scan_uvs, input_path)
     uv_transforms = _seam_uv_transforms(
         template_seams, scan_seams, template, points, canonical_uvs, scan_uvs
     )
@@ -630,14 +637,11 @@ def main() -> None:
     root = Path("/Users/cindygrimm/PycharmProjects/data/ScannedModels")
     scan = root / "ProsserEnvyApples"
     parser = argparse.ArgumentParser(description="Align a canonical apple mesh to a normalized scan.")
-    parser.add_argument("input", nargs="?", type=Path, default=scan / "NormalizedTexture/Envy1NoStemHiRes.obj")
-    parser.add_argument("canonical", nargs="?", type=Path, default=root / "apple.obj")
-    parser.add_argument("input_seams", nargs="?", type=Path, default=scan / "Voxelized/Envy1_seam.csv")
-    parser.add_argument("canonical_seams", nargs="?", type=Path, default=root / "apple_seam.csv")
-    parser.add_argument("endpoints", nargs="?", type=Path, default=scan / "Voxelized/Envy1.txt")
-    parser.add_argument("output", nargs="?", type=Path, default=scan / "Aligned/Envy1Aligned.obj")
+    parser.add_argument("input", nargs="?", type=Path, default=scan / "NormalizedTexture/Envy_001_FullRes.obj")
+    parser.add_argument("canonical", nargs="?", type=Path, default=root / "Canonical/apple_fullres.obj")
+    parser.add_argument("output", nargs="?", type=Path, default=scan / "AlignedMeshes/Envy_001_FullRes.obj")
     args = parser.parse_args()
-    align_meshes(args.input, args.canonical, args.input_seams, args.canonical_seams, args.endpoints, args.output)
+    align_meshes(args.input, args.output, args.canonical)
 
 
 if __name__ == "__main__":

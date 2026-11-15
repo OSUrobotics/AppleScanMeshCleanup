@@ -28,6 +28,7 @@ from bake_textures import (
     _projection_distance,
     bake_textures,
 )
+from align_meshes import align_meshes
 
 from normalize_uv_projection import normalize_uv_projection
 
@@ -54,7 +55,7 @@ def parse_args():
     parser.add_argument(
         "--operation",
         required=True,
-        choices=(*MLX_SCRIPTS, "rename", "normalize_uv_projection", "bake_textures", "align", "downsample", "normalize_uv_projection"),
+        choices=(*MLX_SCRIPTS, "rename", "normalize_uv_projection", "bake_textures", "align_meshes", "downsample", "normalize_uv_projection"),
         help="Operation to run; selects the input/output directories.",
     )
     parser.add_argument(
@@ -109,6 +110,10 @@ def parse_args():
     parser.add_argument(
         "--max-ray-distance", type=_projection_distance, default=DEFAULT_MAX_RAY_DISTANCE,
         help="Maximum bake ray distance in scene units (default: 0.35; 0 means unlimited).",
+    )
+    parser.add_argument(
+        "--canonical", type=str, default="fullres",
+        help="Canonical mesh to align to (default: fullres).",
     )
     return parser.parse_args()
 
@@ -185,6 +190,15 @@ def main():
         process_file = partial(
             normalize_uv_projection,
             seam_path=seam_dir
+        )
+    elif args.operation == "align_meshes":
+        input_dir = root_dir / "NormalizedTexture"
+        output_dir = root_dir / "AlignedMeshes"
+
+        canonical_path = root_dir.parent / "Canonical" / f"apple_{args.canonical}.obj"
+        process_file = partial(
+            align_meshes,
+            canonical_path=canonical_path
         )
     elif args.operation == "rename":
         input_dir = root_dir / args.source_dir

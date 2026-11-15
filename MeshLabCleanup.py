@@ -222,7 +222,7 @@ def downsample_mesh(
         if texture_path.suffix.lower() != padded_texture.suffix.lower():
             raise ValueError("The output texture format does not match the padded texture.")
         if tag == "lowres":
-            # Instead of just copying the file, downsample it by 1/4
+            # Instead of just copying the file, downsample it by quarter
             with Image.open(padded_texture) as img:
                 img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
                 img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)

@@ -35,3 +35,11 @@ The launch.json file has examples of calling each of these (the --operation name
 The code will not over-write an existing file unless replace_existing is set. 
 
 ## Normalization process
+
+Alignment reads meshes from `NormalizedTexture`, using their matching
+`Voxelized/<input stem>_seam.csv` for seam vertices and the scan's top and
+bottom XYZ endpoints. The canonical seam CSV is next to the canonical OBJ.
+Run normalization before alignment; rebaked UV charts are not necessarily
+normalized. The batch command uses `--operation align_meshes` and selects
+`Canonical/apple_fullres.obj` by default (or `--canonical hires`, etc.).
+The standalone command accepts `input.obj canonical.obj output.obj`.

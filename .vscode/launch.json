@@ -64,6 +64,16 @@
                      "--operation", "normalize_uv_projection"]
         },
         {
+            "name": "Debug align meshes",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "internalConsole",
+            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                     "--operation", "align_meshes",
+                    "--canonical", "fullres"]
+        },
+        {
             "name": "Debug rename",
             "type": "debugpy",
             "request": "launch",
