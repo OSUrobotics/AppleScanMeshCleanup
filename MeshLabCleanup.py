@@ -186,36 +186,54 @@ def _reorient_mesh(centers_path: Path, output_path: Path) -> Path:
 
 
 def downsample_mesh(
-    input_path: Path, output_path: Path, mlx_script_paths: list[Path],
-    replace_existing: bool = True,
+    input_path: Path, output_path: Path, mlx_script_paths: list[Path]
 ) -> Path:
+    from PIL import Image
     print("Original textured mesh topology")
     print_mesh_topology(input_path)
 
-    seam_path = None
+    _, _, _, source_material = _read_obj(input_path)
+    source_texture = _read_texture(source_material)
+    padded_texture = input_path.with_name(input_path.stem + "_padded" + source_texture.suffix)
+    if padded_texture.resolve() in {input_path.resolve(), source_material.resolve(), source_texture.resolve()}:
+        raise ValueError("The padded texture must not overwrite an input file.")
+    normalized_seam = input_path.with_name(input_path.stem + "_seam.csv")
+    seam_path = (normalized_seam if normalized_seam.is_file()
+                 else _find_seam_file(input_path, input_path.parent.parent / "Voxelized"))
+    flood_fill_texture_map(source_texture, input_path, seam_path, padded_texture)
+
     for mlx_script_path in mlx_script_paths:
         tag = mlx_script_path.name.split("_")[-1]
         tag = tag.split(".")[0]
         apple_name = _apple_name_base(output_path.name) + "_" + tag + ".obj"
         output_path = output_path.with_name(apple_name)
-        if output_path.exists() and not replace_existing:
-            print(f"Skipping existing output: {output_path}")
-            continue
 
-        if seam_path is None:
-            seam_path = _find_seam_file(input_path, input_path.parent.parent / "Voxelized")
         _process_mesh(input_path, output_path, mlx_script_path)
 
         # The centers text file is in BlenderStemRemoved
         apple_name, apple_num = _split_filename_into_apple_type_and_number(output_path.name)
         fname = f"{apple_name}{apple_num}.txt"
-        path_reorient = input_path.parent.with_name(
-            input_path.parent.name.replace("BlenderRebaked", "BlenderStemRemoved")
-        ) / fname
+        path_reorient = input_path.parent.parent / "BlenderStemRemoved"  / fname
         _reorient_mesh(centers_path=path_reorient, output_path=output_path)
         _, _, _, material_path = _read_obj(output_path)
         texture_path = _read_texture(material_path)
-        flood_fill_texture_map(texture_path, input_path, seam_path, texture_path)
+        if texture_path.resolve() in {source_texture.resolve(), padded_texture.resolve()}:
+            raise ValueError("The output texture must not overwrite the source or padded texture.")
+        if texture_path.suffix.lower() != padded_texture.suffix.lower():
+            raise ValueError("The output texture format does not match the padded texture.")
+        if tag == "lowres":
+            # Instead of just copying the file, downsample it by 1/4
+            with Image.open(padded_texture) as img:
+                img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
+                img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
+                img.save(texture_path)
+        elif tag == "highres":
+            # Instead of just copying the file, downsample it by half
+            with Image.open(padded_texture) as img:
+                img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
+                img.save(texture_path)
+        else:
+            shutil.copyfile(padded_texture, texture_path)
         print("Downsampled textured mesh topology")
         print_mesh_topology(output_path)
     return output_path

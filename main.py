@@ -152,7 +152,6 @@ def main():
                 MLX_SCRIPTS["downsample_hires"],
                 MLX_SCRIPTS["downsample_fullres"],
             ],
-            replace_existing=replace_existing,
         )
     elif args.operation == "downsample_lowres":
         #
@@ -161,7 +160,6 @@ def main():
         process_file = partial(
             downsample_mesh,
             mlx_script_paths=[MLX_SCRIPTS["downsample_lowres"]],
-            replace_existing=replace_existing,
         )
     elif args.operation == "downsample_hires":
         #
@@ -170,7 +168,6 @@ def main():
         process_file = partial(
             downsample_mesh,
             mlx_script_paths=[MLX_SCRIPTS["downsample_hires"]],
-            replace_existing=replace_existing,
         )
     elif args.operation == "downsample_fullres":
         #
@@ -179,7 +176,6 @@ def main():
         process_file = partial(
             downsample_mesh,
             mlx_script_paths=[MLX_SCRIPTS["downsample_fullres"]],
-            replace_existing=replace_existing,
         )
     elif args.operation == "normalize":
         input_dir = root_dir / "BlenderRebaked"

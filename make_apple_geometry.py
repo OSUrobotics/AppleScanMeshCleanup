@@ -151,6 +151,10 @@ def _create_apple_bottom(
     first_face = len(ms.triangles)
     lobe_count = 5
     subdivision_levels = 4
+    if len(bottom_ring) < 20:
+        subdivision_levels = 2
+    elif len(bottom_ring) < 40:
+        subdivision_levels = 3
     bottom_y = ms.points[bottom_ring[0]][1]
     bottom_radius = math.hypot(ms.points[bottom_ring[0]][0], ms.points[bottom_ring[0]][2])
     lobe_radius = bottom_radius * 0.45
@@ -569,7 +573,10 @@ def _main(argv=None):
     parser.add_argument('--output-file', default='/Users/cindygrimm/PycharmProjects/data/ScannedModels/apple.obj', help='Path to the output OBJ mesh')
     args = parser.parse_args(argv)
 
-    _create_apple(n_samples=args.n_samples, output_path=Path(args.output_file))
+    output_path = Path(args.output_file)
+    for n_samples, tag in ((16, "lowres"), (32, "hires"), (64, "fullres")):
+        output_path_tagged = output_path.with_name(output_path.stem + f"_{tag}.obj")
+        _create_apple(n_samples=n_samples, output_path=output_path_tagged)
 
 
 if __name__ == '__main__':
