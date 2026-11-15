@@ -47,15 +47,15 @@ def parse_args():
         description="Clean up, downsample, voxelize, bake textures, normalize UV textures, or align with canonical."
     )
     parser.add_argument(
-        "--operation",
-        required=True,
-        choices=(*MLX_SCRIPTS, "rename", "normalize", "bake_textures", "align"),
-        help="Operation to run; selects the input/output directories.",
-    )
-    parser.add_argument(
         "--root-dir",
         required=True,
-        help="Top-level folder containing OriginalRevoScans, MeshLabCleaned, MeshLabDownsampled, and BlenderTextures.",
+        help="Path to the root directories containing the meshes to process.",
+    )
+    parser.add_argument(
+        "--operation",
+        required=True,
+        choices=(*MLX_SCRIPTS, "rename", "normalize_uv_projection", "bake_textures", "align", "downsample", "normalize_uv_projection"),
+        help="Operation to run; selects the input/output directories.",
     )
     parser.add_argument(
         "--source-dir",
@@ -73,10 +73,10 @@ def parse_args():
         help="What to append after Apple# for the file name.",
     )
     parser.add_argument(
-        "--check-existing",
+        "--replace-existing",
         required=False,
         action="store_true",
-        help="Do not overwrite existing files if they exist.",
+        help="Overwrite existing files if they exist.",
     )
     parser.add_argument(
         "--use_original_material_file",
@@ -117,7 +117,7 @@ def main():
     args = parse_args()
     root_dir = Path(args.root_dir)
 
-    check_existing = args.check_existing
+    replace_existing = args.replace_existing
     if args.operation == "cleanup":
         # Takes the original scans from Revo and runs 
         #.  - the MeshLabCleanup.mlx to get rid of duplicate vertices, etc, then downsample
@@ -134,11 +134,25 @@ def main():
         )
     elif args.operation == "voxelize":
         # The meshes in MeshCleaned up are currently being hand cleaned with the stem removed and put in BlenderStemRemoved
+        # They are then re-textured automatically and placed in BlenderNoStemRebaked
         #.  - this re-meshes those hand cleaned up meshes and splits the texturemap
-        input_dir = root_dir / "BlenderStemRemoved"
+        input_dir = root_dir / "BlenderNoStemRebaked"
         output_dir = root_dir / "Voxelized"
         process_file = partial(
             voxelize_mesh,
+        )
+    elif args.operation == "downsample":
+        # Do all three downsample operations: lowres, hires, and fullres
+        input_dir = root_dir / "BlenderRebaked"
+        output_dir = root_dir / "Final"
+        process_file = partial(
+            downsample_mesh,
+            mlx_script_paths=[
+                MLX_SCRIPTS["downsample_lowres"],
+                MLX_SCRIPTS["downsample_hires"],
+                MLX_SCRIPTS["downsample_fullres"],
+            ],
+            replace_existing=replace_existing,
         )
     elif args.operation == "downsample_lowres":
         #
@@ -146,7 +160,8 @@ def main():
         output_dir = root_dir / "Final"
         process_file = partial(
             downsample_mesh,
-            mlx_script_path=MLX_SCRIPTS["downsample_lowres"],
+            mlx_script_paths=[MLX_SCRIPTS["downsample_lowres"]],
+            replace_existing=replace_existing,
         )
     elif args.operation == "downsample_hires":
         #
@@ -154,7 +169,8 @@ def main():
         output_dir = root_dir / "Final"
         process_file = partial(
             downsample_mesh,
-            mlx_script_path=MLX_SCRIPTS["downsample_hires"],
+            mlx_script_paths=[MLX_SCRIPTS["downsample_hires"]],
+            replace_existing=replace_existing,
         )
     elif args.operation == "downsample_fullres":
         #
@@ -162,16 +178,18 @@ def main():
         output_dir = root_dir / "Final"
         process_file = partial(
             downsample_mesh,
-            mlx_script_path=MLX_SCRIPTS["downsample_fullres"],
+            mlx_script_paths=[MLX_SCRIPTS["downsample_fullres"]],
+            replace_existing=replace_existing,
         )
     elif args.operation == "normalize":
         input_dir = root_dir / "BlenderRebaked"
         seam_dir = root_dir / "Voxelized"
         output_dir = root_dir / "NormalizedTexture"
 
-        def process_file(input_path: Path, output_path: Path) -> Path:
-            seam_name = input_path.stem.replace("NoStemHiRes", "") + "_seam.csv"
-            return normalize_uv_projection(input_path, seam_dir / seam_name, output_path)
+        process_file = partial(
+            normalize_uv_projection,
+            seam_path=seam_dir
+        )
     elif args.operation == "rename":
         input_dir = root_dir / args.source_dir
         output_dir = root_dir / args.dest_dir
@@ -192,7 +210,7 @@ def main():
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        source_dir = root_dir / "OriginalRevoScans"
+        source_dir = root_dir / "BlenderRebaked_v2"
         process_file = partial(
             bake_textures,
             source_dir=source_dir,
@@ -201,16 +219,14 @@ def main():
             cage_extrusion=args.cage_extrusion,
             max_ray_distance=args.max_ray_distance,
         )
-    elif args.operation == "normalize":
+    elif args.operation == "normalize_uv_projection":
         input_dir = root_dir / "BlenderRebaked"
         seam_dir = root_dir / "Voxelized"
         output_dir = root_dir / "NormalizedTexture"
 
         process_file = partial(
             normalize_uv_projection,
-            input_dir=input_dir,
-            seam_dir=seam_dir,
-            output_dir=output_dir,
+            seam_path=seam_dir,
         )
     else:
         raise ValueError(f"No valid command {args.operation}")
@@ -220,7 +236,7 @@ def main():
         output_dir,
         process_file,
         prompt_overwrite_older=args.prompt_overwrite_older,
-        check_existing_outputs=check_existing,
+        replace_existing_outputs=replace_existing,
         new_tag_output_filename=args.dest_name,
         input_extensions=(".obj",),
     )

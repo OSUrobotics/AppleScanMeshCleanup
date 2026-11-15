@@ -36,6 +36,34 @@
                      "--operation", "voxelize"]
         },
         {
+            "name": "Debug after voxelize bake",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "internalConsole",
+            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                     "--operation", "bake_textures",
+                     "--dest-name", "FullRes"]
+        },
+        {
+            "name": "Debug downsample",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "internalConsole",
+            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                     "--operation", "downsample"]
+        },
+        {
+            "name": "Debug normalize uv projection",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "internalConsole",
+            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                     "--operation", "normalize_uv_projection"]
+        },
+        {
             "name": "Debug rename",
             "type": "debugpy",
             "request": "launch",
@@ -43,8 +71,8 @@
             "console": "internalConsole",
             "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
                      "--operation", "rename",
-                     "--source-dir", "MeshLabCleaned",
-                     "--dest-dir", "MeshLabCleaned_temp",
+                     "--source-dir", "BlenderRebaked_save",
+                     "--dest-dir", "BlenderRebaked",
                      "--dest-name", "FullRes"]
         },
     ]

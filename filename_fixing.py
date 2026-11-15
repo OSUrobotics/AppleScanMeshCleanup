@@ -62,6 +62,8 @@ def _split_filename_into_apple_type_and_number(filename: str) -> tuple[str, int]
     remainder_filename = filename[indx:]
     number_str = ""
     for c in remainder_filename:
+        if c == "_":
+            continue
         if not c.isdigit():
             break
         number_str += c

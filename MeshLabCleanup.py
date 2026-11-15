@@ -26,9 +26,12 @@ from meshlib import mrmeshpy as mm
 from MeshLibCleanup import print_mesh_topology
 
 from uv_texture import uv_texture, _find_centers
-from filename_fixing import _write_material_file, _apple_name_base
+from filename_fixing import _write_material_file, _apple_name_base, _split_filename_into_apple_type_and_number
+from fix_texture_maps import flood_fill_texture_map
+from normalize_uv_projection import _find_seam_file, _read_obj, _read_texture
 
 MeshProcessor = Callable[[Path, Path], Path]
+
 
 
 def _rename_mesh(input_path: Path, output_path: Path, use_original_material_file: bool) -> None:
@@ -57,13 +60,18 @@ def _rename_mesh(input_path: Path, output_path: Path, use_original_material_file
     # Copy the texture file if it exists
     if tex_name == "":
         tex_name = input_path.name.rsplit(".", 1)[0]
+    elif "_uv" in tex_name:
+        tex_name = tex_name.replace("_uv", "")
     for ext in [".png", ".jpg", ".jpeg"]:
         if os.path.exists(input_path.with_name(tex_name + ext)):
             tex_name += ext
             break   
     tex_path = input_path.with_name(tex_name)
     if os.path.exists(tex_path):
+        print(f"Copying texture {tex_path} to {output_path.with_suffix(tex_path.suffix)}")
         shutil.copy(tex_path, output_path.with_suffix(tex_path.suffix))
+    else:
+        print(f"Warning: Could not find texture {tex_path}")
 
     if use_original_material_file and os.path.exists(input_path.basename + mtl_name):
         if os.path.exists(input_path.basename + mtl_name):
@@ -178,24 +186,38 @@ def _reorient_mesh(centers_path: Path, output_path: Path) -> Path:
 
 
 def downsample_mesh(
-    input_path: Path, output_path: Path, mlx_script_path: Path
+    input_path: Path, output_path: Path, mlx_script_paths: list[Path],
+    replace_existing: bool = True,
 ) -> Path:
     print("Original textured mesh topology")
     print_mesh_topology(input_path)
 
-    tag = mlx_script_path.name.split("_")[-1]
-    apple_name = _apple_name_base(output_path.name) + "_" + tag + ".obj"
-    output_path = output_path.with_name(output_path.stem + apple_name)
-    
-    _process_mesh(input_path, output_path, mlx_script_path)
+    seam_path = None
+    for mlx_script_path in mlx_script_paths:
+        tag = mlx_script_path.name.split("_")[-1]
+        tag = tag.split(".")[0]
+        apple_name = _apple_name_base(output_path.name) + "_" + tag + ".obj"
+        output_path = output_path.with_name(apple_name)
+        if output_path.exists() and not replace_existing:
+            print(f"Skipping existing output: {output_path}")
+            continue
 
-    # The centers text file is in BlenderStemRemoved
-    path_reorient = input_path.parent.with_name(
-        input_path.parent.name.replace("BlenderRebaked", "BlenderStemRemoved")
-    ) / input_path.name
-    _reorient_mesh(centers_path=path_reorient, output_path=output_path)
-    print("Downsampled textured mesh topology")
-    print_mesh_topology(output_path)
+        if seam_path is None:
+            seam_path = _find_seam_file(input_path, input_path.parent.parent / "Voxelized")
+        _process_mesh(input_path, output_path, mlx_script_path)
+
+        # The centers text file is in BlenderStemRemoved
+        apple_name, apple_num = _split_filename_into_apple_type_and_number(output_path.name)
+        fname = f"{apple_name}{apple_num}.txt"
+        path_reorient = input_path.parent.with_name(
+            input_path.parent.name.replace("BlenderRebaked", "BlenderStemRemoved")
+        ) / fname
+        _reorient_mesh(centers_path=path_reorient, output_path=output_path)
+        _, _, _, material_path = _read_obj(output_path)
+        texture_path = _read_texture(material_path)
+        flood_fill_texture_map(texture_path, input_path, seam_path, texture_path)
+        print("Downsampled textured mesh topology")
+        print_mesh_topology(output_path)
     return output_path
 
 
@@ -290,13 +312,12 @@ def voxelize_mesh(input_path: Path, output_path: Path) -> Path:
     _remove_zero_area_face(fixed_mesh)
 
     # 5. Save the cleaned manifold mesh
-    mm.saveMesh(fixed_mesh, str(output_path))
+    voxel_path = output_path.with_name(output_path.stem + "_voxel" + output_path.suffix)
+    mm.saveMesh(fixed_mesh, str(voxel_path))
     print("voxel fixed topology")
-    print_mesh_topology(output_path)
+    print_mesh_topology(voxel_path)
 
-    path_uv = output_path.with_name(input_path.name.replace("NoStemHiRes", ""))
-
-    uv_texture(input_path=output_path, output_path=path_uv)
+    uv_texture(input_path=voxel_path, output_path=output_path)
 
 
 def process_meshes(
@@ -305,7 +326,7 @@ def process_meshes(
     process_file: MeshProcessor,
     new_tag_output_filename=None,
     prompt_overwrite_older=False,
-    check_existing_outputs=True,
+    replace_existing_outputs=True,
     input_extensions=(".obj", ".ply", ".stl"),
 ):
     input_dir = Path(input_dir)
@@ -321,7 +342,7 @@ def process_meshes(
     # Did we do this one already? (the output time stamp is greater than the input)
     already_done = set()
     no_outputs = set()
-    if check_existing_outputs:
+    if not replace_existing_outputs:
         for filename in filenames:
             if not filename.lower().endswith(input_extensions):
                 continue
@@ -359,7 +380,7 @@ def process_meshes(
 
             output_path = output_path.with_name(output_filename + output_path.suffix)   
 
-        if check_existing_outputs and output_path.exists():
+        if not replace_existing_outputs and output_path.exists():
             if output_path in already_done:
                 if prompt_overwrite_older:
                     answer = input(f"Overwrite {output_path.name}? [y/n] ").strip().lower()
@@ -371,6 +392,6 @@ def process_meshes(
             processed_path = process_file(input_path, output_path)
             processed_files.append(str(processed_path))
         except Exception as exc:
-            print(f"Failed to process {output_path.name}: {exc}")
+            print(f"Failed to process {input_path.name} to {output_path.name}: {exc}")
 
     return processed_files

@@ -69,12 +69,12 @@ def _mesh(path: Path):
 def _seam_ids(path: Path, vertex_count: int) -> list[list[int]]:
     with path.open(encoding="utf-8", newline="") as stream:
         rows = [[entry.strip() for entry in row if entry.strip()] for row in csv.reader(stream)]
-    if len(rows) == 18:
+    if len(rows) in (18, 20):
         rows = [rows[i] for i in (0, 3, 6, 9, 12, 15)]
     elif len(rows) == 10:
         rows = [rows[i] for i in (0, 3, 6, 7, 8, 9)]
     else:
-        raise ValueError(f"Expected 10 or 18 rows in seam CSV {path}.")
+        raise ValueError(f"Expected 10, 18, or 20 rows in seam CSV {path}.")
     seams = [[int(value) for value in row] for row in rows]
     for seam in seams:
         if len(seam) < 2 or min(seam) < 0 or max(seam) >= vertex_count:

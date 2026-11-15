@@ -18,6 +18,7 @@ Approximate algorithm:
 
 import heapq
 from collections import deque
+from collections.abc import Sequence
 from pathlib import Path
 import struct
 import zlib
@@ -26,6 +27,7 @@ import csv
 import numpy as np
 import pymeshlab
 import trimesh
+from filename_fixing import _write_material_file, _split_filename_into_apple_type_and_number
 
 
 def _write_blank_texture(n_vs: int, seam_vs: list[list[list[int]]], uvs: np.ndarray, texture_path: Path):
@@ -164,6 +166,29 @@ def _create_adjacency_structure(mesh: trimesh.Trimesh):
     return adjacency
 
 
+def _orient_mesh(mesh: trimesh.Trimesh, top_vertex: np.ndarray, bottom_vertex: np.ndarray):
+    """Orient the mesh by finding the transformation that puts the top vertex at 0,0,0 and orients the mesh 
+       so that the bottom vertex lies along the negative y-axis. Then translate back up"""
+    translation = -top_vertex
+    mesh.vertices += translation
+    new_top_vertex = top_vertex + translation
+    new_bottom_vertex = bottom_vertex + translation
+
+    direction = new_bottom_vertex / np.linalg.norm(new_bottom_vertex)  
+    target = np.array([0, -1, 0])
+    axis = np.cross(direction, target)
+    if np.linalg.norm(axis) < 1e-8:
+        return mesh
+    axis /= np.linalg.norm(axis)
+    angle = np.arccos(np.clip(np.dot(direction, target), -1.0, 1.0))
+    rotation_matrix = trimesh.transformations.rotation_matrix(angle, axis)[:3, :3]
+    mesh.vertices = mesh.vertices @ rotation_matrix.T
+
+    new_bottom_vertex = new_bottom_vertex @ rotation_matrix.T
+
+    return mesh, new_top_vertex, new_bottom_vertex
+
+       
 def _geodesic(adjacency: list[tuple[int, float]], v1: int, v2: int, no_cross_vs: list[int]):
     """Find the shortest path between two vertices along mesh edges."""
 
@@ -203,9 +228,7 @@ def _geodesic(adjacency: list[tuple[int, float]], v1: int, v2: int, no_cross_vs:
 def _define_seam(mesh: trimesh.Trimesh, 
                  adjacency: list[tuple[int, float]], 
                  no_cross_vs: list[int],
-                 perc_top_bottom: float, 
-                 perc_width: float, 
-                 pt_center: np.array):
+                 b_is_top: bool):
     """ Define a ring of connected edges on the top (or bottom) of the mesh
     Also return the first v point; we'll use that to do the side seam"""
 
@@ -213,32 +236,48 @@ def _define_seam(mesh: trimesh.Trimesh,
     vertices = mesh.vertices
     if len(vertices) == 0:
         raise ValueError("Cannot define a seam on a mesh with no vertices.")
-    if not 0.0 <= perc_top_bottom <= 1.0:
-        raise ValueError("perc_top_bottom must be between 0 and 1.")
-    if not 0.0 < perc_width <= 1.0:
-        raise ValueError("perc_width must be greater than 0 and at most 1.")
 
     # Y is the vertical axis; the ring lies in the XZ plane.
-    horizontal_extents = np.ptp(vertices[:, [0, 2]], axis=0)
-    diameter = float(np.max(horizontal_extents))
     y_min = float(np.min(vertices[:, 1]))
-    height = float(np.max(vertices[:, 1]) - y_min)
-    target_y = 0.2 * pt_center[1] + 0.8 * (y_min + perc_top_bottom * height)
-    radius = diameter * perc_width / 2.0
+    y_max = float(np.max(vertices[:, 1]))
+    height = y_max - y_min
+    if b_is_top:
+        y_target = y_max
+        y_top_vs = vertices[:, 1] > 0.95 * y_max
+        # Use the average radius of the top vertices
+        vs_top_x = vertices[y_top_vs, 0]
+        vs_top_z = vertices[y_top_vs, 2]
+        radius_all = np.sqrt(vs_top_x * vs_top_x + vs_top_z * vs_top_z)
+        radius = float(np.mean(radius_all))
+    else:
+        y_target = y_min
+        # Radius is 2 cm on the bottom
+        radius = 20
 
     # Place eight evenly spaced targets around the ring and choose the
     # closest unused mesh vertex to each target.
     angles = np.linspace(0.0, 2.0 * np.pi, num=16, endpoint=False)
     key_points = np.column_stack((
-        pt_center[0] + radius * np.cos(angles),
-        np.full(angles.shape, target_y),
-        pt_center[2] + radius * np.sin(angles),
+        radius * np.cos(angles),
+        np.full(angles.shape, y_target),
+        radius * np.sin(angles),
     ))
     vs = []
+
     for point in key_points:
-        distances = np.linalg.norm(vertices - point, axis=1)
+        # Look for the vertex that has a y in the valid y range and is closest
+        # to the point's x and z values
+        if b_is_top:
+            valid_vs = vertices[:, 1] > y_min + 0.7 * height
+        else:
+            valid_vs = vertices[:, 1] < y_min + 0.3 * height
+        distances_x = np.fabs(vertices[:, 0] - point[0])
+        distances_z = np.fabs(vertices[:, 2] - point[2])
+        distances = distances_x + distances_z
         for vertex_id in np.argsort(distances):
             vertex_id = int(vertex_id)
+            if not valid_vs[vertex_id]:
+                continue
             if vertex_id not in vs:
                 vs.append(vertex_id)
                 break
@@ -259,6 +298,30 @@ def _define_seam(mesh: trimesh.Trimesh,
     # Duplicate the last vertex and edge
     seam_vertices.append(vs[0])
     return seam_vertices, seam_edges
+
+
+def _check_diamond(mesh: trimesh.Trimesh, seam_uvs: set, uvs_diamond) -> bool:
+    """Check that the uv texture coordinates for the diamond/middle component do not overlap with the two circle components. 
+    If they do, warp the diamond component to avoid overlap."""
+    # The two sides that might overlap with the circles are two side seams. Check if the UV coordiantes of the side seam overlap with the
+    # boundary of the two circle components. If there is overlap, warp the uv coordiantes of the diamond component by warping the
+    # edge in.
+
+    circle_centers = [(0.8, 0.2), (0.2, 0.8 )]
+    circle_radius = 0.2
+
+    warp_sides = []
+    for circle in circle_centers:
+        overlap = 0.0
+        for uv in seam_uvs:
+            dist = np.linalg.norm(np.array(uv) - np.array(circle))
+            if dist < circle_radius:
+                if circle_radius - dist > overlap:
+                    overlap = circle_radius - dist
+        warp_sides.append(overlap)
+
+    # Now fix the warp by 
+    return overlap > 0.0
 
 
 def _side_seam(adjacency: list[tuple[int, float]], v1: int, v2: int, no_cross_vs: list[int]):
@@ -599,6 +662,90 @@ def _parameterize_cut_mesh(
         np.asarray(output_uvs, dtype=np.float64),
     )
 
+def _search_better_top_vertex(mesh: trimesh.Trimesh, top_vertex: np.ndarray):
+    """ Search for a better top vertex in the mesh near the given top_vertex. 
+    The best vertex is one that is in the center of the lowest set of vertices near the top_vertex.
+    Find the lowest y value of the vertices in a 10 ring neighborhood around the top_vertex.
+    Find the max y and the min y of that 10 ring neighborhood.
+    Take all the vertices that are within 20% of the vertical range from the lowest y value.
+    Return the vertex that is in the center of these selected vertices. 
+    """
+    # Find the id of the vertex closest to the given top_vertex
+    top_vertex_id = np.argmin(np.linalg.norm(mesh.vertices - top_vertex, axis=1))
+    # Find the 10-ring neighborhood around the top_vertex using mesh adjacency information
+    vertex_neighbors = []
+    for _ in range(10):
+        if not vertex_neighbors:
+            vertex_neighbors = mesh.vertex_neighbors[top_vertex_id]
+        else:
+            new_neighbors = []
+            for v in vertex_neighbors:
+                new_neighbors.extend(mesh.vertex_neighbors[v])
+            vertex_neighbors = list(set(new_neighbors))
+
+    # Include the top_vertex itself in the neighborhood
+    vertex_neighbors.append(top_vertex_id)
+
+    # Get the coordinates of the 10-ring neighborhood vertices
+    neighborhood_vertices = mesh.vertices[vertex_neighbors]
+
+    # Find the lowest y value in the neighborhood
+    y_min = np.min(neighborhood_vertices[:, 1])
+    y_max = np.max(neighborhood_vertices[:, 1])
+    vertical_range = y_max - y_min
+
+    # Select vertices within 20% of the vertical range from the lowest y value
+    selected_vertices = neighborhood_vertices[neighborhood_vertices[:, 1] < y_min + 0.2 * vertical_range]
+
+    # Return the vertex in the center of the selected vertices
+    new_center = np.median(selected_vertices, axis=0)
+    for indx in range(3):
+        top_vertex[indx] = new_center[indx]
+    return top_vertex
+
+
+def _search_better_bottom_vertex(mesh: trimesh.Trimesh, bottom_vertex: np.ndarray):
+    """ Grow a 20 ring neighborhood around the bottom vertex. 
+    Find the min and max y values of those vertices.
+    Find all vertices within a distance of 1 in x and z that are also within those y bounds.
+    Calculate the median in x and z. Find the vertex that is closest to this median with the biggest y value"""
+    # Find the id of the vertex closest to the given bottom_vertex
+    bottom_vertex_id = np.argmin(np.linalg.norm(mesh.vertices - bottom_vertex, axis=1))
+    vertex_neighbors = []
+    for _ in range(20):
+        if not vertex_neighbors:
+            vertex_neighbors = mesh.vertex_neighbors[bottom_vertex_id]
+        else:
+            new_neighbors = []
+            for v in vertex_neighbors:
+                new_neighbors.extend(mesh.vertex_neighbors[v])
+            vertex_neighbors = list(set(new_neighbors))
+
+    vertex_neighbors.append(bottom_vertex_id)
+    neighborhood_vertices = mesh.vertices[vertex_neighbors]
+
+    y_min = np.min(neighborhood_vertices[:, 1])
+    y_max = np.max(neighborhood_vertices[:, 1])
+
+    candidates = neighborhood_vertices[
+        (neighborhood_vertices[:, 1] >= y_min) &
+        (neighborhood_vertices[:, 1] <= y_max) &
+        (np.abs(neighborhood_vertices[:, 0] - bottom_vertex[0]) <= .1) &
+        (np.abs(neighborhood_vertices[:, 2] - bottom_vertex[2]) <= .1)
+    ]
+
+    if len(candidates) == 0:
+        return bottom_vertex
+
+    median_xz = np.median(candidates[:, [0, 2]], axis=0)
+    best_vertex = max(
+        candidates,
+        key=lambda v: (v[1], -np.linalg.norm(v[[0, 2]] - median_xz))
+    )
+    for indx in range(3):
+        bottom_vertex[indx] = best_vertex[indx]
+    return best_vertex
+
 
 def _find_centers(input_path: Path, vertices: np.ndarray):
     input_path_endpts = input_path.with_name(input_path.name.replace("NoStemHiRes", ""))
@@ -632,32 +779,64 @@ def _find_centers(input_path: Path, vertices: np.ndarray):
             end_pts = list(csv.reader(file))
 
         print(f"End points from text file {end_pts}")
-        return [
-            np.asarray([float(value) for value in point], dtype=np.float64)
-            for point in end_pts
-        ]
+        pts = []
+        for point in end_pts:
+            pt = []
+            for xyz in point:
+                pt_str = ""
+                for c in xyz:
+                    if c.isdigit() or c == "." or c == "-":
+                        pt_str += c
+                if pt_str != "":
+                    pt.append(float(pt_str))
+            pts.append(pt)
+        if len(pts) < 2:
+            print(f"WARNING: Only one point in end points file {input_path_endpts}")
+            return [pt_center_top, pt_center_bot]
+        return np.asarray(pts[0], dtype=np.float64), np.asarray(pts[1])
+    print(f"WARNING: No center points file found at {input_path_endpts}, guessing good point using mesh geometry")
     return [pt_center_top, pt_center_bot]
 
 
-def _write_seam_mesh(mesh: trimesh.Trimesh, vs: list[int], output_path: Path):
+def _write_seam_mesh(
+    mesh: trimesh.Trimesh, vs: list[int], centers: Sequence[np.ndarray], output_path: Path
+):
     seam_mesh = mesh.copy()
     vertex_colors = np.full((len(seam_mesh.vertices), 4), 255, dtype=np.uint8)
     seam_vertex_ids = np.asarray(vs, dtype=np.int64)
     if seam_vertex_ids.size and (seam_vertex_ids.min() < 0 or seam_vertex_ids.max() >= len(seam_mesh.vertices)):
         raise ValueError("Seam vertex indices are outside the mesh vertex array.")
+    center_points = np.asarray(centers, dtype=np.float64)
+    if center_points.shape != (2, 3) or not np.isfinite(center_points).all():
+        raise ValueError("Expected finite top and bottom 3D center coordinates.")
+    if not len(seam_mesh.vertices):
+        raise ValueError("Cannot mark centers on a mesh without vertices.")
+    center_vertex_ids = [
+        int(np.argmin(np.linalg.norm(seam_mesh.vertices - center, axis=1)))
+        for center in center_points
+    ]
+    center_region = set(center_vertex_ids)
+    frontier = set(center_vertex_ids)
+    neighbors = seam_mesh.vertex_neighbors
+    for _ in range(6):
+        frontier = {neighbor for vertex in frontier for neighbor in neighbors[vertex]} - center_region
+        center_region.update(frontier)
     vertex_colors[seam_vertex_ids] = [0, 0, 0, 255]
+    vertex_colors[list(center_region)] = [0, 255, 0, 255]
     seam_mesh.visual.vertex_colors = vertex_colors
 
     seam_output_path = output_path.with_name(f"{output_path.stem}_seam.ply")
     seam_mesh.export(str(seam_output_path), file_type="ply")
 
 
-def _write_seams_as_txt_file(seams: list[list[int]], seams_uv: list[list[list[int]]], uvs: np.ndarray, output_path: Path):
+def _write_seams_as_txt_file(seams: list[list[int]], seams_uv: list[list[list[int]]], uvs: np.ndarray,
+                             centers: list[np.ndarray], output_path: Path):
     """ Write out the seam locations. For each seam write
        - the vertex coordinates in the mesh of the seam
        - the uv coordinates of the seam on the top/bottom
        - the uv coordinates of the seam on the side for the top/bottom seam
-       - the uv coordinates of the two parts of the side seam"""
+       - the uv coordinates of the two parts of the side seam
+       - the top and bottom center coordinates, one point per row"""
     seam_output_path = output_path.with_name(f"{output_path.stem}_seam.csv")
 
     with open(str(seam_output_path), 'w') as fp:
@@ -699,24 +878,40 @@ def _write_seams_as_txt_file(seams: list[list[int]], seams_uv: list[list[list[in
                     uv = uvs[vindx[indx_offset]]
                     v_str += f"{uv[indx]}, "
                 fp.write(v_str + "\n")
-                 
+
+        for center in centers:
+            fp.write(", ".join(str(coordinate) for coordinate in center) + "\n")
     
 def uv_texture(input_path: Path, output_path: Path):
     """Slice open the top and the bottom and unwrap the middle"""
     mesh = _load_mesh(input_path)
 
-    centers = _find_centers(input_path=input_path, vertices=mesh.vertices)
+    apple_name, apple_number = _split_filename_into_apple_type_and_number(input_path.name)
+    for directory in ["BlenderStemRemoved", "BlenderNoStemBaked", "Voxelized"]:
+        # Get the directory one up and over (root plus directory)
+        seam_path = input_path.parent.parent / directory / f"{apple_name}_{apple_number}.txt"
+        if seam_path.exists():
+            break   
+        seam_path = input_path.parent.parent / directory / f"{apple_name}{apple_number}.txt"
+        if seam_path.exists():
+            break   
+    centers = _find_centers(input_path=seam_path, vertices=mesh.vertices)
+    _search_better_top_vertex(mesh, centers[0])
+    _search_better_bottom_vertex(mesh, centers[1])
+    print(f"New centers {centers}")
+    mesh_oriented = mesh.copy()
+    mesh_oriented, new_top_vertex, new_bottom_vertex = _orient_mesh(mesh_oriented, centers[0], centers[1])
+    print(f"New top vertex {new_top_vertex}")
+    print(f"New bottom vertex {new_bottom_vertex}")
 
-    adjacency = _create_adjacency_structure(mesh=mesh)
+    adjacency = _create_adjacency_structure(mesh=mesh_oriented)
     no_cross_vs = set()
-    top_seam_vs, top_seam_es = _define_seam(mesh=mesh, adjacency=adjacency, no_cross_vs=no_cross_vs,
-                                            perc_top_bottom=0.95, perc_width=0.5, pt_center=centers[0])
-    _write_seam_mesh(mesh=mesh, vs=top_seam_vs, output_path=output_path)    
+    top_seam_vs, top_seam_es = _define_seam(mesh=mesh_oriented, adjacency=adjacency, no_cross_vs=no_cross_vs, b_is_top=True)
+    _write_seam_mesh(mesh=mesh_oriented, vs=top_seam_vs, centers=[new_top_vertex, new_bottom_vertex], output_path=output_path)
     for v in top_seam_vs:
         no_cross_vs.add(v)
-    bottom_seam_vs, bottom_seam_es = _define_seam(mesh=mesh, adjacency=adjacency, no_cross_vs=no_cross_vs, 
-                                                  perc_top_bottom=0.05, perc_width=0.6, pt_center=centers[1])
-    _write_seam_mesh(mesh=mesh, vs=top_seam_vs + bottom_seam_vs, output_path=output_path)    
+    bottom_seam_vs, bottom_seam_es = _define_seam(mesh=mesh_oriented, adjacency=adjacency, no_cross_vs=no_cross_vs, b_is_top=False)
+    _write_seam_mesh(mesh=mesh_oriented, vs=top_seam_vs + bottom_seam_vs, centers=[new_top_vertex, new_bottom_vertex], output_path=output_path)
     for v in bottom_seam_vs:
         no_cross_vs.add(v)
 
@@ -731,7 +926,7 @@ def uv_texture(input_path: Path, output_path: Path):
             no_cross_vs.add(bottom_seam_vs[indx])
 
     seam_vs_flat = top_seam_vs + bottom_seam_vs + side_seam_vs
-    _write_seam_mesh(mesh=mesh, vs=seam_vs_flat, output_path=output_path)    
+    _write_seam_mesh(mesh=mesh_oriented, vs=seam_vs_flat, centers=[new_top_vertex, new_bottom_vertex], output_path=output_path)
 
     seam_edges = top_seam_es + bottom_seam_es + side_seam_es
     print("Parameterizing the mesh with the requested seam boundaries...")
@@ -758,6 +953,7 @@ def uv_texture(input_path: Path, output_path: Path):
     _write_seams_as_txt_file(seams=seam_vs, 
                              seams_uv=seam_vs_mapped,
                              uvs=uvs,
+                             centers=centers,
                              output_path=output_path)
     print(f"✓ Asset exported with manual UV seams to: {output_path}")
 

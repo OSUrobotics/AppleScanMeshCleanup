@@ -5,6 +5,7 @@ The top and bottom boundaries become circles of radius 0.1 centered at
 corners (0.5, 0), (1, 0.5), (0.5, 1), and (0, 0.5). The seam CSV contains
 six groups of three rows: vertex indices, U coordinates, and V coordinates,
 for the top, bottom, and the four clockwise sides of the body.
+Two additional rows contain the top and bottom center positions in 3D.
 Each circular chart's first seam vertex lies on the positive U axis.
 The warped texture is padded by four pixels outside the rasterized charts.
 The output OBJ has a companion <output stem>_seam.csv with normalized UVs.
@@ -14,6 +15,7 @@ import argparse
 import csv
 import math
 import shlex
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +25,8 @@ from scipy.sparse import coo_matrix, diags
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
+
+from filename_fixing import _split_filename_into_apple_type_and_number
 
 
 _SEAM_TOLERANCE = 2e-6
@@ -92,11 +96,13 @@ def _read_texture(material_path: Path) -> Path:
     return textures[0]
 
 
-def _read_seam_records(seam_path: Path) -> list[tuple[list[int], np.ndarray]]:
+def _read_seam_data(
+    seam_path: Path,
+) -> tuple[list[tuple[list[int], np.ndarray]], np.ndarray | None]:
     with seam_path.open(encoding="utf-8", newline="") as seam_file:
         rows = [[entry.strip() for entry in row] for row in csv.reader(seam_file)]
-    if len(rows) != 18:
-        raise ValueError(f"Expected 18 seam CSV rows in {seam_path}, found {len(rows)}.")
+    if len(rows) not in (18, 20):
+        raise ValueError(f"Expected 18 or 20 seam CSV rows in {seam_path}, found {len(rows)}.")
     seams = []
     for start in range(0, 18, 3):
         group = [row[:-1] if row and not row[-1] else row for row in rows[start:start + 3]]
@@ -112,7 +118,19 @@ def _read_seam_records(seam_path: Path) -> list[tuple[list[int], np.ndarray]]:
         if not np.isfinite(points).all():
             raise ValueError(f"Non-finite seam coordinates in {seam_path}.")
         seams.append((ids, points))
-    return seams
+    centers = None
+    if len(rows) == 20:
+        try:
+            centers = np.asarray([[float(value) for value in row] for row in rows[18:]], dtype=np.float64)
+        except ValueError as exc:
+            raise ValueError(f"Expected two finite 3D center coordinates in {seam_path}.") from exc
+        if centers.shape != (2, 3) or not np.isfinite(centers).all():
+            raise ValueError(f"Expected two finite 3D center coordinates in {seam_path}.")
+    return seams, centers
+
+
+def _read_seam_records(seam_path: Path) -> list[tuple[list[int], np.ndarray]]:
+    return _read_seam_data(seam_path)[0]
 
 
 def _read_seams(seam_path: Path) -> list[np.ndarray]:
@@ -138,6 +156,7 @@ def _write_seam_csv(
     records: list[tuple[list[int], np.ndarray]],
     seam_indices: list[np.ndarray],
     normalized_uvs: np.ndarray,
+    centers: np.ndarray | None = None,
 ) -> None:
     with output_path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.writer(stream)
@@ -146,6 +165,34 @@ def _write_seam_csv(
             writer.writerow(ids)
             writer.writerow([f"{u:.9g}" for u in coordinates[:, 0]])
             writer.writerow([f"{v:.9g}" for v in coordinates[:, 1]])
+        if centers is not None:
+            writer.writerows(centers)
+
+
+def _center_uv_indices(
+    lines: list[str], faces: np.ndarray, centers: np.ndarray, input_path: Path
+) -> list[np.ndarray]:
+    vertices = []
+    vertex_faces = []
+    for line in lines:
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "v":
+            vertices.append([float(value) for value in parts[1:4]])
+        elif parts[0] == "f":
+            indices = [int(corner.split("/")[0]) for corner in parts[1:]]
+            if 0 in indices:
+                raise ValueError(f"OBJ vertex indices cannot be zero in {input_path}.")
+            vertex_faces.append([index - 1 if index > 0 else len(vertices) + index for index in indices])
+    coordinates = np.asarray(vertices, dtype=np.float64)
+    triangles = np.asarray(vertex_faces, dtype=np.int64)
+    if coordinates.ndim != 2 or coordinates.shape[1] != 3 or not np.isfinite(coordinates).all():
+        raise ValueError(f"Expected finite 3D vertices in {input_path}.")
+    if triangles.shape != faces.shape or triangles.min() < 0 or triangles.max() >= len(coordinates):
+        raise ValueError(f"Face vertex index is out of range in {input_path}.")
+    closest = cKDTree(coordinates).query(centers)[1]
+    return [np.unique(faces[triangles == index]) for index in closest]
 
 
 def _ordered_boundary(edges: np.ndarray) -> list[int]:
@@ -179,12 +226,25 @@ def _parameterize(
     original_uvs: np.ndarray,
     faces: np.ndarray,
     seams: list[np.ndarray],
+    center_uv_indices: list[np.ndarray],
 ) -> np.ndarray:
     all_edges = np.concatenate((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
     all_edges.sort(axis=1)
     edges, counts = np.unique(all_edges, axis=0, return_counts=True)
-    if np.any(edges[:, 0] == edges[:, 1]) or np.any(counts > 2):
-        raise ValueError("UV charts contain degenerate or non-manifold edges.")
+    invalid_edges = (edges[:, 0] == edges[:, 1]) | (counts > 2)
+    if np.any(invalid_edges):
+        warnings.warn(
+            "UV charts contain degenerate or non-manifold edges; perturbing their UV coordinates. "
+            "This does not repair the topology, and parameterization may still fail.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        affected = np.unique(edges[invalid_edges])
+        perturbed_uvs = original_uvs.copy()
+        noise = np.random.default_rng(0).uniform(-1e-8, 1e-8, size=(len(affected), 2))
+        perturbed_uvs[affected] = np.clip(perturbed_uvs[affected] + noise, 0.0, 1.0)
+    else:
+        perturbed_uvs = original_uvs
     graph = coo_matrix(
         (np.ones(2 * len(edges)), (np.r_[edges[:, 0], edges[:, 1]], np.r_[edges[:, 1], edges[:, 0]])),
         shape=(len(original_uvs), len(original_uvs)),
@@ -202,7 +262,7 @@ def _parameterize(
     if len(set(chart_labels[:2] + [chart_labels[2]])) != 3 or len(set(chart_labels[2:])) != 1:
         raise ValueError("The seam CSV does not identify separate top, bottom, and body charts.")
 
-    result = original_uvs.copy()
+    result = perturbed_uvs.copy()
     for chart_index, chart_label in enumerate(chart_labels[:3]):
         vertices = np.flatnonzero(labels == chart_label)
         boundary_edges = edges[(counts == 1) & (labels[edges[:, 0]] == chart_label)]
@@ -212,7 +272,7 @@ def _parameterize(
             if not set(map(int, seam_indices[seam_index])).issubset(boundary_set):
                 raise ValueError(f"Seam {seam_index + 1} is not on its OBJ chart boundary.")
         boundary_array = np.asarray(boundary)
-        source = original_uvs[boundary_array]
+        source = perturbed_uvs[boundary_array]
 
         if chart_index < 2:
             center = np.array((0.9, 0.1) if chart_index == 0 else (0.1, 0.9))
@@ -220,8 +280,7 @@ def _parameterize(
             if abs(signed_area) < 1e-14:
                 raise ValueError("A circular chart has zero boundary area.")
             lengths = np.linalg.norm(np.roll(source, -1, axis=0) - source, axis=1)
-            if np.any(lengths <= 0):
-                raise ValueError("A circular chart has a zero-length boundary edge.")
+            lengths[lengths == 0] = lengths.mean() * 1e-6
             angles = np.r_[0.0, np.cumsum(lengths[:-1])] / lengths.sum() * (2 * math.pi)
             angles *= 1 if signed_area > 0 else -1
             anchor = boundary.index(int(seam_indices[chart_index][0]))
@@ -252,12 +311,26 @@ def _parameterize(
             if any((order[(i + 1) % 4] - order[i]) % 4 not in (1, 3) for i in range(4)):
                 raise ValueError("Body-chart corners do not follow the diamond boundary.")
 
-        result[boundary_array] = target
-        interior = np.setdiff1d(vertices, boundary_array)
+        fixed_indices = boundary_array
+        fixed_targets = target
+        if chart_index < 2:
+            matches = center_uv_indices[chart_index]
+            matches = matches[labels[matches] == chart_label]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"The closest {'top' if chart_index == 0 else 'bottom'} center vertex "
+                    "must have exactly one UV coordinate on its circular chart."
+                )
+            if int(matches[0]) in boundary_set:
+                raise ValueError("The closest center vertex must be inside its circular chart, not on its boundary.")
+            fixed_indices = np.r_[boundary_array, matches]
+            fixed_targets = np.vstack((target, center))
+        result[fixed_indices] = fixed_targets
+        interior = np.setdiff1d(vertices, fixed_indices)
         if len(interior):
             degree = np.asarray(graph.sum(axis=1)).ravel()
             laplacian = diags(degree) - graph
-            rhs = -(laplacian[interior][:, boundary_array] @ target)
+            rhs = -(laplacian[interior][:, fixed_indices] @ fixed_targets)
             solution = spsolve(laplacian[interior][:, interior].tocsc(), rhs)
             if not np.isfinite(solution).all():
                 raise ValueError("Could not solve the UV chart parameterization.")
@@ -325,20 +398,46 @@ def _warp_texture(
     Image.fromarray(output).save(output_texture)
 
 
-def normalize_uv_projection(input_path: Path, seam_path: Path, output_path: Path) -> Path:
-    """Normalize one textured OBJ using its matching voxelized seam CSV."""
-    input_path, seam_path, output_path = Path(input_path), Path(seam_path), Path(output_path)
+def _find_seam_file(input_path: Path, seam_dir: Path) -> Path:
+    if not seam_dir.is_dir():
+        raise NotADirectoryError(f"Seam directory not found or not a directory: {seam_dir}")
+    apple = _split_filename_into_apple_type_and_number(input_path.name)
+    matches = []
+    for candidate in seam_dir.glob("*_seam.csv"):
+        if not candidate.is_file():
+            continue
+        try:
+            candidate_apple = _split_filename_into_apple_type_and_number(candidate.name)
+        except ValueError:
+            continue
+        if candidate_apple == apple:
+            matches.append(candidate)
+    if not matches:
+        raise FileNotFoundError(f"No seam CSV found for {input_path.name} in {seam_dir}.")
+    if len(matches) > 1:
+        names = ", ".join(sorted(path.name for path in matches))
+        raise ValueError(f"Multiple seam CSV files match {input_path.name} in {seam_dir}: {names}")
+    return matches[0]
+
+
+def normalize_uv_projection(input_path: Path, output_path: Path, seam_path: Path) -> Path:
+    """Normalize one textured OBJ using its matching seam CSV in seam_path."""
+    input_path, seam_dir, output_path = Path(input_path), Path(seam_path), Path(output_path)
     if input_path.resolve() == output_path.resolve():
         raise ValueError("The output OBJ must differ from the input OBJ.")
     if output_path.suffix.lower() != ".obj":
         raise ValueError("The normalized mesh output must be an OBJ file.")
+    seam_path = _find_seam_file(input_path, seam_dir)
     lines, original_uvs, faces, material_path = _read_obj(input_path)
     texture_path = _read_texture(material_path)
     if np.any(original_uvs < -1e-8) or np.any(original_uvs > 1.0 + 1e-8):
         raise ValueError("The input UVs must lie within the texture image; tiled UVs are not supported.")
-    records = _read_seam_records(seam_path)
+    records, centers = _read_seam_data(seam_path)
+    if centers is None:
+        raise ValueError(f"Expected top and bottom 3D center rows in {seam_path}.")
     seams = [uv for _, uv in records]
-    normalized_uvs = _parameterize(original_uvs, faces, seams)
+    center_uv_indices = _center_uv_indices(lines, faces, centers, input_path)
+    normalized_uvs = _parameterize(original_uvs, faces, seams, center_uv_indices)
     seam_indices = _match_seam_uvs(original_uvs, seams)
     output_texture = output_path.with_suffix(".png")
     output_material = output_path.with_suffix(".mtl")
@@ -348,7 +447,7 @@ def normalize_uv_projection(input_path: Path, seam_path: Path, output_path: Path
         raise ValueError("Output files must not overwrite the input mesh, seam, material, or texture.")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _warp_texture(texture_path, output_texture, original_uvs, normalized_uvs, faces)
-    _write_seam_csv(output_seams, records, seam_indices, normalized_uvs)
+    _write_seam_csv(output_seams, records, seam_indices, normalized_uvs, centers)
     material_lines = material_path.read_text(encoding="utf-8").splitlines()
     with output_material.open("w", encoding="utf-8", newline="\n") as material_file:
         for line in material_lines:
@@ -371,11 +470,11 @@ def normalize_uv_projection(input_path: Path, seam_path: Path, output_path: Path
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Normalize an OBJ's UV charts and texture.")
-    parser.add_argument("input", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/BlenderRebaked/Envy1NoStemHiRes.obj", type=Path, help="Rebaked textured OBJ")
-    parser.add_argument("seams", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/Voxelized/Envy1_seam.csv", type=Path, help="Matching voxelized seam CSV")
-    parser.add_argument("output", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/NormalizedTexture/Envy1NoStemHiRes.obj", type=Path, help="Output OBJ path")
+    parser.add_argument("input", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/BlenderRebaked/Envy_002_FullRes.obj", type=Path, help="Rebaked textured OBJ")
+    parser.add_argument("output", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/NormalizedTexture/Envy_002_FullRes_seam.obj", type=Path, help="Output OBJ path")
+    parser.add_argument("seams", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/Voxelized", type=Path, help="Directory containing voxelized seam CSV files")
     args = parser.parse_args()
-    normalize_uv_projection(args.input, args.seams, args.output)
+    normalize_uv_projection(args.input, args.output, args.seams)
 
 
 if __name__ == "__main__":

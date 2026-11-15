@@ -1,4 +1,5 @@
 import csv
+import io
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from PIL import Image
 
 import main
 import normalize_uv_projection as normalization
+from align_meshes import _seam_ids
 from normalize_uv_projection import _read_obj, normalize_uv_projection
 
 
@@ -22,8 +24,8 @@ class NormalizeUVProjectionTests(unittest.TestCase):
         self.seam_dir = self.root / "Voxelized"
         self.input_dir.mkdir()
         self.seam_dir.mkdir()
-        self.input_path = self.input_dir / "AppleNoStemHiRes.obj"
-        self.seam_path = self.seam_dir / "Apple_seam.csv"
+        self.input_path = self.input_dir / "Apple_001_NoStemHiRes.obj"
+        self.seam_path = self.seam_dir / "Apple1_FullRes_seam.csv"
         self.output_path = self.root / "NormalizedTexture" / self.input_path.name
 
         top = [(0.99, 0.1), (0.9, 0.18), (0.81, 0.1), (0.9, 0.02)]
@@ -32,7 +34,7 @@ class NormalizeUVProjectionTests(unittest.TestCase):
         charts = [top, bottom, body]
         centers = [(0.9, 0.1), (0.1, 0.9), (0.5, 0.5)]
         with self.input_path.open("w", encoding="utf-8") as obj:
-            obj.write("mtllib AppleNoStemHiRes.mtl\n")
+            obj.write("mtllib Apple_001_NoStemHiRes.mtl\n")
             for index in range(15):
                 obj.write(f"v {index} 0 0\n")
             for chart, center in zip(charts, centers):
@@ -64,16 +66,19 @@ class NormalizeUVProjectionTests(unittest.TestCase):
                 writer.writerow(ids)
                 writer.writerow([point[0] for point in points])
                 writer.writerow([point[1] for point in points])
+            writer.writerow([4.1, 0, 0])
+            writer.writerow([9.1, 0, 0])
 
     def test_normalizes_boundaries_and_warps_texture(self):
-        normalize_uv_projection(self.input_path, self.seam_path, self.output_path)
+        normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
         _, uvs, faces, material = _read_obj(self.output_path)
         self.assertEqual(len(faces), 12)
         self.assertTrue(material.is_file())
-        self.assertIn("map_Kd AppleNoStemHiRes.png", material.read_text())
+        self.assertIn("map_Kd Apple_001_NoStemHiRes.png", material.read_text())
         for indices, center in [(range(4), (0.9, 0.1)), (range(5, 9), (0.1, 0.9))]:
             radii = np.linalg.norm(uvs[list(indices)] - center, axis=1)
             np.testing.assert_allclose(radii, 0.1, atol=1e-8)
+        np.testing.assert_allclose(uvs[[4, 9]], [(0.9, 0.1), (0.1, 0.9)], atol=1e-8)
         for point in uvs[10:14]:
             self.assertAlmostEqual(abs(point[0] - 0.5) + abs(point[1] - 0.5), 0.5)
         with Image.open(self.output_path.with_suffix(".png")) as result:
@@ -84,8 +89,71 @@ class NormalizeUVProjectionTests(unittest.TestCase):
             self.assertLess(abs(pixel[1] - 126), 5)
             self.assertEqual(pixel[2], 100)
 
+    def test_selects_seam_by_apple_name_and_number(self):
+        for name in ("Apple10_seam.csv", "Other1_seam.csv", "Apple_seam.csv"):
+            (self.seam_dir / name).write_text("unrelated", encoding="utf-8")
+        normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
+        self.assertTrue(self.output_path.is_file())
+
+    def test_rejects_missing_or_ambiguous_seam_files(self):
+        self.seam_path.unlink()
+        (self.seam_dir / "Apple10_seam.csv").touch()
+        with self.assertRaisesRegex(FileNotFoundError, "No seam CSV found"):
+            normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
+        self.seam_path.touch()
+        (self.seam_dir / "Apple_001_seam.csv").touch()
+        with self.assertRaisesRegex(ValueError, "Multiple seam CSV files match"):
+            normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
+        self.assertFalse(self.output_path.exists())
+
+    def test_rejects_seam_file_instead_of_directory(self):
+        with self.assertRaisesRegex(NotADirectoryError, "Seam directory"):
+            normalize_uv_projection(self.input_path, self.output_path, self.seam_path)
+
+    def test_normalizes_circular_charts_with_zero_length_boundary_edges(self):
+        obj = self.input_path.read_text(encoding="utf-8")
+        obj = obj.replace("vt 0.9 0.18\n", "vt 0.99 0.1\n")
+        obj = obj.replace("vt 0.1 0.98\n", "vt 0.19 0.9\n")
+        self.input_path.write_text(obj, encoding="utf-8")
+        with self.seam_path.open(encoding="utf-8", newline="") as stream:
+            rows = list(csv.reader(stream))
+        for start in (0, 3):
+            rows[start + 1][1] = rows[start + 1][0]
+            rows[start + 2][1] = rows[start + 2][0]
+        with self.seam_path.open("w", encoding="utf-8", newline="") as stream:
+            csv.writer(stream).writerows(rows)
+
+        normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
+        _, uvs, _, _ = _read_obj(self.output_path)
+        for first, center in ((0, (0.9, 0.1)), (5, (0.1, 0.9))):
+            np.testing.assert_allclose(
+                np.linalg.norm(uvs[first:first + 4] - center, axis=1), 0.1, atol=1e-8
+            )
+            separation = np.linalg.norm(uvs[first] - uvs[first + 1])
+            self.assertGreater(separation, 0)
+            self.assertLess(separation, 1e-5)
+        np.testing.assert_allclose(uvs[[4, 9]], [(0.9, 0.1), (0.1, 0.9)], atol=1e-8)
+
+    def test_warns_and_perturbs_invalid_topology_without_mutating_source_uvs(self):
+        _, uvs, faces, _ = _read_obj(self.input_path)
+        original_uvs = uvs.copy()
+        seams = normalization._read_seams(self.seam_path)
+        centers = [np.array([4]), np.array([9])]
+        reference = normalization._parameterize(uvs, faces, seams, centers)
+        for extra_faces in ([[0, 4, 2], [0, 4, 2]], [[4, 4, 4]]):
+            with self.subTest(extra_faces=extra_faces):
+                invalid_faces = np.vstack((faces, extra_faces))
+                with self.assertWarnsRegex(RuntimeWarning, "does not repair the topology"):
+                    result = normalization._parameterize(uvs, invalid_faces, seams, centers)
+                self.assertTrue(np.isfinite(result).all())
+                np.testing.assert_array_equal(uvs, original_uvs)
+                np.testing.assert_allclose(result[[4, 9]], [(0.9, 0.1), (0.1, 0.9)])
+                if len(extra_faces) == 2:
+                    self.assertGreater(np.max(np.abs(result[:4] - reference[:4])), 0)
+                    self.assertLess(np.max(np.abs(result[:4] - reference[:4])), 1e-6)
+
     def test_normalized_seam_csv_preserves_ids_and_uses_output_uvs(self):
-        normalize_uv_projection(self.input_path, self.seam_path, self.output_path)
+        normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
         output_seam = self.output_path.with_name(self.output_path.stem + "_seam.csv")
         input_records = normalization._read_seam_records(self.seam_path)
         output_records = normalization._read_seam_records(output_seam)
@@ -96,13 +164,71 @@ class NormalizeUVProjectionTests(unittest.TestCase):
         for (old_ids, _), (new_ids, actual), uv_indices in zip(input_records, output_records, indices):
             self.assertEqual(new_ids, old_ids)
             np.testing.assert_allclose(actual, after[uv_indices], atol=1e-8)
+        _, input_centers = normalization._read_seam_data(self.seam_path)
+        _, output_centers = normalization._read_seam_data(output_seam)
+        np.testing.assert_array_equal(output_centers, input_centers)
+        self.assertEqual(_seam_ids(output_seam, 15), [ids for ids, _ in input_records])
+
+    def test_pins_nearest_3d_vertex_and_solves_remaining_interior(self):
+        obj = self.input_path.read_text(encoding="utf-8")
+        obj = obj.replace("v 14 0 0\n", "v 14 0 0\nv 15 0 0\n")
+        obj = obj.replace("vt 0.9 0.18\n", "vt 0.97 0.18\n")
+        obj = obj.replace("usemtl apple\n", "vt 0.945 0.13\nusemtl apple\n")
+        obj = obj.replace(
+            "f 1/1 2/2 5/5\n",
+            "f 1/1 2/2 16/16\nf 2/2 5/5 16/16\nf 5/5 1/1 16/16\n",
+        )
+        self.input_path.write_text(obj, encoding="utf-8")
+        with self.seam_path.open(encoding="utf-8", newline="") as stream:
+            rows = list(csv.reader(stream))
+        rows[1][1] = "0.97"
+        rows[-2] = ["15.05", "0", "0"]
+        with self.seam_path.open("w", encoding="utf-8", newline="") as stream:
+            csv.writer(stream).writerows(rows)
+
+        normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
+        _, uvs, _, _ = _read_obj(self.output_path)
+        np.testing.assert_allclose(uvs[15], (0.9, 0.1), atol=1e-8)
+        np.testing.assert_allclose(uvs[9], (0.1, 0.9), atol=1e-8)
+        np.testing.assert_allclose(uvs[4], np.mean(uvs[[0, 1, 2, 3, 15]], axis=0), atol=1e-8)
+        self.assertGreater(np.linalg.norm(uvs[4] - uvs[15]), 0.001)
+
+    def test_center_vertex_mapping_uses_obj_face_indices(self):
+        lines = [
+            "v 0 0 0", "v 1 0 0", "v 2 0 0",
+            "f -3/3 -2/1 -1/2",
+        ]
+        matches = normalization._center_uv_indices(
+            lines, np.array([[2, 0, 1]]), np.array([[0.1, 0, 0], [1.9, 0, 0]]),
+            self.input_path,
+        )
+        np.testing.assert_array_equal(matches[0], [2])
+        np.testing.assert_array_equal(matches[1], [1])
+
+    def test_rejects_missing_or_invalid_centers(self):
+        with self.seam_path.open(encoding="utf-8", newline="") as stream:
+            rows = list(csv.reader(stream))
+        for center_rows, error in (
+            ([], "Expected top and bottom 3D center rows"),
+            ([["nan", "0", "0"], rows[-1]], "finite 3D center"),
+            ([["1", "2"], rows[-1]], "finite 3D center"),
+            ([["0", "0", "0"], rows[-1]], "not on its boundary"),
+            ([["14", "0", "0"], rows[-1]], "exactly one UV coordinate"),
+        ):
+            with self.subTest(center_rows=center_rows):
+                with self.seam_path.open("w", encoding="utf-8", newline="") as stream:
+                    csv.writer(stream).writerows(rows[:18] + center_rows)
+                with self.assertRaisesRegex(ValueError, error):
+                    normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
+                self.assertFalse(self.output_path.exists())
 
     def test_refuses_to_overwrite_source_seam(self):
-        self.seam_path = self.input_dir / "result_seam.csv"
-        self.seam_path.write_text((self.seam_dir / "Apple_seam.csv").read_text())
+        source_seam = self.seam_path
+        self.seam_path = self.input_dir / "Apple_001_seam.csv"
+        self.seam_path.write_text(source_seam.read_text())
         original = self.seam_path.read_bytes()
         with self.assertRaisesRegex(ValueError, "must not overwrite"):
-            normalize_uv_projection(self.input_path, self.seam_path, self.input_dir / "result.obj")
+            normalize_uv_projection(self.input_path, self.input_dir / "Apple_001.obj", self.input_dir)
         self.assertEqual(self.seam_path.read_bytes(), original)
 
     def test_rejects_mismatched_seam(self):
@@ -112,7 +238,7 @@ class NormalizeUVProjectionTests(unittest.TestCase):
         with self.seam_path.open("w", encoding="utf-8", newline="") as seam_file:
             csv.writer(seam_file).writerows(rows)
         with self.assertRaisesRegex(ValueError, "does not match"):
-            normalize_uv_projection(self.input_path, self.seam_path, self.output_path)
+            normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
         self.assertFalse(self.output_path.exists())
 
     def test_ring_first_vertices_are_on_positive_u_axis_and_texture_follows(self):
@@ -124,7 +250,7 @@ class NormalizeUVProjectionTests(unittest.TestCase):
         with self.seam_path.open("w", encoding="utf-8", newline="") as stream:
             csv.writer(stream).writerows(rows)
 
-        normalize_uv_projection(self.input_path, self.seam_path, self.output_path)
+        normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
         _, uvs, _, _ = _read_obj(self.output_path)
         np.testing.assert_allclose(uvs[1], (1.0, 0.1), atol=1e-8)
         np.testing.assert_allclose(uvs[7], (0.2, 0.9), atol=1e-8)
@@ -141,22 +267,23 @@ class NormalizeUVProjectionTests(unittest.TestCase):
                 self.assertEqual(pixel[3], 255)
 
     def test_main_normalize_uses_voxelized_seams(self):
-        with patch.object(sys, "argv", ["main.py", "--operation", "normalize", "--input-dir", str(self.root)]):
+        with patch.object(sys, "argv", ["main.py", "--operation", "normalize_uv_projection", "--root-dir", str(self.root)]):
             main.main()
         self.assertTrue(self.output_path.is_file())
         self.assertTrue(self.output_path.with_suffix(".png").is_file())
 
     def test_main_reports_missing_seam(self):
         self.seam_path.unlink()
-        with patch.object(sys, "argv", ["main.py", "--operation", "normalize", "--input-dir", str(self.root)]):
-            with self.assertRaisesRegex(RuntimeError, "Normalized 0 of 1"):
+        with patch.object(sys, "argv", ["main.py", "--operation", "normalize_uv_projection", "--root-dir", str(self.root)]):
+            with patch("sys.stdout", new_callable=io.StringIO) as output:
                 main.main()
+        self.assertIn("No seam CSV found", output.getvalue())
         self.assertFalse(self.output_path.exists())
 
     def test_refuses_to_overwrite_source_texture(self):
         conflicting_output = self.input_dir / "source.obj"
         with self.assertRaisesRegex(ValueError, "must not overwrite"):
-            normalize_uv_projection(self.input_path, self.seam_path, conflicting_output)
+            normalize_uv_projection(self.input_path, conflicting_output, self.seam_dir)
         self.assertFalse(conflicting_output.exists())
 
     def test_texture_padding_copies_nearest_color_without_changing_chart(self):
@@ -183,17 +310,17 @@ class NormalizeUVProjectionTests(unittest.TestCase):
             with patch.object(sys, "argv", ["normalize_uv_projection.py"]):
                 normalization.main()
             normalize.assert_called_once_with(
-                root / "BlenderRebaked/Envy1NoStemHiRes.obj",
-                root / "Voxelized/Envy1_seam.csv",
-                root / "NormalizedTexture/Envy1NoStemHiRes.obj",
+                root / "BlenderRebaked/Envy_002_FullRes.obj",
+                root / "NormalizedTexture/Envy_002_FullRes_seam.obj",
+                root / "Voxelized",
             )
             normalize.reset_mock()
             with patch.object(
-                sys, "argv", ["normalize_uv_projection.py", "input.obj", "seam.csv", "output.obj"]
+                sys, "argv", ["normalize_uv_projection.py", "input.obj", "output.obj", "seam_dir"]
             ):
                 normalization.main()
             normalize.assert_called_once_with(
-                Path("input.obj"), Path("seam.csv"), Path("output.obj")
+                Path("input.obj"), Path("output.obj"), Path("seam_dir")
             )
 
 
