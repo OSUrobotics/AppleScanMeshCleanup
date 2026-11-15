@@ -300,28 +300,48 @@ def _define_seam(mesh: trimesh.Trimesh,
     return seam_vertices, seam_edges
 
 
-def _check_diamond(mesh: trimesh.Trimesh, seam_uvs: set, uvs_diamond) -> bool:
-    """Check that the uv texture coordinates for the diamond/middle component do not overlap with the two circle components. 
-    If they do, warp the diamond component to avoid overlap."""
-    # The two sides that might overlap with the circles are two side seams. Check if the UV coordiantes of the side seam overlap with the
-    # boundary of the two circle components. If there is overlap, warp the uv coordiantes of the diamond component by warping the
-    # edge in.
+_CAP_RADIUS = 0.1
+_UV_PADDING = 3.0 / 1024.0
+_CAP_CENTERS = np.array([
+    [0.9 - _UV_PADDING, 0.1 + _UV_PADDING],
+    [0.1 + _UV_PADDING, 0.9 - _UV_PADDING],
+])
 
-    circle_centers = [(0.8, 0.2), (0.2, 0.8 )]
-    circle_radius = 0.2
 
-    warp_sides = []
-    for circle in circle_centers:
-        overlap = 0.0
-        for uv in seam_uvs:
-            dist = np.linalg.norm(np.array(uv) - np.array(circle))
-            if dist < circle_radius:
-                if circle_radius - dist > overlap:
-                    overlap = circle_radius - dist
-        warp_sides.append(overlap)
+def _check_diamond(diamond_uvs: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Contract the body along the cap-to-cap diagonal when its triangles overlap a cap."""
+    triangles = diamond_uvs[faces]
+    overlaps = False
+    for center in _CAP_CENTERS:
+        relative = triangles - center
+        following = np.roll(relative, -1, axis=1)
+        cross = relative[:, :, 0] * following[:, :, 1] - relative[:, :, 1] * following[:, :, 0]
+        inside = (np.all(cross >= 0, axis=1) | np.all(cross <= 0, axis=1)) & (
+            np.abs(np.sum(cross, axis=1)) > 1e-15
+        )
+        edge = following - relative
+        lengths_squared = np.sum(edge * edge, axis=2)
+        fraction = np.zeros_like(lengths_squared)
+        np.divide(-np.sum(relative * edge, axis=2), lengths_squared,
+                  out=fraction, where=lengths_squared > 0)
+        fraction = np.clip(fraction, 0, 1)
+        nearest = relative + fraction[:, :, None] * edge
+        distance_squared = np.sum(nearest * nearest, axis=2).min(axis=1)
+        if np.any(inside | (distance_squared < _CAP_RADIUS ** 2)):
+            overlaps = True
+            break
+    if not overlaps:
+        return diamond_uvs
 
-    # Now fix the warp by 
-    return overlap > 0.0
+    diagonal = np.array([1.0, -1.0]) / np.sqrt(2.0)
+    positions = diamond_uvs @ diagonal
+    cap_positions = _CAP_CENTERS @ diagonal
+    limit = min(cap_positions[0], -cap_positions[1]) - _CAP_RADIUS - _UV_PADDING
+    if limit <= 0:
+        raise ValueError("Cap charts leave no room for the middle chart.")
+    extent = float(np.max(np.abs(positions)))
+    scale = min(1.0, limit / extent)
+    return diamond_uvs - (1.0 - scale) * positions[:, None] * diagonal
 
 
 def _side_seam(adjacency: list[tuple[int, float]], v1: int, v2: int, no_cross_vs: list[int]):
@@ -393,6 +413,14 @@ def _label_seam_faces(mesh: trimesh.Trimesh,
             faces_right_seam.add(face_id)
 
     return faces_left_seam, faces_right_seam
+
+
+def _pack_cap_uvs(local_uvs: np.ndarray, center: np.ndarray, chart_id: int) -> np.ndarray:
+    if not np.isfinite(local_uvs).all() or np.any(np.ptp(local_uvs, axis=0) <= 0):
+        raise ValueError(f"Chart {chart_id} has invalid or zero UV extent.")
+    offsets = local_uvs - np.median(local_uvs, axis=0)
+    max_radius = float(np.max(np.linalg.norm(offsets, axis=1)))
+    return center + offsets * (_CAP_RADIUS / max_radius)
 
 
 def _parameterize_cut_mesh(
@@ -580,7 +608,7 @@ def _parameterize_cut_mesh(
     output_uvs = []
     vertex_offset = 0
     # Putting the pixels at the corners slightly inside
-    pad = 3.0 / 1024.0
+    pad = _UV_PADDING
     chart_id = 1
     for (_, local_corners, source_vertices, local_faces, local_uvs, is_middle, is_top, is_bottom) in chart_data:
         if is_middle:
@@ -630,20 +658,14 @@ def _parameterize_cut_mesh(
             max_extent = float(np.max(np.abs(centered_uvs)))
             if max_extent > 0.5 - pad:
                 packed_uvs = 0.5 + centered_uvs * ((0.5 - pad) / max_extent)
+            packed_uvs = _check_diamond(packed_uvs, local_faces)
             print(f"Largest cutout corner UVs: {packed_uvs[local_corners].tolist()}")
         else:
-            uv_min = local_uvs.min(axis=0)
-            uv_size = local_uvs.max(axis=0) - uv_min
-            if np.any(uv_size <= 0):
-                raise ValueError(f"Chart {chart_id} has zero UV extent.")
-            available_size = 0.2 - 2 * pad
-            scale = min(available_size / uv_size[0], available_size / uv_size[1])
-            normalized_uvs = (local_uvs - uv_min) * scale
             if is_bottom:
-                packed_uvs = normalized_uvs + [pad, 0.8 - pad]
+                packed_uvs = _pack_cap_uvs(local_uvs, _CAP_CENTERS[1], chart_id)
                 chart_id += 1
             elif is_top:
-                packed_uvs = normalized_uvs + [0.8 - pad, pad]
+                packed_uvs = _pack_cap_uvs(local_uvs, _CAP_CENTERS[0], chart_id)
             else:
                 raise ValueError(f"Was not top, bottom, or middle")
 
