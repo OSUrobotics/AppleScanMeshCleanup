@@ -9,35 +9,36 @@ Output:
     - correspondence: A mapping from vertices of the input mesh to the canonical mesh.
     - The canonical mesh re-shaped to be the same shape as the input mesh
 
-Objective: The top and bottom conical polar vertices should go to the input
+Objective: The top and bottom polar vertices should go to the input
 mesh vertices closest to the endpoints in the input seam CSV.
-The seams should go to the corresponding seams on the canonical mesh, preserving the alignment defined by the seam files.
+Fit the two halves separated by the midpoint along the pole axis without
+constraining the seams.
 
-There are five cone peaks in the canonical mesh at the bottom (the calyx). As best as possible these should go to the points on the
-bottom of the input mesh that have high curvature and stick out. 
 The other objective is to minimize the distortion of the canonical mesh as it is reshaped to match the input mesh.
 
 Run with optional positional arguments:
     python align_meshes.py [input.obj [canonical.obj [output.obj]]]
 The default input is in NormalizedTexture. The output retains the canonical
-material and texture. The companion _correspondence.csv contains zero-based
+material and uses the scan texture resampled into canonical UV space.
+The companion _correspondence.csv contains zero-based
 input vertex and canonical face indices followed by three barycentric weights.
-Peak selection and surface fitting are geometric approximations; they do not
+Surface fitting is a geometric approximation; it does not
 guarantee a globally optimal or intersection-free deformation.
 """
 
 import argparse
 import csv
 import math
-import shutil
+import warnings
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 from scipy.sparse import coo_matrix, diags
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
-from normalize_uv_projection import _read_obj, _read_seam_data, _read_texture
+from normalize_uv_projection import _read_obj, _read_seam_data, _read_texture, _warp_texture
 
 
 def _mesh(path: Path):
@@ -318,6 +319,60 @@ def _resample_seam(
     return np.asarray(source), positions
 
 
+def _half_surface(points, faces, axis):
+    """Split scan triangles at the midpoint without changing the input mesh."""
+    heights = points @ axis
+    midpoint = (heights.min() + heights.max()) / 2
+    triangles = points[faces]
+    triangle_heights = heights[faces] - midpoint
+    pieces = []
+    labels = []
+    for half in (0, 1):
+        signed = triangle_heights if half == 1 else -triangle_heights
+        inside = signed >= 0
+        complete = triangles[np.all(inside, axis=1)]
+        if len(complete):
+            pieces.extend(complete)
+            labels.extend([half] * len(complete))
+        crossing = np.flatnonzero(np.any(inside, axis=1) & ~np.all(inside, axis=1))
+        for index in crossing:
+            polygon = []
+            for corner in range(3):
+                previous = (corner - 1) % 3
+                a, b = triangles[index, previous], triangles[index, corner]
+                da, db = signed[index, previous], signed[index, corner]
+                if (da < 0 and db > 0) or (da > 0 and db < 0):
+                    polygon.append(a + da / (da - db) * (b - a))
+                if db >= 0:
+                    polygon.append(b)
+            for corner in range(1, len(polygon) - 1):
+                pieces.append(np.array([polygon[0], polygon[corner], polygon[corner + 1]]))
+                labels.append(half)
+    if not pieces or set(labels) != {0, 1}:
+        raise ValueError("The scan mesh must have surface triangles in both midpoint halves.")
+    vertices = np.asarray(pieces).reshape(-1, 3)
+    split_faces = np.arange(len(vertices)).reshape(-1, 3)
+    return vertices, split_faces, _SurfaceLocator(vertices, split_faces, np.asarray(labels))
+
+
+def _refine_fit(fitted, graph, surface_points, surface_faces, locator, halves, protected):
+    """Average neighbors and project each free vertex onto its scan half."""
+    graph = graph.tocsr()
+    degree = np.asarray(graph.sum(axis=1)).ravel()
+    if np.any(degree == 0):
+        raise ValueError("The canonical mesh has isolated vertices.")
+
+    refined = fitted.copy()
+    indices = np.setdiff1d(np.arange(len(fitted)), list(protected))
+    for _ in range(4):
+        refined[indices] = (graph[indices] @ refined) / degree[indices, None]
+        for vertex in indices:
+            half = int(halves[vertex])
+            face, weights = locator.locate(refined[vertex], half, int(locator.indices[half][0]))
+            refined[vertex] = weights @ surface_points[surface_faces[face]]
+    return refined
+
+
 def _seam_correspondence(source_ids, target_ids, source_points, target_points, closed):
     source = list(dict.fromkeys(source_ids))
     target = list(dict.fromkeys(target_ids))
@@ -395,66 +450,104 @@ def _seam_uv_transforms(template_seams, scan_seams, template, points, canonical_
     return transforms
 
 
-def _match_calyx_peaks(
-    template: np.ndarray,
-    template_graph,
-    target: np.ndarray,
-    points: np.ndarray,
-    faces: np.ndarray,
-    uv: np.ndarray,
-    uv_faces: np.ndarray,
-    bottom_seam: list[int],
-    endpoints: np.ndarray,
-    reserved_vertices: set[int],
-) -> dict[int, np.ndarray]:
-    neighbors = template_graph.tocsr()
-    seam_height = float(np.mean(template[bottom_seam, 1]))
-    peak_candidates = []
-    for vertex in np.flatnonzero(template[:, 1] < seam_height):
-        adjacent = neighbors.indices[neighbors.indptr[vertex]:neighbors.indptr[vertex + 1]]
-        if len(adjacent) and np.all(template[vertex, 1] < template[adjacent, 1] - 1e-10):
-            peak_candidates.append(int(vertex))
-    if len(peak_candidates) != 5:
-        raise ValueError(f"Expected five distinct canonical calyx peaks, found {len(peak_candidates)}.")
-
-    scan_edges = np.concatenate((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
-    scan_edges.sort(axis=1)
-    scan_edges = np.unique(scan_edges, axis=0)
-    scan_graph = coo_matrix(
-        (np.ones(2 * len(scan_edges)), (np.r_[scan_edges[:, 0], scan_edges[:, 1]], np.r_[scan_edges[:, 1], scan_edges[:, 0]])),
-        shape=(len(points), len(points)),
-    ).tocsr()
-    degree = np.asarray(scan_graph.sum(axis=1)).ravel()
-    if np.any(degree == 0):
-        raise ValueError("The input mesh has isolated vertices.")
-    axis = endpoints[1] - endpoints[0]
-    axis /= np.linalg.norm(axis)
-    prominence = ((points - (scan_graph @ points) / degree[:, None]) @ axis)
-    bottom_faces = np.array([_chart(uv[face].mean(axis=0)) == 1 for face in uv_faces])
-    bottom_vertices = np.unique(faces[bottom_faces])
-    if len(bottom_vertices) < 5:
-        raise ValueError("The input bottom chart does not contain enough vertices for five calyx peaks.")
-    search = cKDTree(points[bottom_vertices])
-    diameter = float(np.linalg.norm(np.ptp(points, axis=0)))
-    if diameter <= 0:
-        raise ValueError("The input mesh has zero size.")
-    used = set()
-    matches = {}
-    for peak in peak_candidates:
-        local = search.query_ball_point(target[peak], 0.1 * diameter)
-        choices = np.array([
-            bottom_vertices[i] for i in local
-            if bottom_vertices[i] not in used and bottom_vertices[i] not in reserved_vertices
-        ], dtype=int)
-        if not len(choices):
-            raise ValueError("Could not find five distinct bottom-chart calyx candidates.")
-        distance = np.linalg.norm(points[choices] - target[peak], axis=1)
-        depth = (points[choices] - endpoints[1]) @ axis
-        score = 2.0 * prominence[choices] + 0.1 * depth - 0.15 * distance
-        selected = int(choices[np.argmax(score)])
-        used.add(selected)
-        matches[peak] = points[selected]
-    return matches
+def _resample_texture(
+    texture_path, output_texture, scan_faces, scan_uv, scan_uv_faces,
+    template_faces, template_uv, template_uv_faces, correspondence, uv_transforms,
+):
+    """Warp scan triangles into canonical UV charts using vertex correspondences."""
+    vertex_faces = [[] for _ in range(int(template_faces.max()) + 1)]
+    for face_index, face in enumerate(template_faces):
+        for vertex in face:
+            vertex_faces[vertex].append(face_index)
+    charts = np.array([_chart(template_uv[face].mean(axis=0)) for face in template_uv_faces])
+    output_uv = np.empty((len(scan_faces), 3, 2), dtype=float)
+    cache = {}
+    for face_index, (face, uv_face) in enumerate(zip(scan_faces, scan_uv_faces)):
+        chart = _chart(scan_uv[uv_face].mean(axis=0))
+        center, transform = uv_transforms[chart]
+        for corner, (vertex, uv_index) in enumerate(zip(face, uv_face)):
+            key = (int(vertex), int(uv_index), chart)
+            if key not in cache:
+                _, canonical_face, *weights = correspondence[vertex]
+                weights = np.asarray(weights)
+                vertices = template_faces[canonical_face]
+                support = vertices[weights > 1e-10]
+                if not len(support):
+                    raise ValueError(f"Invalid correspondence weights for scan vertex {vertex}.")
+                choices = set(vertex_faces[support[0]])
+                for shared_vertex in support[1:]:
+                    choices.intersection_update(vertex_faces[shared_vertex])
+                choices = sorted(index for index in choices if charts[index] == chart)
+                if not choices:
+                    raise ValueError(
+                        f"Scan vertex {vertex} has no corresponding canonical face on chart {chart}."
+                    )
+                expected = center + transform.T @ (scan_uv[uv_index] - center)
+                candidates = []
+                for candidate in choices:
+                    coordinate = np.zeros(2)
+                    for source_vertex, weight in zip(vertices, weights):
+                        if weight > 1e-10:
+                            corner_index = np.flatnonzero(template_faces[candidate] == source_vertex)[0]
+                            coordinate += weight * template_uv[template_uv_faces[candidate, corner_index]]
+                    candidates.append(coordinate)
+                nearest = np.argmin(np.linalg.norm(np.asarray(candidates) - expected, axis=1))
+                cache[key] = candidates[nearest]
+            output_uv[face_index, corner] = cache[key]
+    source_triangles = scan_uv[scan_uv_faces]
+    source_edges = np.linalg.norm(source_triangles - np.roll(source_triangles, 1, axis=1), axis=2)
+    target_edges = np.linalg.norm(output_uv - np.roll(output_uv, 1, axis=1), axis=2)
+    source_scale = np.max(source_edges, axis=1)
+    stretched = np.flatnonzero(
+        (np.max(target_edges, axis=1) > 0.25)
+        & (np.max(target_edges, axis=1) > 3 * source_scale + 0.05)
+    )
+    if len(stretched):
+        locator = _SurfaceLocator(template_uv, template_uv_faces, charts)
+        repaired = 0
+        unresolved = 0
+        for face_index in stretched:
+            chart = _chart(source_triangles[face_index].mean(axis=0))
+            center, transform = uv_transforms[chart]
+            expected = (source_triangles[face_index] - center) @ transform + center
+            errors = np.linalg.norm(output_uv[face_index] - expected, axis=1)
+            for corner in np.flatnonzero(errors > max(0.1, 3 * source_scale[face_index])):
+                chart_face = int(locator.indices[chart][0])
+                match, weights = locator.locate(expected[corner], chart, chart_face)
+                output_uv[face_index, corner] = weights @ template_uv[template_uv_faces[match]]
+                repaired += 1
+            new_edges = np.linalg.norm(
+                output_uv[face_index] - np.roll(output_uv[face_index], 1, axis=0), axis=1
+            )
+            if np.max(new_edges) > 0.25 and np.max(new_edges) > 3 * source_scale[face_index] + 0.05:
+                unresolved += 1
+        if repaired:
+            warnings.warn(
+                f"Texture resampling used face-corner UV lookup for {repaired} "
+                "corners of stretched mapped triangles.",
+                UserWarning, stacklevel=2,
+            )
+        if unresolved:
+            warnings.warn(
+                f"Texture resampling still has {unresolved} unusually stretched mapped triangles.",
+                UserWarning, stacklevel=2,
+            )
+    source_uv = scan_uv[scan_uv_faces].reshape(-1, 2)
+    triangles = np.arange(len(source_uv)).reshape(-1, 3)
+    with Image.open(texture_path) as image:
+        width, height = image.size
+    first = output_uv[:, 1] - output_uv[:, 0]
+    second = output_uv[:, 2] - output_uv[:, 0]
+    determinant = first[:, 0] * second[:, 1] - first[:, 1] * second[:, 0]
+    degenerate = np.count_nonzero(np.abs(determinant) * (width - 1) * (height - 1) < 1e-12)
+    if degenerate:
+        warnings.warn(
+            f"Texture resampling skipped {degenerate} degenerate mapped triangles; "
+            "the output may contain gaps.",
+            UserWarning,
+            stacklevel=2,
+        )
+    _warp_texture(texture_path, output_texture, source_uv, output_uv.reshape(-1, 2), triangles)
 
 
 def align_meshes(
@@ -475,13 +568,14 @@ def align_meshes(
     template_seams = _oriented_seams(template_seams, template, template_faces)
     endpoints = _endpoints(Path(input_seams_path))
     texture_path = _read_texture(material_path)
+    scan_texture_path = _read_texture(input_material)
     output_material = output_path.with_suffix(".mtl")
-    output_texture = output_path.with_suffix(texture_path.suffix)
+    output_texture = output_path.with_suffix(".png")
     correspondence_path = output_path.with_name(output_path.stem + "_correspondence.csv")
     sources = {
         p.resolve() for p in (input_path, canonical_path, input_seams_path,
                               canonical_seams_path, input_material,
-                              _read_texture(input_material), material_path, texture_path)
+                              scan_texture_path, material_path, texture_path)
     }
     if output_path.suffix.lower() != ".obj" or any(
         p.resolve() in sources for p in (output_path, output_material, output_texture, correspondence_path)
@@ -503,16 +597,12 @@ def align_meshes(
         face, weights = scan_locator.locate(center + transform @ (coord - center), chart)
         target[index] = weights @ points[faces[face]]
 
-    constraints: dict[int, np.ndarray] = {}
     seam_pairs = []
     for seam_index in range(6):
         source = template_seams[seam_index]
         dest = scan_seams[seam_index]
         closed = seam_index in (0, 1, 2, 4)
         seam_pairs.append((source, dest, closed))
-        ids, positions = _resample_seam(source, dest, template, points, closed)
-        for vertex, position in zip(ids, positions):
-            constraints.setdefault(int(vertex), position)
 
     scan_tree = cKDTree(points)
     endpoint_ids = scan_tree.query(endpoints)[1]
@@ -526,8 +616,27 @@ def align_meshes(
 
     top_pole = chart_pole(0, np.array([0.9, 0.1]))
     bottom_pole = chart_pole(1, np.array([0.1, 0.9]))
-    constraints[top_pole] = points[endpoint_ids[0]]
-    constraints[bottom_pole] = points[endpoint_ids[1]]
+    constraints = {
+        top_pole: points[endpoint_ids[0]],
+        bottom_pole: points[endpoint_ids[1]],
+    }
+
+    canonical_axis = template[bottom_pole] - template[top_pole]
+    canonical_axis_length = np.linalg.norm(canonical_axis)
+    if canonical_axis_length <= 1e-12:
+        raise ValueError("The canonical pole vertices must be distinct.")
+    canonical_axis /= canonical_axis_length
+    canonical_heights = template @ canonical_axis
+    midpoint = (canonical_heights.min() + canonical_heights.max()) / 2
+    halves = (canonical_heights >= midpoint).astype(int)
+    scan_axis = endpoints[1] - endpoints[0]
+    scan_axis /= np.linalg.norm(scan_axis)
+    surface_points, surface_faces, half_locator = _half_surface(points, faces, scan_axis)
+    for vertex in range(len(template)):
+        if vertex not in constraints:
+            half = int(halves[vertex])
+            face, weights = half_locator.locate(target[vertex], half, int(half_locator.indices[half][0]))
+            target[vertex] = weights @ surface_points[surface_faces[face]]
 
     edges = np.concatenate((template_faces[:, [0, 1]], template_faces[:, [1, 2]], template_faces[:, [2, 0]]))
     edges.sort(axis=1)
@@ -536,11 +645,6 @@ def align_meshes(
         (np.ones(2 * len(edges)), (np.r_[edges[:, 0], edges[:, 1]], np.r_[edges[:, 1], edges[:, 0]])),
         shape=(len(template), len(template)),
     ).tocsr()
-    peak_constraints = _match_calyx_peaks(
-        template, graph, target, points, faces, uv, uv_faces, template_seams[1], endpoints,
-        set(int(vertex) for vertex in endpoint_ids) | set().union(*map(set, scan_seams)),
-    )
-    constraints.update(peak_constraints)
     degree = np.asarray(graph.sum(axis=1)).ravel()
     laplacian = diags(degree) - graph
     # Penalize changes in local edge vectors relative to a best-fit similarity transform.
@@ -565,6 +669,10 @@ def align_meshes(
     if not np.isfinite(fitted).all():
         raise ValueError("Could not solve the canonical mesh deformation.")
 
+    fitted = _refine_fit(
+        fitted, graph, surface_points, surface_faces, half_locator, halves, constraints,
+    )
+
     edge_faces = {}
     vertex_faces = {}
     for face_index, face in enumerate(template_faces):
@@ -583,10 +691,10 @@ def align_meshes(
             weights[np.flatnonzero(face == first)[0]] = 1 - weight
             weights[np.flatnonzero(face == second)[0]] = weight
             seam_mapping.setdefault(vertex, (face_index, weights))
-    for template_vertex, scan_vertex in [
-        (top_pole, int(endpoint_ids[0])), (bottom_pole, int(endpoint_ids[1])),
-        *[(vertex, int(scan_tree.query(point)[1])) for vertex, point in peak_constraints.items()],
-    ]:
+    for template_vertex, scan_vertex in (
+        (top_pole, int(endpoint_ids[0])),
+        (bottom_pole, int(endpoint_ids[1])),
+    ):
         face_index = vertex_faces[template_vertex]
         weights = np.zeros(3)
         weights[np.flatnonzero(template_faces[face_index] == template_vertex)[0]] = 1
@@ -605,7 +713,10 @@ def align_meshes(
         correspondence.append((vertex, face, *weights))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(texture_path, output_texture)
+    _resample_texture(
+        scan_texture_path, output_texture, faces, uv, uv_faces,
+        template_faces, template_uv, template_uv_faces, correspondence, uv_transforms,
+    )
     with output_material.open("w", encoding="utf-8", newline="\n") as stream:
         for line in material_path.read_text(encoding="utf-8").splitlines():
             stream.write(f"map_Kd {output_texture.name}\n" if line.strip().startswith("map_Kd ") else line + "\n")

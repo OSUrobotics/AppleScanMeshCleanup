@@ -38,8 +38,27 @@ The code will not over-write an existing file unless replace_existing is set.
 
 Alignment reads meshes from `NormalizedTexture`, using their matching
 `Voxelized/<input stem>_seam.csv` for seam vertices and the scan's top and
-bottom XYZ endpoints. The canonical seam CSV is next to the canonical OBJ.
+bottom XYZ endpoints. The canonical seam CSV is in the same folder as the canonical OBJ.
 Run normalization before alignment; rebaked UV charts are not necessarily
 normalized. The batch command uses `--operation align_meshes` and selects
 `Canonical/apple_fullres.obj` by default (or `--canonical hires`, etc.).
 The standalone command accepts `input.obj canonical.obj output.obj`.
+The aligned OBJ uses the canonical UVs and material, with a PNG texture
+resampled from the input scan texture using the exported vertex-to-face
+correspondences. The PNG has the input texture's dimensions; triangle
+rasterization uses bilinear sampling and adds four pixels of chart padding.
+Source coordinates come from each face corner, including duplicated seam UVs.
+When a correspondence creates a disproportionately stretched triangle, the
+resampler warns and uses the transformed face-corner UV to locate the affected
+corner on the canonical chart; it warns if a stretched triangle remains.
+Degenerate mapped triangles are skipped with a warning, so distorted or
+incomplete correspondences can leave gaps or overlaps in the resampled texture.
+The fit does not impose special calyx peak or seam constraints. It divides
+each mesh halfway between its extrema along its top-to-bottom pole axis, and
+projects vertices onto the corresponding scan half. Scan triangles crossing
+the midpoint are clipped for projection; the canonical mesh remains connected
+across the boundary. The pole vertices remain pinned to the scan vertices
+nearest the endpoints through six neighbor-averaging and reprojection
+iterations. UV seam and pole
+correspondences are still used for texture transfer. This does not guarantee
+an intersection-free mesh or exact vertex-to-vertex matches.

@@ -4,86 +4,158 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-
         {
             "name": "Debug cleanup",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "main.py",
             "console": "internalConsole",
-            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
-                     "--operation", "cleanup",
-                     "--dest-name", "FullRes"]
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "cleanup",
+                "--dest-name",
+                "FullRes"
+            ]
         },
         {
             "name": "Debug stem removal bake",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "main.py",
             "console": "internalConsole",
-            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
-                     "--operation", "bake_textures",
-                     "--dest-name", "FullRes",
-                     "--use_smart_uv"]
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "bake_textures",
+                "--dest-name",
+                "FullRes",
+                "--use_smart_uv"
+            ]
         },
         {
             "name": "Debug voxelize",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "main.py",
             "console": "internalConsole",
-            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
-                     "--operation", "voxelize"]
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "voxelize"
+            ]
         },
         {
             "name": "Debug after voxelize bake",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "main.py",
             "console": "internalConsole",
-            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
-                     "--operation", "bake_textures",
-                     "--dest-name", "FullRes"]
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "bake_textures",
+                "--dest-name",
+                "FullRes"
+            ]
         },
         {
             "name": "Debug downsample",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "main.py",
             "console": "internalConsole",
-            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
-                     "--operation", "downsample"]
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "downsample"
+            ]
         },
         {
             "name": "Debug normalize uv projection",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "main.py",
             "console": "internalConsole",
-            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
-                     "--operation", "normalize_uv_projection"]
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "normalize_uv_projection"
+            ]
         },
         {
             "name": "Debug align meshes",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "main.py",
             "console": "internalConsole",
-            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
-                     "--operation", "align_meshes",
-                    "--canonical", "fullres"]
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "align_meshes",
+                "--canonical",
+                "fullres"
+            ]
         },
         {
             "name": "Debug rename",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "main.py",
             "console": "internalConsole",
-            "args": ["--root-dir", "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
-                     "--operation", "rename",
-                     "--source-dir", "BlenderRebaked_save",
-                     "--dest-dir", "BlenderRebaked",
-                     "--dest-name", "FullRes"]
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "rename",
+                "--source-dir",
+                "BlenderRebaked_save",
+                "--dest-dir",
+                "BlenderRebaked",
+                "--dest-name",
+                "FullRes"
+            ]
+        },
+        {
+            "name": "Debug pca",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "shape_variation.py",
+            "console": "internalConsole",
+            "args": [
+                "analyze",
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--mesh-directory",
+                "AlignedMeshes",
+                "--output_name",
+                "model.npz"
+            ]
+        },
+        {
+            "name": "Debug Generate random pca",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "shape_variation.py",
+            "console": "internalConsole",
+            "args": [
+                "generate",
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--pca-file",
+                "AlignedMeshes/model.npz",
+                "--count",
+                "1",
+                "--output-dir",
+                "Variations"
+            ]
         },
     ]
 }

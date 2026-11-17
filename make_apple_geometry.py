@@ -5,8 +5,7 @@ Creates the canonical apple mesh, the corresponding texture map with the tops an
 
 The mesh is a spherical lat-long parameterized mesh with longitude density adjusted to keep the
 triangles roughly equilateral. The Y axis runs from the bottom (-Y) to the top (+Y).
- - the top mesh is created by placing a grid of vertices along the top hemisphere, with one vertex at the pole.
- - the bottom mesh has five downward-pointing cones distributed around the calyx and joined to the body ring.
+The top and bottom caps use lat-long grids that meet at their respective poles.
 
 
 """
@@ -21,6 +20,8 @@ from pathlib import Path
 import zlib
 from meshlib import mrmeshpy as mm
 from filename_fixing import _write_material_file
+import numpy as np
+from scipy.spatial import Delaunay
 
 
 _TEXTURE_SIZE = 1024
@@ -30,7 +31,8 @@ _UV_RADIUS = 0.1
 _CENTER_DOT_RADIUS = 0.012
 _AXIS_LINE_HALF_WIDTH = 0.004
 _SEAM_LINE_HALF_WIDTH = 0.004
-_PEAK_DOT_RADIUS = 0.008
+_PEAK_DOT_RADIUS = 0.0015
+_VERTEX_DOT_RADIUS = 0.003
 
 
 @dataclass
@@ -43,6 +45,16 @@ def _longitude_count(latitude: float, latitude_step: float) -> int:
     latitude_step_radians = math.radians(latitude_step)
     circumference = 2.0 * math.pi * math.cos(math.radians(latitude))
     return max(5, math.ceil(circumference / latitude_step_radians))
+
+
+def _body_longitude_count(latitude: float, latitude_step: float) -> int:
+    circumference = 2.0 * math.pi * math.cos(math.radians(latitude))
+    return max(3, round(circumference / math.radians(latitude_step)))
+
+
+def _body_latitude_step(n_samples: int) -> float:
+    target_step = 360.0 * math.cos(math.radians(70.0)) / n_samples
+    return 140.0 / math.ceil(140.0 / target_step)
 
 
 def _add_ring(ms: _MeshAssembly, latitude: float, n_samples: int) -> list[int]:
@@ -92,26 +104,26 @@ def _connect_rings(
 def _create_apple_body(
     n_samples: int,
 ) -> tuple[_MeshAssembly, list[int], list[int], list[int]]:
-    """Create the body of the apple as a lat-long parameterized mesh."""
+    """Create a lat-long body with n_samples vertices on each seam ring."""
     if n_samples < 3:
         raise ValueError("n_samples must be at least 3.")
 
     ms = _MeshAssembly()
-    latitudes = [-70.0 + 140.0 * i / n_samples for i in range(n_samples + 1)]
-    latitude_step = 140.0 / n_samples
-    adjacent_ring_latitude = (latitudes[0] + latitudes[1]) / 2.0
-    latitudes.insert(1, adjacent_ring_latitude)
-    rings = [
-        _add_ring(
-            ms,
-            latitude,
-            _longitude_count(
-                latitude,
-                latitude_step / 2.0 if latitude == adjacent_ring_latitude else latitude_step,
-            ),
-        )
-        for latitude in latitudes
+    endpoint_latitude = 70.0
+    latitude_step = _body_latitude_step(n_samples)
+    latitude_intervals = round(140.0 / latitude_step)
+    latitudes = [
+        -endpoint_latitude + latitude_step * index
+        for index in range(latitude_intervals + 1)
     ]
+    rings = []
+    for index, latitude in enumerate(latitudes):
+        longitude_count = (
+            n_samples
+            if index in (0, latitude_intervals)
+            else _body_longitude_count(latitude, latitude_step)
+        )
+        rings.append(_add_ring(ms, latitude, longitude_count))
     for lower_ring, upper_ring in zip(rings, rings[1:]):
         _connect_rings(ms, lower_ring, upper_ring)
     return ms, rings[-1], rings[0], [ring[0] for ring in rings]
@@ -126,7 +138,7 @@ def _create_apple_top(
     first_face = len(ms.triangles)
     x, y, z = ms.points[top_ring[0]]
     start_latitude = math.degrees(math.atan2(y, math.hypot(x, z)))
-    body_step = 140.0 / n_samples
+    body_step = _body_latitude_step(n_samples)
     intervals = max(1, math.ceil((90.0 - start_latitude) / body_step))
     cap_step = (90.0 - start_latitude) / intervals
     cap_ring = top_ring
@@ -147,171 +159,132 @@ def _create_apple_bottom(
     ms: _MeshAssembly,
     bottom_ring: list[int],
 ) -> tuple[int, int]:
-    """Create five cone shapes distributed around the bottom pole for the calyx."""
+    """Fill the bottom cap with a Cartesian grid projected onto the apple surface."""
     first_face = len(ms.triangles)
-    lobe_count = 5
-    subdivision_levels = 4
-    if len(bottom_ring) < 20:
-        subdivision_levels = 2
-    elif len(bottom_ring) < 40:
-        subdivision_levels = 3
-    bottom_y = ms.points[bottom_ring[0]][1]
-    bottom_radius = math.hypot(ms.points[bottom_ring[0]][0], ms.points[bottom_ring[0]][2])
-    lobe_radius = bottom_radius * 0.45
-    lobe_vertices = []
-    lobe_edges: set[tuple[int, int]] = set()
-    edge_subdivisions: dict[tuple[int, int, int], int] = {}
+    boundary_edge_lengths = [
+        math.dist(
+            ms.points[vertex],
+            ms.points[bottom_ring[(index + 1) % len(bottom_ring)]],
+        )
+        for index, vertex in enumerate(bottom_ring)
+    ]
+    target_edge_length = sum(boundary_edge_lengths) / (2 * len(boundary_edge_lengths))
+    bottom_latitude = math.degrees(
+        math.atan2(
+            ms.points[bottom_ring[0]][1],
+            math.hypot(ms.points[bottom_ring[0]][0], ms.points[bottom_ring[0]][2]),
+        )
+    )
+    pole_distance = math.dist(
+        (0.5 * math.cos(math.radians(bottom_latitude)),
+         0.5 * math.sin(math.radians(bottom_latitude))),
+        (0.0, -0.5),
+    )
+    target_edge_length = min(target_edge_length, 2 * pole_distance / 3)
+    ring_latitude = bottom_latitude - math.degrees(
+        2 * math.asin(min(1.0, target_edge_length))
+    )
+    ring_count = max(
+        3,
+        round(
+            len(bottom_ring)
+            * math.cos(math.radians(ring_latitude))
+            / math.cos(math.radians(bottom_latitude))
+        ),
+    )
+    transition_ring = _add_ring(ms, ring_latitude, ring_count)
+    _connect_rings(ms, transition_ring, bottom_ring)
 
-    def edge_vertex(apex: int, endpoint: int, level: int) -> int:
-        if level == subdivision_levels:
-            return endpoint
-        start, end = sorted((apex, endpoint))
-        canonical_level = level if apex == start else subdivision_levels - level
-        edge = (start, end, canonical_level)
-        vertex = edge_subdivisions.get(edge)
-        if vertex is None:
-            fraction = canonical_level / subdivision_levels
-            point = ms.points[start]
-            other = ms.points[end]
-            position = tuple(
-                (1.0 - fraction) * a + fraction * b
-                for a, b in zip(point, other)
-            )
-            if (start, end) in lobe_edges:
-                position = (
-                    position[0],
-                    position[1] + 0.03 * 4.0 * fraction * (1.0 - fraction),
-                    position[2],
-                )
-            vertex = len(ms.points)
-            ms.points.append(position)
-            edge_subdivisions[edge] = vertex
-        return vertex
+    boundary = np.asarray(
+        [(ms.points[vertex][0], ms.points[vertex][2]) for vertex in transition_ring],
+        dtype=np.float64,
+    )
+    radius = max(np.linalg.norm(boundary, axis=1))
+    grid_radius = radius - target_edge_length / 2
+    if grid_radius <= 0:
+        raise ValueError("The bottom boundary is too small for the requested grid spacing.")
+    grid_spacing = min(target_edge_length, grid_radius * 0.8)
+    for _ in range(8):
+        grid_extent = math.ceil(grid_radius / grid_spacing)
+        grid_axis = np.arange(-grid_extent, grid_extent + 1) * grid_spacing
+        grid_points = []
+        for x in grid_axis:
+            for z in grid_axis:
+                if x * x + z * z >= grid_radius * grid_radius:
+                    continue
+                crosses = [
+                    (boundary[(index + 1) % len(boundary), 0] - boundary[index, 0])
+                    * (z - boundary[index, 1])
+                    - (boundary[(index + 1) % len(boundary), 1] - boundary[index, 1])
+                    * (x - boundary[index, 0])
+                    for index in range(len(boundary))
+                ]
+                if all(value >= -1e-12 for value in crosses) or all(
+                    value <= 1e-12 for value in crosses
+                ):
+                    grid_points.append((x, z))
+        grid_points.append((0.0, 0.0))
+        unique_points = np.unique(np.vstack((boundary, grid_points)), axis=0)
+        simplices = Delaunay(unique_points).simplices
+        edge_indices = np.unique(
+            np.sort(
+                np.concatenate((
+                    simplices[:, [0, 1]],
+                    simplices[:, [1, 2]],
+                    simplices[:, [2, 0]],
+                )),
+                axis=1,
+            ),
+            axis=0,
+        )
+        coordinates = unique_points
+        heights = -np.sqrt(np.maximum(0.0, 0.25 - np.sum(coordinates**2, axis=1)))
+        surface_points = np.column_stack((coordinates[:, 0], heights, coordinates[:, 1]))
+        edge_lengths = np.linalg.norm(
+            surface_points[edge_indices[:, 0]] - surface_points[edge_indices[:, 1]],
+            axis=1,
+        )
+        measured_length = float(edge_lengths.mean())
+        if abs(measured_length - target_edge_length) <= target_edge_length * 0.03:
+            break
+        grid_spacing = min(
+            grid_spacing * target_edge_length / measured_length,
+            grid_radius * 0.8,
+        )
 
-    def subdivide_cone_face(
-        apex: int,
-        first: int,
-        second: int,
-        subdivide_base: bool = False,
-    ) -> None:
-        rows = [[apex]]
-        final_level = subdivision_levels if subdivide_base else subdivision_levels - 1
-        for level in range(1, final_level + 1):
-            row = []
-            for position in range(level + 1):
-                if position == 0:
-                    row.append(edge_vertex(apex, first, level))
-                elif position == level:
-                    row.append(edge_vertex(apex, second, level))
-                elif level == subdivision_levels:
-                    row.append(edge_vertex(first, second, position))
-                else:
-                    fraction = level / subdivision_levels
-                    side = position / level
-                    apex_point = ms.points[apex]
-                    first_point = ms.points[first]
-                    second_point = ms.points[second]
-                    vertex = len(ms.points)
-                    ms.points.append(tuple(
-                        (1.0 - fraction) * apex_coordinate
-                        + fraction * (
-                            (1.0 - side) * first_coordinate
-                            + side * second_coordinate
-                        )
-                        for apex_coordinate, first_coordinate, second_coordinate
-                        in zip(apex_point, first_point, second_point)
-                    ))
-                    row.append(vertex)
-            rows.append(row)
-
-        for level in range(final_level):
-            previous_row = rows[level]
-            row = rows[level + 1]
-            for position in range(level + 1):
-                ms.triangles.append((
-                    previous_row[position],
-                    row[position],
-                    row[position + 1],
-                ))
-                if position < level:
-                    ms.triangles.append((
-                        previous_row[position],
-                        row[position + 1],
-                        previous_row[position + 1],
-                    ))
-
-        if not subdivide_base:
-            previous_row = rows[-1]
-            for position in range(subdivision_levels - 1):
-                ms.triangles.append((
-                    previous_row[position],
-                    first,
-                    previous_row[position + 1],
-                ))
-            ms.triangles.append((previous_row[-1], first, second))
-
-    for i in range(lobe_count):
-        angle = 2.0 * math.pi * (i + 0.5) / lobe_count
-        lobe_vertices.append(len(ms.points))
-        ms.points.append((
-            lobe_radius * math.cos(angle),
-            bottom_y - 0.04,
-            -lobe_radius * math.sin(angle),
-        ))
-
-    lobe_edges = {
-        tuple(sorted((lobe_vertices[i], lobe_vertices[(i + 1) % lobe_count])))
-        for i in range(lobe_count)
+    boundary_indices = np.array(
+        [int(np.flatnonzero(np.all(unique_points == point, axis=1))[0]) for point in boundary]
+    )
+    boundary_vertex_by_point = {
+        int(point_index): int(vertex)
+        for point_index, vertex in zip(boundary_indices, transition_ring)
     }
+    point_indices = []
+    for point_index, point in enumerate(unique_points):
+        if point_index in boundary_vertex_by_point:
+            point_indices.append(boundary_vertex_by_point[point_index])
+            continue
+        x, z = point
+        if abs(x) <= 1e-12 and abs(z) <= 1e-12:
+            point_indices.append(-1)
+        else:
+            y = -math.sqrt(max(0.0, 0.25 - x * x - z * z))
+            point_indices.append(len(ms.points))
+            ms.points.append((float(x), y, float(z)))
+    south_pole = len(ms.points)
+    ms.points.append((0.0, -0.5, 0.0))
+    for point_index, vertex in enumerate(point_indices):
+        if vertex == -1:
+            point_indices[point_index] = south_pole
 
-    for i, lobe in enumerate(lobe_vertices):
-        start = round(i * len(bottom_ring) / lobe_count)
-        end = round((i + 1) * len(bottom_ring) / lobe_count)
-        for edge in range(start, end):
-            outer = bottom_ring[edge % len(bottom_ring)]
-            next_outer = bottom_ring[(edge + 1) % len(bottom_ring)]
-            subdivide_cone_face(lobe, next_outer, outer)
+    for simplex in simplices:
+        face = [point_indices[int(index)] for index in simplex]
+        a, b, c = (np.asarray(ms.points[vertex]) for vertex in face)
+        normal = np.cross(b - a, c - a)
+        if float(normal @ (a + b + c)) < 0:
+            face[1], face[2] = face[2], face[1]
+        ms.triangles.append(tuple(face))
 
-        boundary_vertex = bottom_ring[end % len(bottom_ring)]
-        next_lobe = lobe_vertices[(i + 1) % lobe_count]
-        subdivide_cone_face(boundary_vertex, lobe, next_lobe, subdivide_base=True)
-
-    pole = len(ms.points)
-    ms.points.append((0.0, bottom_y + 0.02, 0.0))
-    for i, lobe in enumerate(lobe_vertices):
-        next_lobe = lobe_vertices[(i + 1) % lobe_count]
-        subdivide_cone_face(pole, next_lobe, lobe, subdivide_base=True)
-
-    boundary_edges = {
-        tuple(sorted((vertex, bottom_ring[(i + 1) % len(bottom_ring)])))
-        for i, vertex in enumerate(bottom_ring)
-    }
-    for _ in range(2):
-        midpoints: dict[tuple[int, int], int] = {}
-        refined = []
-
-        def midpoint(a: int, b: int) -> int:
-            edge = tuple(sorted((a, b)))
-            if edge not in midpoints:
-                midpoints[edge] = len(ms.points)
-                ms.points.append(tuple((x + y) / 2 for x, y in zip(ms.points[a], ms.points[b])))
-            return midpoints[edge]
-
-        for a, b, c in ms.triangles[first_face:]:
-            edges = [(a, b), (b, c), (c, a)]
-            fixed = [i for i, edge in enumerate(edges) if tuple(sorted(edge)) in boundary_edges]
-            if fixed:
-                if len(fixed) != 1:
-                    raise ValueError("A calyx triangle has multiple boundary edges.")
-                vertices = (a, b, c)
-                i = fixed[0]
-                a, b, c = vertices[i], vertices[(i + 1) % 3], vertices[(i + 2) % 3]
-                bc, ca = midpoint(b, c), midpoint(c, a)
-                refined.extend(((a, b, bc), (a, bc, ca), (ca, bc, c)))
-            else:
-                ab, bc, ca = midpoint(a, b), midpoint(b, c), midpoint(c, a)
-                refined.extend(((a, ab, ca), (ab, b, bc), (ca, bc, c), (ab, bc, ca)))
-        ms.triangles[first_face:] = refined
     return first_face, len(ms.triangles)
 
 
@@ -348,7 +321,35 @@ def _longitude(point: tuple[float, float, float]) -> float:
 def _write_texture_map(
     texture_path: Path,
     peak_uvs: tuple[tuple[float, float], ...] = (),
+    vertex_uvs: tuple[tuple[float, float], ...] = (),
 ) -> None:
+    vertex_dot_pixels = set()
+    for vertex_u, vertex_v in vertex_uvs:
+        column_min = max(
+            0, math.ceil((vertex_u - _VERTEX_DOT_RADIUS) * _TEXTURE_SIZE - 0.5)
+        )
+        column_max = min(
+            _TEXTURE_SIZE - 1,
+            math.floor((vertex_u + _VERTEX_DOT_RADIUS) * _TEXTURE_SIZE - 0.5),
+        )
+        row_min = max(
+            0,
+            math.ceil((1 - vertex_v - _VERTEX_DOT_RADIUS) * _TEXTURE_SIZE - 0.5),
+        )
+        row_max = min(
+            _TEXTURE_SIZE - 1,
+            math.floor((1 - vertex_v + _VERTEX_DOT_RADIUS) * _TEXTURE_SIZE - 0.5),
+        )
+        for row in range(row_min, row_max + 1):
+            pixel_v = 1.0 - (row + 0.5) / _TEXTURE_SIZE
+            for column in range(column_min, column_max + 1):
+                pixel_u = (column + 0.5) / _TEXTURE_SIZE
+                if (
+                    (pixel_u - vertex_u) ** 2 + (pixel_v - vertex_v) ** 2
+                    <= _VERTEX_DOT_RADIUS**2
+                ):
+                    vertex_dot_pixels.add((row, column))
+
     image = bytearray()
     for row in range(_TEXTURE_SIZE):
         v = 1.0 - (row + 0.5) / _TEXTURE_SIZE
@@ -380,6 +381,8 @@ def _write_texture_map(
                     color = (128, 128, 128)
                 elif 0.0 < du <= _UV_RADIUS and abs(dv) <= _AXIS_LINE_HALF_WIDTH:
                     color = (0, 0, 0)
+            if (row, column) in vertex_dot_pixels:
+                color = (128, 128, 128)
             for peak_u, peak_v in peak_uvs:
                 if (u - peak_u) ** 2 + (v - peak_v) ** 2 <= _PEAK_DOT_RADIUS**2:
                     color = (0, 255, 255)
@@ -485,7 +488,8 @@ def _write_obj_with_uv(
         for point in ms.points
         if point[1] <= lowest_y + 1e-6
     )
-    _write_texture_map(texture_path, peak_uvs)
+    seam_vertices = set(top_ring) | set(bottom_ring) | set(side_seam)
+    vertex_uvs: dict[int, tuple[float, float]] = {}
     _write_material_file(material_path, texture_path.name)
     _write_seam_csv(
         seam_path,
@@ -522,6 +526,8 @@ def _write_obj_with_uv(
                 else:
                     uv = _middle_uv(point, longitudes[corner], bottom_y, top_y)
                 face_uvs.append(uv)
+                if vertex not in seam_vertices:
+                    vertex_uvs.setdefault(vertex, uv)
 
             vt_indices = [3 * face_index + corner + 1 for corner in range(3)]
             for u, v in face_uvs:
@@ -531,6 +537,7 @@ def _write_obj_with_uv(
                 for vertex, vt_index in zip(face, vt_indices)
             )
             obj_file.write(f"f {corners}\n")
+    _write_texture_map(texture_path, peak_uvs, tuple(vertex_uvs.values()))
 
 
 def _to_mesh(ms: _MeshAssembly) -> mm.Mesh:
@@ -570,11 +577,11 @@ def _main(argv=None):
     parser.add_argument('--variety', default='random', help='random or a named cultivar')
     parser.add_argument('--n_samples', default=64, type=int)
     parser.add_argument('--blemishes', type=float, default=0.20)
-    parser.add_argument('--output-file', default='/Users/cindygrimm/PycharmProjects/data/ScannedModels/apple.obj', help='Path to the output OBJ mesh')
+    parser.add_argument('--output-file', default='/Users/cindygrimm/PycharmProjects/data/ScannedModels/Canonical/apple.obj', help='Path to the output OBJ mesh')
     args = parser.parse_args(argv)
 
     output_path = Path(args.output_file)
-    for n_samples, tag in ((16, "lowres"), (32, "hires"), (64, "fullres")):
+    for n_samples, tag in ((15, "lowres"), (33, "hires"), (60, "fullres")):
         output_path_tagged = output_path.with_name(output_path.stem + f"_{tag}.obj")
         _create_apple(n_samples=n_samples, output_path=output_path_tagged)
 

@@ -19,7 +19,7 @@ _ENVY_NORMALIZED = Path(
 
 
 class AppleGeometryUVTests(unittest.TestCase):
-    def test_texture_marks_calyx_peaks_with_cyan_dots(self):
+    def test_texture_marks_south_pole_with_cyan_dot(self):
         from PIL import Image
 
         with tempfile.TemporaryDirectory() as directory:
@@ -33,13 +33,53 @@ class AppleGeometryUVTests(unittest.TestCase):
             ])
         lowest = vertices[:, 1].min()
         peaks = np.flatnonzero(vertices[:, 1] <= lowest + 1e-6)
-        self.assertEqual(len(peaks), 5)
-        bottom_radius = math.hypot(*vertices[peaks[0]][[0, 2]]) / 0.45
-        for peak in peaks:
-            u, v = geometry._bottom_uv(tuple(vertices[peak]), bottom_radius)
+        self.assertEqual(len(peaks), 1)
+        bottom_radius = 0.5 * math.cos(math.radians(70))
+        u, v = geometry._bottom_uv(tuple(vertices[peaks[0]]), bottom_radius)
+        self.assertEqual(
+            image.getpixel((int(u * image.width), int((1 - v) * image.height))),
+            (0, 255, 255),
+        )
+
+    def test_texture_marks_non_seam_vertices_with_grey_dots(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as directory:
+            obj_path = Path(directory) / "apple.obj"
+            geometry._create_apple(16, obj_path)
+            image = Image.open(obj_path.with_suffix(".png")).convert("RGB")
+
+            assembly, top_ring, bottom_ring, side_seam = geometry._create_apple_body(16)
+            top_faces = geometry._create_apple_top(assembly, top_ring, 16)
+            bottom_faces = geometry._create_apple_bottom(assembly, bottom_ring)
+            seam_vertices = set(top_ring) | set(bottom_ring) | set(side_seam)
+            texture_coordinates = []
+            candidate_uv = None
+            for line in obj_path.read_text(encoding="utf-8").splitlines():
+                parts = line.split()
+                if parts[0] == "vt":
+                    texture_coordinates.append((float(parts[1]), float(parts[2])))
+                elif parts[0] == "f":
+                    for corner in parts[1:]:
+                        vertex_index, texture_index = (
+                            int(index) - 1 for index in corner.split("/")
+                        )
+                        face_index = texture_index // 3
+                        if (
+                            vertex_index not in seam_vertices
+                            and (face_index < top_faces[0] or face_index >= top_faces[1])
+                            and (face_index < bottom_faces[0] or face_index >= bottom_faces[1])
+                        ):
+                            candidate_uv = texture_coordinates[texture_index]
+                            break
+                    if candidate_uv is not None:
+                        break
+
+            self.assertIsNotNone(candidate_uv)
+            u, v = candidate_uv
             self.assertEqual(
                 image.getpixel((int(u * image.width), int((1 - v) * image.height))),
-                (0, 255, 255),
+                (128, 128, 128),
             )
 
     def test_texture_circles_have_grey_center_and_positive_x_line(self):
@@ -66,16 +106,58 @@ class AppleGeometryUVTests(unittest.TestCase):
         self.assertEqual(pixel(0.75, 0.75), (144, 238, 144))
         self.assertEqual(pixel(0.25, 0.25), (173, 216, 230))
 
-    def test_calyx_is_refined_twice_without_splitting_seam(self):
-        baseline_faces = {3: 225, 12: 303, 32: 537, 64: 901}
-        for samples, original_faces in baseline_faces.items():
+    def test_bottom_grid_spacing_and_seam_csv(self):
+        for samples in (3, 12, 32, 64):
             with self.subTest(samples=samples):
-                assembly, top, bottom, _ = geometry._create_apple_body(samples)
+                assembly, top, bottom, side_seam = geometry._create_apple_body(samples)
                 geometry._create_apple_top(assembly, top, samples)
                 body_faces = list(assembly.triangles)
+                first_new_point = len(assembly.points)
                 first, last = geometry._create_apple_bottom(assembly, bottom)
                 self.assertEqual(assembly.triangles[:first], body_faces)
-                self.assertEqual(last - first, 16 * original_faces - 5 * len(bottom))
+                self.assertGreater(last, first)
+                boundary_lengths = np.linalg.norm(
+                    np.asarray(assembly.points)[bottom]
+                    - np.roll(np.asarray(assembly.points)[bottom], -1, axis=0),
+                    axis=1,
+                )
+                bottom_latitude = math.radians(-70.0)
+                pole_distance = math.dist(
+                    (0.5 * math.cos(bottom_latitude), 0.5 * math.sin(bottom_latitude)),
+                    (0.0, -0.5),
+                )
+                target_edge_length = min(
+                    float(boundary_lengths.mean()) / 2,
+                    2 * pole_distance / 3,
+                )
+                ring_latitude = bottom_latitude - 2 * math.asin(target_edge_length)
+                ring_count = max(
+                    3,
+                    round(
+                        len(bottom)
+                        * math.cos(ring_latitude)
+                        / math.cos(bottom_latitude)
+                    ),
+                )
+                transition_ring = np.asarray(
+                    assembly.points[first_new_point:first_new_point + ring_count]
+                )
+                self.assertTrue(np.allclose(
+                    transition_ring[:, 1],
+                    0.5 * math.sin(ring_latitude),
+                ))
+                meridian_edge_length = math.dist(
+                    (
+                        0.5 * math.cos(bottom_latitude),
+                        0.5 * math.sin(bottom_latitude),
+                    ),
+                    (0.5 * math.cos(ring_latitude), 0.5 * math.sin(ring_latitude)),
+                )
+                self.assertAlmostEqual(
+                    meridian_edge_length,
+                    target_edge_length,
+                    places=12,
+                )
                 edges = {}
                 for face in assembly.triangles:
                     for i in range(3):
@@ -85,10 +167,57 @@ class AppleGeometryUVTests(unittest.TestCase):
                 for i, vertex in enumerate(bottom):
                     edge = tuple(sorted((vertex, bottom[(i + 1) % len(bottom)])))
                     self.assertEqual(edges[edge], 2)
+                self.assertEqual(assembly.points[-1], (0.0, -0.5, 0.0))
                 vertices = np.asarray(assembly.points)
-                bottom_y = vertices[bottom[0], 1]
-                peaks = vertices[np.isclose(vertices[:, 1], bottom_y - 0.04, atol=1e-10)]
-                self.assertEqual(len(peaks), 5)
+                cap_faces = np.asarray(assembly.triangles[first:last])
+                cap_edges = np.unique(
+                    np.sort(
+                        np.concatenate((
+                            cap_faces[:, [0, 1]],
+                            cap_faces[:, [1, 2]],
+                            cap_faces[:, [2, 0]],
+                        )),
+                        axis=1,
+                    ),
+                    axis=0,
+                )
+                cap_lengths = np.linalg.norm(
+                    vertices[cap_edges[:, 0]] - vertices[cap_edges[:, 1]],
+                    axis=1,
+                )
+                expected_length = target_edge_length
+                self.assertLess(
+                    abs(float(cap_lengths.mean()) - expected_length) / expected_length,
+                    0.3,
+                )
+                grid_vertices = np.asarray(
+                    assembly.points[first_new_point + ring_count:-1]
+                )
+                gap = np.linalg.norm(
+                    transition_ring[:, None, :] - grid_vertices[None, :, :],
+                    axis=2,
+                ).min()
+                self.assertGreater(gap, 0.4 * expected_length)
+                self.assertLess(gap, 0.8 * expected_length)
+                with tempfile.TemporaryDirectory() as directory:
+                    csv_path = Path(directory) / "seam.csv"
+                    geometry._write_seam_csv(
+                        csv_path,
+                        assembly,
+                        top,
+                        bottom,
+                        side_seam,
+                        math.hypot(*[assembly.points[top[0]][i] for i in (0, 2)]),
+                        math.hypot(*[assembly.points[bottom[0]][i] for i in (0, 2)]),
+                    )
+                    with csv_path.open(newline="") as stream:
+                        rows = list(csv.reader(stream))
+                seam_ids = {
+                    int(vertex)
+                    for row_index in (0, 3, 6, 9, 12, 15)
+                    for vertex in rows[row_index]
+                }
+                self.assertTrue(all(vertex < first_new_point for vertex in seam_ids))
 
     @unittest.skipUnless(_ENVY_NORMALIZED.is_dir(), "Envy1 sample data is not available")
     def test_envy_and_canonical_seam_uv_placement_and_winding(self):
@@ -233,12 +362,19 @@ class AppleGeometryUVTests(unittest.TestCase):
                 ]
                 self.assertAlmostEqual(latitudes[0], -70)
                 self.assertAlmostEqual(latitudes[-1], 70)
-                self.assertAlmostEqual(latitudes[1], -70 + 70 / samples)
-                np.testing.assert_allclose(
-                    latitudes[2:], np.linspace(-70 + 140 / samples, 70, samples), atol=1e-12
+                self.assertEqual(len(top_ring), samples)
+                self.assertEqual(len(bottom_ring), samples)
+                self.assertTrue(np.allclose(np.diff(latitudes), np.diff(latitudes)[0]))
+
+                vertices = np.asarray(assembly.points)
+                faces = np.asarray(assembly.triangles)
+                triangles = vertices[faces]
+                lengths = np.linalg.norm(
+                    triangles - np.roll(triangles, 1, axis=1),
+                    axis=2,
                 )
-                self.assertEqual(len(top_ring), geometry._longitude_count(70, 140 / samples))
-                self.assertEqual(len(bottom_ring), geometry._longitude_count(-70, 140 / samples))
+                ratios = lengths.max(axis=1) / lengths.min(axis=1)
+                self.assertLess(float(np.quantile(ratios, 0.95)), 1.8)
 
     def test_seam_csv_contains_body_uvs_for_each_face_corner(self):
         assembly, top_ring, bottom_ring, side_seam = geometry._create_apple_body(32)
