@@ -11,6 +11,8 @@ Directories
    BlenderStemRemoved : Manually cut out the stem 
    Voxelized : Generate a new, clean mesh using voxelization and build the cylindrical parameterization. Runs on BlenderStemRemoved
            - it is safe to overwrite these
+   Parameterized : Derived from Voxelized by adding the cylindrical parameterization.
+           - it is safe to overwrite these
    BlenderTextured : Manually Bake the texture map from the meshlabcleaned and clean up the stem texture
    NormalizedTexture : Normalize UV charts and warp the rebaked texture using seams from Voxelized
    Final : Generate Hi and Low res meshees from BlenderTextured.
@@ -18,6 +20,7 @@ Directories
 from MeshLabCleanup import (
     cleanup_mesh,
     downsample_mesh,
+    parameterize_mesh,
     process_meshes,
     voxelize_mesh,
     _rename_mesh
@@ -45,7 +48,7 @@ MLX_SCRIPTS = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Clean up, downsample, voxelize, bake textures, normalize UV textures, or align with canonical."
+        description="Clean up, downsample, voxelize, parameterize, bake textures, normalize UV textures, or align with canonical."
     )
     parser.add_argument(
         "--root-dir",
@@ -55,7 +58,7 @@ def parse_args():
     parser.add_argument(
         "--operation",
         required=True,
-        choices=(*MLX_SCRIPTS, "rename", "normalize_uv_projection", "bake_textures", "align_meshes", "downsample", "normalize_uv_projection"),
+        choices=(*MLX_SCRIPTS, "rename", "parameterize", "normalize_uv_projection", "bake_textures", "align_meshes", "downsample"),
         help="Operation to run; selects the input/output directories.",
     )
     parser.add_argument(
@@ -146,6 +149,13 @@ def main():
         process_file = partial(
             voxelize_mesh,
         )
+    elif args.operation == "parameterize":
+        # The meshes labeled _voxel are parameterized with cylindrical coordinates
+        input_dir = root_dir / "Voxelized"
+        output_dir = root_dir / "Parameterized"
+        process_file = partial(
+            parameterize_mesh,
+        )
     elif args.operation == "downsample":
         # Do all three downsample operations: lowres, hires, and fullres
         input_dir = root_dir / "BlenderRebaked"
@@ -184,7 +194,7 @@ def main():
         )
     elif args.operation == "normalize":
         input_dir = root_dir / "BlenderRebaked"
-        seam_dir = root_dir / "Voxelized"
+        seam_dir = root_dir / "Parameterized"
         output_dir = root_dir / "NormalizedTexture"
 
         process_file = partial(
@@ -214,7 +224,7 @@ def main():
             input_dir = root_dir / "BlenderStemRemoved"
             output_dir = root_dir / "BlenderNoStemRebaked"
         else:
-            input_dir = root_dir / "Voxelized" 
+            input_dir = root_dir / "Parameterized" 
             output_dir = root_dir / "BlenderRebaked"
 
         if not os.path.exists(output_dir):
@@ -231,7 +241,7 @@ def main():
         )
     elif args.operation == "normalize_uv_projection":
         input_dir = root_dir / "BlenderRebaked"
-        seam_dir = root_dir / "Voxelized"
+        seam_dir = root_dir / "Parameterized"
         output_dir = root_dir / "NormalizedTexture"
 
         process_file = partial(

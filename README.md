@@ -17,6 +17,8 @@ A note on scanning: You need to leave the stem on the apple. Otherwise, RevoScan
 - Each cap chart is centered using the median of its UV vertices and uniformly scaled to a maximum radius of 0.1 (diameter 0.2), with padding from the texture edges.
 - If the middle chart overlaps either cap, it is contracted along the cap-to-cap diagonal until it clears both caps, preserving triangle orientation.
 - The generated `_seam.csv` ends with two rows containing the top and bottom center coordinates, respectively, in `x, y, z` order.
+- Voxelization also writes `_seam_topology.json` with the original Y bounds, selected center points, top and bottom shoulder radii, and calyx, stem, top, bottom, and side seam data. The shoulder radii determine the top and bottom UV seam targets. Each seam vertex has a list of its UV coordinates, including copies on different charts; the side seam has no ring center or radius.
+- The standalone UV entry point requires a matching `_seam_topology.json` containing both shoulder radii; for a `_voxel` mesh it looks for the JSON without the `_voxel` suffix.
 - The companion `_seam.ply` marks seam vertices black and the vertices nearest the top and bottom centers, plus their first two rings of mesh neighbors, green; green takes precedence where they overlap.
 - UV normalization maps the mesh vertices nearest those 3D points to the centers of the top and bottom circular charts; each must have an interior UV on its respective chart. The normalized seam CSV retains both center rows.
 - Normalization looks in the voxelized seam directory for one `_seam.csv` with the same apple name and number as the input OBJ, ignoring zero-padding and any suffix after the number. Missing or multiple matches are errors.

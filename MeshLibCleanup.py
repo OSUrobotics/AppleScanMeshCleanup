@@ -5,7 +5,7 @@ from pathlib import Path
 from meshlib import mrmeshpy as mm
 
 
-def print_mesh_topology(mesh_path: str | Path) -> int:
+def print_mesh_topology(mesh_path: str | Path, b_check = False) -> int:
     """Print vertex, face, edge counts and the Euler characteristic."""
     mesh = mm.loadMesh(str(mesh_path))
     topology = mesh.topology
@@ -27,4 +27,11 @@ def print_mesh_topology(mesh_path: str | Path) -> int:
         f"non-manifold edges={non_manifold_edges}, "
         f"non-manifold vertices={non_manifold_vertices}, "
     )
+    if b_check:
+        if euler_characteristic != 2:
+            print(f"Warning: Euler characteristic is not 2 for {Path(mesh_path).name}")
+        if non_manifold_edges > 0:
+            print(f"Warning: Non-manifold edges found in {Path(mesh_path).name}")
+        if non_manifold_vertices > 0:
+            print(f"Warning: Non-manifold vertices found in {Path(mesh_path).name}")
     return euler_characteristic

@@ -49,6 +49,19 @@
             ]
         },
         {
+            "name": "Debug parameterize",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "internalConsole",
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "parameterize"
+            ]
+        },
+        {
             "name": "Debug after voxelize bake",
             "type": "debugpy",
             "request": "launch",
@@ -167,9 +180,9 @@
                 "--root-dir",
                 "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
                 "--input-path",
-                "Voxelized/Envy_002_FullRes_voxel.obj",
+                "Voxelized/Envy_003_FullRes_voxel.obj",
                 "--output-path",
-                "CalyxRemoved/Envy_002_NoCalyx.obj"
+                "CalyxRemoved/Envy_003_NoCalyx.obj"
             ]
         },
     ]

@@ -14,6 +14,7 @@
 
 """
 import argparse
+import json
 import os
 from pathlib import Path
 import shutil
@@ -23,13 +24,17 @@ from typing import Callable
 import numpy as np
 import pymeshlab as pml
 from meshlib import mrmeshpy as mm
+from meshlib import mrmeshnumpy as mn
 
 from MeshLibCleanup import print_mesh_topology
 
+from seam_topology import SeamTopology
 from uv_texture import uv_texture, _find_centers
 from filename_fixing import _write_material_file, _apple_name_base, _split_filename_into_apple_type_and_number
 from fix_texture_maps import flood_fill_texture_map
 from normalize_uv_projection import _find_seam_file, _read_obj, _read_texture
+
+from remove_calyx import patch_stem_and_ring_calyx
 
 MeshProcessor = Callable[[Path, Path], Path]
 
@@ -332,21 +337,63 @@ def voxelize_mesh(input_path: Path, output_path: Path) -> Path:
 
     # 1. Clean up deleted faces/vertices and compact indices
     fixed_mesh.pack()
+    fixed_mesh.invalidateCaches()
 
     params = mm.MeshRelaxParams()
 
     params.iterations = 3  # Number of smoothing passes
     params.force = 0.5  # Strength per step (0.0 to 1.0)
 
+    # 4. Relax the mesh to smooth out any irregularities introduced by voxelization
     mm.relaxKeepVolume(fixed_mesh, params)
 
-    # 5. Save the cleaned manifold mesh
-    voxel_path = output_path.with_name(output_path.stem + "_voxel" + output_path.suffix)
-    mm.saveMesh(fixed_mesh, str(voxel_path))
-    print("voxel fixed topology")
-    print_mesh_topology(voxel_path)
+    vertices = mn.getNumpyVerts(fixed_mesh)
+    top_point, bottom_point = _find_centers(input_path=input_path, vertices=vertices)
+    seam_topology = SeamTopology(
+        ymin=float(np.min(vertices[:, 1])),
+        ymax=float(np.max(vertices[:, 1])),
+        top_point=tuple(float(value) for value in top_point),
+        bottom_point=tuple(float(value) for value in bottom_point),
+        seams={},
+    )
 
-    uv_texture(input_path=voxel_path, output_path=output_path)
+    # 5. Save the cleaned manifold mesh
+    mm.saveMesh(fixed_mesh, str(output_path))
+    print("voxel fixed topology")
+    print_mesh_topology(output_path, b_check=True)
+
+    # Write seam topology class to a JSON file
+    seam_topology_path = output_path.with_name(output_path.stem + "_seam_topology.json")
+    with open(seam_topology_path, "w") as handle:
+        json.dump(seam_topology.to_dict(), handle)
+
+
+def parameterize_mesh(input_path: Path, output_path: Path) -> Path:
+    print("Voxel mesh topology")
+    print_mesh_topology(input_path, b_check=True)
+
+    seam_topology_path = input_path.with_name(input_path.stem + "_seam_topology.json")
+    with open(seam_topology_path, "r") as handle:
+        seam_topology = SeamTopology.from_dict(json.load(handle))
+
+    # Patch the stem connection with a ring of vertices and add a split ring around the calyx region
+    # Also computes the size of the ring for the bottom part of the apple and center points
+    patched_mesh = patch_stem_and_ring_calyx(
+        mesh=mm.loadMesh(str(input_path)), seam_topology=seam_topology, output_path=output_path
+    )
+
+    # 5. Save the patched mesh
+    patch_path = output_path.with_name(output_path.stem + "_patch" + output_path.suffix)
+    mm.saveMesh(patched_mesh, str(patch_path))
+    print("patched mesh topology")
+    print_mesh_topology(patch_path)
+
+    uv_texture(input_path=patch_path, output_path=output_path, seam_topology=seam_topology)
+    
+    # Write seam topology class to a JSON file
+    seam_topology_path = output_path.with_name(output_path.stem + "_seam_topology.json")
+    with open(seam_topology_path, "w") as handle:
+        json.dump(seam_topology.to_dict(), handle)
 
 
 def process_meshes(

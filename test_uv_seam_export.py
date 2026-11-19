@@ -2,14 +2,151 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import trimesh
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
-from uv_texture import _write_seam_mesh, _write_seams_as_txt_file
+from seam_topology import SeamInfo, SeamTopology
+from uv_texture import _define_seam, _load_mesh, _orient_mesh, _update_seam_topology, _write_seam_mesh, _write_seams_as_txt_file, uv_texture
 
 
 class UVSeamExportTests(unittest.TestCase):
+    def test_texture_real_mesh_preserves_and_updates_ring_vertices(self):
+        mesh = mm.makeUVSphere(50.0, 32, 32)
+        vertices = mn.getNumpyVerts(mesh)
+        topology = SeamTopology(
+            -50, 50, (0, 50, 0), (0, -50, 0), {},
+            top_shoulder_radius=12.0, bottom_shoulder_radius=20.0,
+        )
+        for name, vertex_id in (("stem", 0), ("calyx", len(vertices) - 1)):
+            topology.add_seam(name, SeamInfo(
+                name, [vertex_id], vertices[[vertex_id]].tolist(), [], (0, 0, 0), 1
+            ))
+        with tempfile.TemporaryDirectory() as temporary:
+            input_path = Path(temporary) / "apple1.obj"
+            output_path = Path(temporary) / "apple1_uv.obj"
+            mm.saveMesh(mesh, str(input_path))
+            uv_texture(input_path, output_path, topology)
+            self.assertTrue(output_path.is_file())
+        self.assertEqual(set(topology.seams), {"stem", "calyx", "top", "bottom", "side"})
+        for seam in topology.seams.values():
+            self.assertEqual(len(seam.uv_coords), len(seam.vertex_ids))
+            self.assertTrue(all(copies for copies in seam.uv_coords))
+
+    def test_rejects_ring_vertices_that_no_longer_match_the_mesh(self):
+        mesh = trimesh.creation.box()
+        topology = SeamTopology(-1, 1, (0, 1, 0), (0, -1, 0), {})
+        topology.add_seam("stem", SeamInfo("stem", [0], [[100, 100, 100]], [], (0, 0, 0), 1))
+        with self.assertRaisesRegex(ValueError, "stem seam vertices do not match"):
+            _update_seam_topology(topology, mesh, [[], [], []], [np.zeros(3), np.zeros(3)], (1, 1), {}, np.empty((0, 2)))
+
+    def test_texture_stores_all_uv_copies_for_each_seam_vertex(self):
+        vertices = [[0, 2, 0], [0, -2, 0]]
+        for y in (1, -1):
+            vertices.extend([[1, y, 0], [0, y, 1], [-1, y, 0], [0, y, -1]])
+        faces = []
+        for i in range(4):
+            a, b = 2 + i, 2 + (i + 1) % 4
+            c, d = 6 + i, 6 + (i + 1) % 4
+            faces.extend([[0, b, a], [1, c, d], [a, b, c], [b, d, c]])
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        topology = SeamTopology(
+            -3, 4, (1, 2, 0), (0, -2, 0), {},
+            top_shoulder_radius=2.5, bottom_shoulder_radius=3.5,
+        )
+        for name, ids in (("stem", [0, 2]), ("calyx", [1, 6])):
+            topology.add_seam(name, SeamInfo(name, ids, mesh.vertices[ids].tolist(), [], (0, 0, 0), 1))
+        top = [2, 3, 4, 5, 2]
+        bottom = [6, 7, 8, 9, 6]
+        top_edges = list(zip(top[:-1], top[1:]))
+        bottom_edges = list(zip(bottom[:-1], bottom[1:]))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "apple.obj"
+            with (
+                patch("uv_texture._load_mesh", return_value=mesh),
+                patch("uv_texture._orient_mesh", wraps=_orient_mesh) as orient,
+                patch("uv_texture._define_seam", side_effect=[
+                    (top, top_edges, 2.5), (bottom, bottom_edges, 3.5)
+                ]) as define,
+                patch("uv_texture._side_seam", return_value=([2, 6], [(2, 6)])),
+                patch("uv_texture._write_seam_mesh"),
+            ):
+                uv_texture(Path("input.obj"), output, topology)
+
+            obj_lines = output.read_text(encoding="utf-8").splitlines()
+            obj_uvs = [list(map(float, line.split()[1:])) for line in obj_lines if line.startswith("vt ")]
+            by_vertex = {}
+            for line in obj_lines:
+                if line.startswith("f "):
+                    for corner in line.split()[1:]:
+                        vertex_id, uv_id = (int(value) - 1 for value in corner.split("/"))
+                        by_vertex.setdefault(vertex_id, set()).add(uv_id)
+            for seam in topology.seams.values():
+                for vertex_id, location, copies in zip(seam.vertex_ids, seam.vertex_locations, seam.uv_coords):
+                    np.testing.assert_allclose(location, mesh.vertices[vertex_id])
+                    self.assertEqual(len(copies), len(by_vertex[vertex_id]))
+                    for uv in copies:
+                        self.assertTrue(any(np.allclose(uv, obj_uvs[index]) for index in by_vertex[vertex_id]))
+
+        self.assertEqual(set(topology.seams), {"stem", "calyx", "top", "bottom", "side"})
+        self.assertEqual(topology.seams["top"].vertex_ids, top[:-1])
+        self.assertEqual(topology.seams["bottom"].vertex_ids, bottom[:-1])
+        self.assertEqual(topology.seams["side"].vertex_ids, [2, 6])
+        self.assertEqual(topology.seams["top"].radius, 2.5)
+        self.assertEqual(topology.seams["bottom"].radius, 3.5)
+        self.assertIsNone(topology.seams["side"].center)
+        self.assertGreater(len(topology.seams["stem"].uv_coords[1]), 1)
+        np.testing.assert_array_equal(orient.call_args.args[1], topology.top_point)
+        np.testing.assert_array_equal(orient.call_args.args[2], topology.bottom_point)
+        for call in define.call_args_list:
+            self.assertEqual((call.kwargs["y_min"], call.kwargs["y_max"]), (-3, 4))
+            np.testing.assert_array_equal(call.kwargs["vertex_heights"], mesh.vertices[:, 1])
+        self.assertEqual([call.kwargs["radius"] for call in define.call_args_list], [2.5, 3.5])
+
+    def test_define_seam_uses_original_vertex_heights_and_topology_bounds(self):
+        angles = np.linspace(0, 2 * np.pi, 16, endpoint=False)
+        vertices = np.vstack([
+            np.column_stack((r * np.cos(angles), np.full(16, y), r * np.sin(angles)))
+            for y in (-100, 100) for r in (2, 5)
+        ])
+        mesh = trimesh.Trimesh(vertices=vertices, faces=[], process=False)
+        heights = np.array([10] * 32 + [-10] * 32)
+        with patch("uv_texture._geodesic", side_effect=lambda adjacency, v1, v2, no_cross_vs: ([v1, v2], [(v1, v2)])):
+            top, _, top_radius = _define_seam(mesh, [], set(), True, heights, -10, 10, 5.0)
+            bottom, _, bottom_radius = _define_seam(mesh, [], set(), False, heights, -10, 10, 2.0)
+        self.assertEqual(set(top), set(range(16, 32)))
+        self.assertEqual(set(bottom), set(range(32, 48)))
+        self.assertEqual((top_radius, bottom_radius), (5.0, 2.0))
+
+    def test_texture_requires_shoulder_radii(self):
+        topology = SeamTopology(-1, 1, (0, 1, 0), (0, -1, 0), {})
+        with self.assertRaisesRegex(ValueError, "top and bottom shoulder radii"):
+            uv_texture(Path("input.obj"), Path("output.obj"), topology)
+
+    def test_define_seam_rejects_invalid_shoulder_radius(self):
+        mesh = trimesh.creation.box()
+        for radius in (0, -1, float("nan")):
+            with self.subTest(radius=radius), self.assertRaisesRegex(ValueError, "Shoulder radius"):
+                _define_seam(mesh, [], set(), True, mesh.vertices[:, 1], -1, 1, radius)
+
+    def test_load_mesh_preserves_vertex_ids_and_orientation_handles_aligned_axis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "mesh.obj"
+            path.write_text(
+                "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 0\nf 1 2 3\nf 4 3 2\n",
+                encoding="utf-8",
+            )
+            mesh = _load_mesh(path)
+        self.assertEqual(len(mesh.vertices), 4)
+        oriented, top, bottom = _orient_mesh(mesh, np.array([0., 1., 0.]), np.array([0., -1., 0.]))
+        np.testing.assert_array_equal(top, [0, 0, 0])
+        np.testing.assert_array_equal(bottom, [0, -2, 0])
+        self.assertIs(oriented, mesh)
+
     def test_seam_mesh_marks_two_rings_around_each_center_green(self):
         mesh = trimesh.Trimesh(
             vertices=[[x, y, 0] for x in range(11) for y in range(2)],

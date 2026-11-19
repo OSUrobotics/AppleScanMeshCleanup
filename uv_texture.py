@@ -17,6 +17,7 @@ Approximate algorithm:
   """
 
 import heapq
+import json
 from collections import deque
 from collections.abc import Sequence
 from pathlib import Path
@@ -28,6 +29,7 @@ import numpy as np
 import pymeshlab
 import trimesh
 from filename_fixing import _write_material_file, _split_filename_into_apple_type_and_number
+from seam_topology import SeamInfo, SeamTopology
 
 
 def _write_blank_texture(n_vs: int, seam_vs: list[list[list[int]]], uvs: np.ndarray, texture_path: Path):
@@ -148,7 +150,7 @@ def _export_obj_with_uv(
 
 def _load_mesh(input_path: Path):
     # 1. Load your cleaned, manifold apple mesh
-    mesh = trimesh.load(str(input_path))
+    mesh = trimesh.load(str(input_path), process=False)
     print(f"Loaded mesh with {len(mesh.vertices)} vertices.")
     return mesh
 
@@ -174,11 +176,18 @@ def _orient_mesh(mesh: trimesh.Trimesh, top_vertex: np.ndarray, bottom_vertex: n
     new_top_vertex = top_vertex + translation
     new_bottom_vertex = bottom_vertex + translation
 
-    direction = new_bottom_vertex / np.linalg.norm(new_bottom_vertex)  
+    axis_length = np.linalg.norm(new_bottom_vertex)
+    if not np.isfinite(axis_length) or axis_length == 0:
+        raise ValueError("Mesh endpoints must define a finite, non-zero axis.")
+    direction = new_bottom_vertex / axis_length
     target = np.array([0, -1, 0])
     axis = np.cross(direction, target)
     if np.linalg.norm(axis) < 1e-8:
-        return mesh
+        if np.dot(direction, target) < 0:
+            rotation_matrix = np.diag([1.0, -1.0, -1.0])
+            mesh.vertices = mesh.vertices @ rotation_matrix.T
+            new_bottom_vertex = new_bottom_vertex @ rotation_matrix.T
+        return mesh, new_top_vertex, new_bottom_vertex
     axis /= np.linalg.norm(axis)
     angle = np.arccos(np.clip(np.dot(direction, target), -1.0, 1.0))
     rotation_matrix = trimesh.transformations.rotation_matrix(angle, axis)[:3, :3]
@@ -189,7 +198,7 @@ def _orient_mesh(mesh: trimesh.Trimesh, top_vertex: np.ndarray, bottom_vertex: n
     return mesh, new_top_vertex, new_bottom_vertex
 
        
-def _geodesic(adjacency: list[tuple[int, float]], v1: int, v2: int, no_cross_vs: list[int]):
+def _geodesic(adjacency: list[list[tuple[int, float]]], v1: int, v2: int, no_cross_vs: set[int]):
     """Find the shortest path between two vertices along mesh edges."""
 
     if v1 == v2:
@@ -226,9 +235,13 @@ def _geodesic(adjacency: list[tuple[int, float]], v1: int, v2: int, no_cross_vs:
 
 
 def _define_seam(mesh: trimesh.Trimesh, 
-                 adjacency: list[tuple[int, float]], 
-                 no_cross_vs: list[int],
-                 b_is_top: bool):
+                 adjacency: list[list[tuple[int, float]]],
+                 no_cross_vs: set[int],
+                 b_is_top: bool,
+                 vertex_heights: np.ndarray,
+                 y_min: float,
+                 y_max: float,
+                 radius: float):
     """ Define a ring of connected edges on the top (or bottom) of the mesh
     Also return the first v point; we'll use that to do the side seam"""
 
@@ -238,21 +251,15 @@ def _define_seam(mesh: trimesh.Trimesh,
         raise ValueError("Cannot define a seam on a mesh with no vertices.")
 
     # Y is the vertical axis; the ring lies in the XZ plane.
-    y_min = float(np.min(vertices[:, 1]))
-    y_max = float(np.max(vertices[:, 1]))
     height = y_max - y_min
+    if not np.isfinite([y_min, y_max]).all() or height <= 0:
+        raise ValueError("Seam topology must have finite, increasing Y bounds.")
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError("Shoulder radius must be finite and positive.")
     if b_is_top:
         y_target = y_max
-        y_top_vs = vertices[:, 1] > 0.95 * y_max
-        # Use the average radius of the top vertices
-        vs_top_x = vertices[y_top_vs, 0]
-        vs_top_z = vertices[y_top_vs, 2]
-        radius_all = np.sqrt(vs_top_x * vs_top_x + vs_top_z * vs_top_z)
-        radius = float(np.mean(radius_all))
     else:
         y_target = y_min
-        # Radius is 2 cm on the bottom
-        radius = 20
 
     # Place eight evenly spaced targets around the ring and choose the
     # closest unused mesh vertex to each target.
@@ -268,9 +275,9 @@ def _define_seam(mesh: trimesh.Trimesh,
         # Look for the vertex that has a y in the valid y range and is closest
         # to the point's x and z values
         if b_is_top:
-            valid_vs = vertices[:, 1] > y_min + 0.7 * height
+            valid_vs = vertex_heights > y_min + 0.7 * height
         else:
-            valid_vs = vertices[:, 1] < y_min + 0.3 * height
+            valid_vs = vertex_heights < y_min + 0.3 * height
         distances_x = np.fabs(vertices[:, 0] - point[0])
         distances_z = np.fabs(vertices[:, 2] - point[2])
         distances = distances_x + distances_z
@@ -297,7 +304,7 @@ def _define_seam(mesh: trimesh.Trimesh,
         seam_edges.extend(connect_edges)
     # Duplicate the last vertex and edge
     seam_vertices.append(vs[0])
-    return seam_vertices, seam_edges
+    return seam_vertices, seam_edges, radius
 
 
 _CAP_RADIUS = 0.1
@@ -344,7 +351,7 @@ def _check_diamond(diamond_uvs: np.ndarray, faces: np.ndarray) -> np.ndarray:
     return diamond_uvs - (1.0 - scale) * positions[:, None] * diagonal
 
 
-def _side_seam(adjacency: list[tuple[int, float]], v1: int, v2: int, no_cross_vs: list[int]):
+def _side_seam(adjacency: list[list[tuple[int, float]]], v1: int, v2: int, no_cross_vs: set[int]):
     """ The top and bottom seam are given as edges in the mesh. Connect them"""
     # Find a list of edges that connects the top seam to the bottom one along the x = 0 plane
 
@@ -770,8 +777,17 @@ def _search_better_bottom_vertex(mesh: trimesh.Trimesh, bottom_vertex: np.ndarra
 
 
 def _find_centers(input_path: Path, vertices: np.ndarray):
-    input_path_endpts = input_path.with_name(input_path.name.replace("NoStemHiRes", ""))
-    input_path_endpts = input_path_endpts.with_suffix(".txt")
+    apple_name, apple_number = _split_filename_into_apple_type_and_number(input_path.name)
+    for directory in ["BlenderStemRemoved", "BlenderNoStemBaked", "Voxelized"]:
+        # Get the directory one up and over (root plus directory)
+        seam_path = input_path.parent.parent / directory / f"{apple_name}_{apple_number}.txt"
+        if os.path.exists(seam_path):
+            input_path_endpts = seam_path
+            break
+        seam_path = input_path.parent.parent / directory / f"{apple_name}{apple_number}.txt"
+        if os.path.exists(seam_path):
+            input_path_endpts = seam_path
+            break
 
     vertices = np.asarray(vertices, dtype=np.float64)
 
@@ -904,23 +920,74 @@ def _write_seams_as_txt_file(seams: list[list[int]], seams_uv: list[list[list[in
         for center in centers:
             fp.write(", ".join(str(coordinate) for coordinate in center) + "\n")
     
-def uv_texture(input_path: Path, output_path: Path):
+def _update_seam_topology(
+    seam_topology: SeamTopology,
+    mesh: trimesh.Trimesh,
+    seam_vertices: list[list[int]],
+    centers: list[np.ndarray],
+    radii: tuple[float, float],
+    map_vs_back: dict[int, list[int]],
+    uvs: np.ndarray,
+) -> None:
+    def vertex_uvs(vertex_ids: list[int]) -> list:
+        result = []
+        for vertex_id in vertex_ids:
+            if vertex_id not in map_vs_back:
+                raise ValueError(f"Seam vertex {vertex_id} has no UV coordinates.")
+            result.append(uvs[map_vs_back[vertex_id]].tolist())
+        return result
+
+    updated_uvs = {}
+    for name in ("calyx", "stem"):
+        if name not in seam_topology.seams:
+            continue
+        seam = seam_topology.seams[name]
+        vertex_ids = seam.vertex_ids
+        if any(vertex_id < 0 or vertex_id >= len(mesh.vertices) for vertex_id in vertex_ids):
+            raise ValueError(f"{name} seam vertex indices are outside the UV mesh.")
+        stored_locations = np.asarray(seam.vertex_locations, dtype=np.float64)
+        if stored_locations.shape != (len(vertex_ids), 3) or not np.allclose(
+            mesh.vertices[vertex_ids], stored_locations, rtol=1e-5, atol=1e-5
+        ):
+            raise ValueError(f"{name} seam vertices do not match the UV mesh.")
+        updated_uvs[name] = vertex_uvs(vertex_ids)
+
+    new_seams = {}
+    for name, vertex_ids, center, radius in zip(
+        ("top", "bottom", "side"),
+        seam_vertices,
+        (centers[0], centers[1], None),
+        (radii[0], radii[1], None),
+    ):
+        new_seams[name] = SeamInfo(
+            name=name,
+            vertex_ids=[int(vertex_id) for vertex_id in vertex_ids],
+            vertex_locations=mesh.vertices[vertex_ids].tolist(),
+            uv_coords=vertex_uvs(vertex_ids),
+            center=tuple(float(value) for value in center) if center is not None else None,
+            radius=float(radius) if radius is not None else None,
+        )
+
+    for name, coords in updated_uvs.items():
+        seam_topology.seams[name].uv_coords = coords
+    for name, seam in new_seams.items():
+        seam_topology.add_seam(name, seam)
+
+
+def uv_texture(input_path: Path, output_path: Path, seam_topology: SeamTopology):
     """Slice open the top and the bottom and unwrap the middle"""
+    top_radius = seam_topology.top_shoulder_radius
+    bottom_radius = seam_topology.bottom_shoulder_radius
+    if top_radius is None or bottom_radius is None:
+        raise ValueError("Seam topology must contain top and bottom shoulder radii.")
+    if not np.isfinite([top_radius, bottom_radius]).all() or min(top_radius, bottom_radius) <= 0:
+        raise ValueError("Top and bottom shoulder radii must be finite and positive.")
     mesh = _load_mesh(input_path)
 
-    apple_name, apple_number = _split_filename_into_apple_type_and_number(input_path.name)
-    for directory in ["BlenderStemRemoved", "BlenderNoStemBaked", "Voxelized"]:
-        # Get the directory one up and over (root plus directory)
-        seam_path = input_path.parent.parent / directory / f"{apple_name}_{apple_number}.txt"
-        if seam_path.exists():
-            break   
-        seam_path = input_path.parent.parent / directory / f"{apple_name}{apple_number}.txt"
-        if seam_path.exists():
-            break   
-    centers = _find_centers(input_path=seam_path, vertices=mesh.vertices)
-    _search_better_top_vertex(mesh, centers[0])
-    _search_better_bottom_vertex(mesh, centers[1])
-    print(f"New centers {centers}")
+    centers = [
+        np.array(seam_topology.top_point, dtype=np.float64),
+        np.array(seam_topology.bottom_point, dtype=np.float64),
+    ]
     mesh_oriented = mesh.copy()
     mesh_oriented, new_top_vertex, new_bottom_vertex = _orient_mesh(mesh_oriented, centers[0], centers[1])
     print(f"New top vertex {new_top_vertex}")
@@ -928,11 +995,19 @@ def uv_texture(input_path: Path, output_path: Path):
 
     adjacency = _create_adjacency_structure(mesh=mesh_oriented)
     no_cross_vs = set()
-    top_seam_vs, top_seam_es = _define_seam(mesh=mesh_oriented, adjacency=adjacency, no_cross_vs=no_cross_vs, b_is_top=True)
+    top_seam_vs, top_seam_es, top_radius = _define_seam(
+        mesh=mesh_oriented, adjacency=adjacency, no_cross_vs=no_cross_vs, b_is_top=True,
+        vertex_heights=mesh.vertices[:, 1], y_min=seam_topology.ymin, y_max=seam_topology.ymax,
+        radius=top_radius,
+    )
     _write_seam_mesh(mesh=mesh_oriented, vs=top_seam_vs, centers=[new_top_vertex, new_bottom_vertex], output_path=output_path)
     for v in top_seam_vs:
         no_cross_vs.add(v)
-    bottom_seam_vs, bottom_seam_es = _define_seam(mesh=mesh_oriented, adjacency=adjacency, no_cross_vs=no_cross_vs, b_is_top=False)
+    bottom_seam_vs, bottom_seam_es, bottom_radius = _define_seam(
+        mesh=mesh_oriented, adjacency=adjacency, no_cross_vs=no_cross_vs, b_is_top=False,
+        vertex_heights=mesh.vertices[:, 1], y_min=seam_topology.ymin, y_max=seam_topology.ymax,
+        radius=bottom_radius,
+    )
     _write_seam_mesh(mesh=mesh_oriented, vs=top_seam_vs + bottom_seam_vs, centers=[new_top_vertex, new_bottom_vertex], output_path=output_path)
     for v in bottom_seam_vs:
         no_cross_vs.add(v)
@@ -971,6 +1046,10 @@ def uv_texture(input_path: Path, output_path: Path):
         seam_mapped = [map_vs_back[v] for v in seam]
         seam_vs_mapped.append(seam_mapped)
 
+    _update_seam_topology(
+        seam_topology, mesh, [top_seam_vs[:-1], bottom_seam_vs[:-1], side_seam_vs],
+        centers, (top_radius, bottom_radius), map_vs_back, uvs,
+    )
     _export_obj_with_uv(mesh=mesh, seam_vs=seam_vs_mapped, vmapping=vmapping, face_indices=indices, uvs=uvs, output_path=output_path)    
     _write_seams_as_txt_file(seams=seam_vs, 
                              seams_uv=seam_vs_mapped,
@@ -990,7 +1069,10 @@ def main():
 
     input_path = Path(scan_dir + "/ProsserEnvyApples/BlenderTexturedFixed/Envy8NoStemHiRes.obj")
     output_path = Path(scan_dir + "/ProsserEnvyApples/BlenderTexturedFixed/Envy8NoStemHiRes_uv.obj")
-    uv_texture(input_path, output_path)
+    topology_path = input_path.with_name(input_path.stem.removesuffix("_voxel") + "_seam_topology.json")
+    with topology_path.open(encoding="utf-8") as handle:
+        seam_topology = SeamTopology.from_dict(json.load(handle))
+    uv_texture(input_path, output_path, seam_topology)
 
 
 if __name__ == "__main__":
