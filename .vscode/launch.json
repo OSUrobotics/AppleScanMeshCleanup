@@ -157,5 +157,20 @@
                 "Variations"
             ]
         },
+        {
+            "name": "Debug remove calyx",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "remove_calyx.py",
+            "console": "internalConsole",
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--input-path",
+                "Voxelized/Envy_002_FullRes_voxel.obj",
+                "--output-path",
+                "CalyxRemoved/Envy_002_NoCalyx.obj"
+            ]
+        },
     ]
 }

@@ -39,6 +39,7 @@ from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
 from normalize_uv_projection import _read_obj, _read_seam_data, _read_texture, _warp_texture
+from fix_texture_maps import flood_fill_texture_map
 
 
 def _mesh(path: Path):
@@ -741,6 +742,8 @@ def align_meshes(
         writer = csv.writer(stream)
         writer.writerow(["input_vertex", "canonical_face", "weight_0", "weight_1", "weight_2"])
         writer.writerows(correspondence)
+
+    flood_fill_texture_map(input_path=output_texture, mesh_path=output_path, seam_path=canonical_seams_path, output_path=output_texture)
     return output_path
 
 

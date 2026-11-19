@@ -13,6 +13,7 @@
       is done with pymeshlab.
 
 """
+import argparse
 import os
 from pathlib import Path
 import shutil
@@ -326,8 +327,18 @@ def voxelize_mesh(input_path: Path, output_path: Path) -> Path:
     # 3. Rebuild the mesh (this melts away tiny tunnels and bridges)
     fixed_mesh = mm.generalOffsetMesh(mm.MeshPart(mesh), 0.0, params)
 
-    _remove_unconnected(fixed_mesh)
     _remove_zero_area_face(fixed_mesh)
+    _remove_unconnected(fixed_mesh)
+
+    # 1. Clean up deleted faces/vertices and compact indices
+    fixed_mesh.pack()
+
+    params = mm.MeshRelaxParams()
+
+    params.iterations = 3  # Number of smoothing passes
+    params.force = 0.5  # Strength per step (0.0 to 1.0)
+
+    mm.relaxKeepVolume(fixed_mesh, params)
 
     # 5. Save the cleaned manifold mesh
     voxel_path = output_path.with_name(output_path.stem + "_voxel" + output_path.suffix)
@@ -413,3 +424,17 @@ def process_meshes(
             print(f"Failed to process {input_path.name} to {output_path.name}: {exc}")
 
     return processed_files
+
+
+def main() -> None:
+    root = Path("/Users/cindygrimm/PycharmProjects/data/ScannedModels")
+    scan = root / "ProsserEnvyApples"
+    parser = argparse.ArgumentParser(description="Perform one of the operations in this file")
+    parser.add_argument("input", nargs="?", type=Path, default=scan / "BlenderNoStemRebaked/Envy_001_FullRes.obj")
+    parser.add_argument("output", nargs="?", type=Path, default=scan / "Voxelized/Envy_001_FullRes.obj")
+    args = parser.parse_args()
+    voxelize_mesh(args.input, args.output)
+
+
+if __name__ == "__main__":
+    main()
