@@ -759,6 +759,87 @@ def _cross(a, b, c):
     return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
 
 
+def _delaunay_patch(points, triangles, sign, tolerance, scale):
+    """Improve interior edges while keeping the calyx boundary fixed."""
+    triangles = np.asarray(triangles, dtype=int).copy()
+    while True:
+        edges = {}
+        for index, face in enumerate(triangles):
+            for a, b in zip(face, np.roll(face, -1)):
+                edges.setdefault(tuple(sorted((int(a), int(b)))), []).append(index)
+        changed = False
+        for incident in edges.values():
+            if len(incident) != 2:
+                continue
+            first, second = incident
+            face = triangles[first]
+            other = triangles[second]
+            shared = set(face) & set(other)
+            for i in range(3):
+                a, b, c = map(int, (face[i], face[(i + 1) % 3], face[(i + 2) % 3]))
+                if a in shared and b in shared:
+                    break
+            d = next(int(v) for v in other if v not in shared)
+            replacement = np.array([[c, a, d], [c, d, b]])
+            if any(sign * _cross(*points[tri]) <= tolerance for tri in replacement):
+                continue
+            pa, pb, pc = points[[a, b, c]] - points[d]
+            determinant = (np.dot(pa, pa) * (pb[0] * pc[1] - pb[1] * pc[0])
+                           - np.dot(pb, pb) * (pa[0] * pc[1] - pa[1] * pc[0])
+                           + np.dot(pc, pc) * (pa[0] * pb[1] - pa[1] * pb[0]))
+            if sign * determinant <= scale ** 4 * 1e-12:
+                continue
+            triangles[first], triangles[second] = replacement
+            changed = True
+            break
+        if not changed:
+            return triangles
+
+
+def _unfold_patch_uvs(points, uvs, triangles, geometry_sign, tolerance):
+    """Flip interior edges where doing so reduces UV inversions without folding the geometry."""
+    triangles = triangles.copy()
+    uv_sign = np.sign(sum(_cross(*uvs[face]) for face in triangles))
+    if not uv_sign:
+        raise ValueError("The calyx ring has zero UV area.")
+    uv_tolerance = 1e-14
+    while True:
+        areas = np.array([uv_sign * _cross(*uvs[face]) for face in triangles])
+        bad = np.flatnonzero(areas <= uv_tolerance)
+        if not len(bad):
+            return triangles
+        edge_faces = {}
+        for index, face in enumerate(triangles):
+            for a, b in zip(face, np.roll(face, -1)):
+                edge_faces.setdefault(tuple(sorted((int(a), int(b)))), []).append(index)
+        best = None
+        for index in bad:
+            face = triangles[index]
+            for i in range(3):
+                a, b, c = map(int, (face[i], face[(i + 1) % 3], face[(i + 2) % 3]))
+                neighbors = edge_faces[(min(a, b), max(a, b))]
+                if len(neighbors) != 2:
+                    continue
+                other = neighbors[0] if neighbors[1] == index else neighbors[1]
+                d = next(int(v) for v in triangles[other] if v != a and v != b)
+                replacement = np.array([[c, a, d], [c, d, b]])
+                if any(geometry_sign * _cross(*points[tri]) <= tolerance for tri in replacement):
+                    continue
+                new_areas = np.array([uv_sign * _cross(*uvs[tri]) for tri in replacement])
+                old_areas = areas[[index, other]]
+                old_score = (int(np.sum(old_areas <= uv_tolerance)),
+                             float(np.maximum(uv_tolerance - old_areas, 0).sum()))
+                new_score = (int(np.sum(new_areas <= uv_tolerance)),
+                             float(np.maximum(uv_tolerance - new_areas, 0).sum()))
+                improvement = (old_score[0] - new_score[0], old_score[1] - new_score[1])
+                if improvement > (0, 1e-18) and (best is None or improvement > best[0]):
+                    best = (improvement, index, other, replacement)
+        if best is None:
+            raise ValueError("The calyx center and ring UVs produce a degenerate or inverted grid patch.")
+        _, index, other, replacement = best
+        triangles[index], triangles[other] = replacement
+
+
 def _grid_patch(vertices, faces, uv_faces, uvs, ring, inside, center_vertex, center):
     """Triangulate the ring in XZ, inserting a Cartesian grid and the center."""
     boundary = vertices[ring][:, [0, 2]]
@@ -799,34 +880,9 @@ def _grid_patch(vertices, faces, uv_faces, uvs, ring, inside, center_vertex, cen
     spacing = float(np.max(np.abs(boundary - center[[0, 2]]))) / 4
     if spacing <= scale * 1e-8:
         raise ValueError("Calyx ring is too small for a grid.")
-    bucket_size = 2 * spacing
-    bucket_origin = boundary.min(axis=0)
-    buckets = {}
-    triangle_bins = {}
-    active_triangles = {}
-    next_triangle_id = 0
-
-    def add_triangle(triangle):
-        nonlocal next_triangle_id
-        triangle_id = next_triangle_id
-        next_triangle_id += 1
-        active_triangles[triangle_id] = triangle
-        coordinates = np.asarray([points[v] for v in triangle])
-        low = np.floor((coordinates.min(axis=0) - bucket_origin - scale * 1e-9) / bucket_size).astype(int)
-        high = np.floor((coordinates.max(axis=0) - bucket_origin + scale * 1e-9) / bucket_size).astype(int)
-        cells = [(x, z) for x in range(low[0], high[0] + 1) for z in range(low[1], high[1] + 1)]
-        triangle_bins[triangle_id] = cells
-        for cell in cells:
-            buckets.setdefault(cell, set()).add(triangle_id)
-
-    for triangle in triangles:
-        add_triangle(triangle)
-
     def insert(point, required=False):
-        cell = tuple(np.floor((point - bucket_origin) / bucket_size).astype(int))
         matches = []
-        for index in buckets.get(cell, ()):
-            a, b, c = active_triangles[index]
+        for index, (a, b, c) in enumerate(triangles):
             crosses = np.array([sign * _cross(points[a], points[b], point),
                                 sign * _cross(points[b], points[c], point),
                                 sign * _cross(points[c], points[a], point)])
@@ -847,28 +903,26 @@ def _grid_patch(vertices, faces, uv_faces, uvs, ring, inside, center_vertex, cen
                     replacement.append((triangle[edge], triangle[(edge + 1) % 3], new_index))
         if not replacement or (required and len(matches) == 1 and np.min(matches[0][2]) <= tolerance):
             raise ValueError("Calyx center lies on the boundary of the projected ring.")
-        for index, _, _ in matches:
-            del active_triangles[index]
-            for bucket in triangle_bins.pop(index):
-                buckets[bucket].remove(index)
+        for index, _, _ in reversed(matches):
+            triangles.pop(index)
         points.append(point)
-        for triangle in replacement:
-            add_triangle(triangle)
+        triangles.extend(replacement)
 
     insert(center[[0, 2]], required=True)
+    edge_vectors = np.roll(boundary, -1, axis=0) - boundary
+    edge_lengths = np.sum(edge_vectors * edge_vectors, axis=1)
+    if np.any(edge_lengths <= tolerance):
+        raise ValueError("Calyx ring has coincident projected vertices.")
     for x in range(-4, 5):
         for z in range(-4, 5):
             if x or z:
                 point = center[[0, 2]] + spacing * np.array([x, z])
-                edge_vectors = np.roll(boundary, -1, axis=0) - boundary
-                edge_lengths = np.sum(edge_vectors * edge_vectors, axis=1)
-                if np.any(edge_lengths <= tolerance):
-                    raise ValueError("Calyx ring has coincident projected vertices.")
                 t = np.clip(np.sum((point - boundary) * edge_vectors, axis=1) / edge_lengths, 0, 1)
                 distance = np.min(np.linalg.norm(point - boundary - t[:, None] * edge_vectors, axis=1))
                 if distance > 0.2 * spacing:
                     insert(point)
-    triangles = list(active_triangles.values())
+    points = np.asarray(points)
+    triangles = _delaunay_patch(points, triangles, sign, tolerance, scale)
 
     def unique_uv(vertex):
         values = uvs[uv_faces[inside][faces[inside] == vertex]]
@@ -906,15 +960,10 @@ def _grid_patch(vertices, faces, uv_faces, uvs, ring, inside, center_vertex, cen
                                                      shape=(len(rhs), len(rhs))).tocsr(), rhs)))
     else:
         values = fixed
-    points = np.asarray(points)
     patch_vertices = np.column_stack((points[:, 0], values[:, 0], points[:, 1]))
     triangles = np.asarray(triangles, dtype=int)
     patch_uvs = values[:, 1:]
-    uv_triangles = patch_uvs[triangles]
-    uv_a = uv_triangles[:, 1] - uv_triangles[:, 0]
-    uv_b = uv_triangles[:, 2] - uv_triangles[:, 0]
-    uv_areas = uv_a[:, 0] * uv_b[:, 1] - uv_a[:, 1] * uv_b[:, 0]
-    if not (np.all(uv_areas > 1e-14) or np.all(uv_areas < -1raise ValueError("The calyx center and ring UVs produce a degenerate or inverted grid patch.")
+    triangles = _unfold_patch_uvs(points, patch_uvs, triangles, sign, tolerance)
     return patch_vertices, patch_uvs, triangles
 
 

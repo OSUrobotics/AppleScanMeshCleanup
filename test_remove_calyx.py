@@ -178,6 +178,36 @@ class RemoveCalyxTest(unittest.TestCase):
         self.assertAlmostEqual(float(np.sum(cross) / 2), 5.0)
         np.testing.assert_allclose(patch_uvs[6], uvs[6])
 
+    def test_patch_uses_eight_by_eight_cells_with_center(self):
+        xz = np.array([[-4, -4], [4, -4], [4, 4], [-4, 4], [0, 0]], dtype=float)
+        vertices = np.column_stack((xz[:, 0], np.zeros(len(xz)), xz[:, 1]))
+        faces = np.array([[i, (i + 1) % 4, 4] for i in range(4)])
+        uvs = (xz + 4) / 8
+        points, patch_uvs, _ = _grid_patch(
+            vertices, faces, faces, uvs, list(range(4)), np.arange(4), 4, vertices[4]
+        )
+        grid = {tuple(point) for point in points[4:, [0, 2]]}
+        self.assertEqual(grid, {(x, z) for x in range(-3, 4) for z in range(-3, 4)})
+        np.testing.assert_allclose(patch_uvs[4], uvs[4])
+
+    def test_patch_avoids_uv_inversions_with_offset_center(self):
+        count = 16
+        angles = np.arange(count) * 2 * np.pi / count
+        boundary = np.column_stack((np.cos(angles), np.sin(angles)))
+        xz = np.vstack((boundary, [0, 0]))
+        vertices = np.column_stack((xz[:, 0], np.zeros(len(xz)), xz[:, 1]))
+        faces = np.array([[i, (i + 1) % count, count] for i in range(count)])
+        uvs = np.vstack((0.5 + 0.4 * boundary, [0.54, 0.46]))
+        points, patch_uvs, triangles = _grid_patch(
+            vertices, faces, faces, uvs, list(range(count)), np.arange(count), count, vertices[count]
+        )
+        np.testing.assert_allclose(patch_uvs[:count], uvs[:count])
+        np.testing.assert_allclose(patch_uvs[count], uvs[count])
+        for coordinates in (points[:, [0, 2]], patch_uvs):
+            a = coordinates[triangles[:, 1]] - coordinates[triangles[:, 0]]
+            b = coordinates[triangles[:, 2]] - coordinates[triangles[:, 0]]
+            self.assertTrue(np.all(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0] > 0))
+
     def test_missing_input(self):
         with self.assertRaisesRegex(FileNotFoundError, "Input mesh not found"):
             remove_calyx(Path("missing.obj"), Path("out.ply"))

@@ -37,7 +37,8 @@ and UVs, enclosing an interior vertex near the recorded bottom center. Its XZ
 projection must be a simple polygon containing the ring center. The command
 writes `OUTPUT_calyx.obj` with a 256×256 PNG containing the calyx UV area and
 eight pixels of padding, and `OUTPUT.obj` with the original calyx replaced by a
-grid patch. The patch center uses the UV of the original interior vertex nearest
+centered 8×8-cell grid patch, clipped to the ring and joined to its boundary.
+The patch center uses the UV of the original interior vertex nearest
 the recorded bottom center; boundary UVs and the rest of the apple texture are
 preserved. Each OBJ has its own material and texture. Vertex IDs change, so the
 input seam JSON does not describe the outputs.
