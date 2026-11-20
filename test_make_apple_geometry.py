@@ -35,6 +35,67 @@ def _write_canonical_legacy_seams(path, assembly, top, bottom, side, top_radius,
 
 
 class AppleGeometryUVTests(unittest.TestCase):
+    def test_bottom_uv_interpolates_without_inverting_cap_faces(self):
+        for samples in (15, 33, 60):
+            with self.subTest(samples=samples):
+                assembly, _, bottom, _ = geometry._create_apple_body(samples)
+                first, last = geometry._create_apple_bottom(assembly, bottom)
+                outer_radius = math.hypot(*assembly.points[bottom[0]][::2])
+                calyx_radius = math.hypot(*assembly.points[assembly.calyx_ring[0]][::2])
+                center = np.asarray(geometry._BOTTOM_UV_CENTER)
+                for radius, expected in (
+                    (0, 0), (calyx_radius / 2, geometry._UV_CALYX_RADIUS / 2),
+                    (calyx_radius, geometry._UV_CALYX_RADIUS),
+                    ((calyx_radius + outer_radius) / 2,
+                     (geometry._UV_CALYX_RADIUS + geometry._UV_RADIUS) / 2),
+                    (outer_radius, geometry._UV_RADIUS),
+                ):
+                    uv = geometry._bottom_uv((radius, 0, 0), outer_radius, calyx_radius)
+                    self.assertAlmostEqual(np.linalg.norm(uv - center), expected)
+                uvs = np.asarray([
+                    geometry._bottom_uv(point, outer_radius, calyx_radius)
+                    for point in assembly.points
+                ])
+                face_uvs = uvs[np.asarray(assembly.triangles[first:last])]
+                a = face_uvs[:, 1] - face_uvs[:, 0]
+                b = face_uvs[:, 2] - face_uvs[:, 0]
+                signed_areas = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+                self.assertTrue(np.all(signed_areas > 0) or np.all(signed_areas < 0))
+
+    def test_bottom_uv_maps_calyx_ring_and_outer_boundary(self):
+        assembly, top, bottom, side = geometry._create_apple_body(33)
+        top_faces = geometry._create_apple_top(assembly, top, 33)
+        bottom_faces = geometry._create_apple_bottom(assembly, bottom)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "apple.obj"
+            geometry._write_obj_with_uv(assembly, top, bottom, side, top_faces, bottom_faces, path)
+            topology = json.loads(path.with_name("apple_seam_topology.json").read_text())
+            lines, uvs, uv_faces, _ = _read_obj(path)
+
+        vertex_faces = [
+            [int(corner.split("/")[0]) - 1 for corner in line.split()[1:]]
+            for line in lines if line.startswith("f ")
+        ]
+        calyx = topology["seams"]["calyx"]
+        center = np.asarray(geometry._BOTTOM_UV_CENTER)
+        for vertex_id, copies in zip(calyx["vertex_ids"], calyx["uv_coords"]):
+            matching_uvs = [
+                uvs[uv_id] for face, uv_face in zip(vertex_faces, uv_faces)
+                for vertex, uv_id in zip(face, uv_face) if vertex == vertex_id
+            ]
+            self.assertTrue(matching_uvs)
+            for uv in matching_uvs:
+                self.assertAlmostEqual(np.linalg.norm(uv - center), geometry._UV_CALYX_RADIUS, places=8)
+                np.testing.assert_allclose(uv, copies[0], atol=1e-8)
+        boundary_uvs = np.asarray(topology["boundary_paths"][1]["uv_coords"])
+        np.testing.assert_allclose(np.linalg.norm(boundary_uvs - center, axis=1), geometry._UV_RADIUS)
+        bottom_uvs = uvs[uv_faces[bottom_faces[0]:bottom_faces[1]]]
+        self.assertTrue(np.all(np.linalg.norm(bottom_uvs - center, axis=2) <= geometry._UV_RADIUS + 1e-8))
+        a = bottom_uvs[:, 1] - bottom_uvs[:, 0]
+        b = bottom_uvs[:, 2] - bottom_uvs[:, 0]
+        signed_areas = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+        self.assertTrue(np.all(signed_areas > 0) or np.all(signed_areas < 0))
+
     def test_calyx_ring_and_intermediate_rings_follow_body_spacing(self):
         for samples in (15, 33, 60):
             with self.subTest(samples=samples):
@@ -86,8 +147,10 @@ class AppleGeometryUVTests(unittest.TestCase):
         self.assertGreaterEqual(len(calyx["vertex_ids"]), 3)
         self.assertAlmostEqual(calyx["radius"], 0.5 * math.cos(math.radians(85)))
         for vertex_id, coordinates in zip(calyx["vertex_ids"], calyx["uv_coords"]):
-            np.testing.assert_allclose(coordinates[0], geometry._bottom_uv(tuple(vertices[vertex_id]), bottom_radius))
-        u, v = geometry._bottom_uv(tuple(vertices[peaks[0]]), bottom_radius)
+            np.testing.assert_allclose(
+                coordinates[0], geometry._bottom_uv(tuple(vertices[vertex_id]), bottom_radius, calyx["radius"])
+            )
+        u, v = geometry._bottom_uv(tuple(vertices[peaks[0]]), bottom_radius, calyx["radius"])
         self.assertEqual(
             image.getpixel((int(u * image.width), int((1 - v) * image.height))),
             (0, 255, 255),
@@ -395,7 +458,11 @@ class AppleGeometryUVTests(unittest.TestCase):
                 radius = math.hypot(*[assembly.points[vertex][i] for i in (0, 2)])
                 expected = (
                     geometry._circle_uv(assembly.points[vertex], center, radius)
-                    if start == 0 else geometry._bottom_uv(assembly.points[vertex], radius)
+                    if start == 0 else geometry._bottom_uv(
+                        assembly.points[vertex], radius,
+                        math.hypot(assembly.points[assembly.calyx_ring[0]][0],
+                                   assembly.points[assembly.calyx_ring[0]][2]),
+                    )
                 )
                 np.testing.assert_allclose(
                     actual, expected, atol=1e-8

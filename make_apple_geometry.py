@@ -30,6 +30,7 @@ _TEXTURE_SIZE = 1024
 _TOP_UV_CENTER = (0.9, 0.1)
 _BOTTOM_UV_CENTER = (0.1, 0.9)
 _UV_RADIUS = 0.1
+_UV_CALYX_RADIUS = 0.05
 _CENTER_DOT_RADIUS = 0.012
 _AXIS_LINE_HALF_WIDTH = 0.004
 _SEAM_LINE_HALF_WIDTH = 0.004
@@ -201,8 +202,9 @@ def _create_apple_bottom(
     grid_radius = radius - target_edge_length / 2
     if grid_radius <= 0:
         raise ValueError("The bottom boundary is too small for the requested grid spacing.")
-    grid_spacing = min(target_edge_length, grid_radius * 0.8)
-    for _ in range(8):
+    n_grid_points = max(3, math.ceil(grid_radius / target_edge_length))
+    grid_spacing = grid_radius / n_grid_points
+    for _ in range(n_grid_points):
         grid_extent = math.ceil(grid_radius / grid_spacing)
         grid_axis = np.arange(-grid_extent, grid_extent + 1) * grid_spacing
         grid_points = []
@@ -308,10 +310,18 @@ def _middle_uv(
 
 
 def _bottom_uv(
-    point: tuple[float, float, float], ring_radius: float,
+    point: tuple[float, float, float], ring_radius: float, calyx_radius: float,
 ) -> tuple[float, float]:
-    u, v = _circle_uv(point, _BOTTOM_UV_CENTER, ring_radius)
-    return u, 2 * _BOTTOM_UV_CENTER[1] - v
+    """Map the calyx and surrounding annulus to their respective UV radii."""
+    radius = math.hypot(point[0], point[2])
+    if radius <= calyx_radius:
+        scale = _UV_CALYX_RADIUS / calyx_radius
+    else:
+        uv_radius = _UV_CALYX_RADIUS + (radius - calyx_radius) * (
+            _UV_RADIUS - _UV_CALYX_RADIUS
+        ) / (ring_radius - calyx_radius)
+        scale = uv_radius / radius
+    return _BOTTOM_UV_CENTER[0] + point[0] * scale, _BOTTOM_UV_CENTER[1] + point[2] * scale
 
 
 def _longitude(point: tuple[float, float, float]) -> float:
@@ -374,7 +384,9 @@ def _write_texture_map(
             if (u - _TOP_UV_CENTER[0]) ** 2 + (v - _TOP_UV_CENTER[1]) ** 2 <= _UV_RADIUS**2:
                 color = (0, 255, 0)
             if (u - _BOTTOM_UV_CENTER[0]) ** 2 + (v - _BOTTOM_UV_CENTER[1]) ** 2 <= _UV_RADIUS**2:
-                color = (0, 0, 128)
+                color = (100, 50, 228)
+                if (u - _BOTTOM_UV_CENTER[0]) ** 2 + (v - _BOTTOM_UV_CENTER[1]) ** 2 <= _UV_CALYX_RADIUS**2:
+                    color = (50, 100, 228)
             for center in (_TOP_UV_CENTER, _BOTTOM_UV_CENTER):
                 du, dv = u - center[0], v - center[1]
                 if du * du + dv * dv <= _CENTER_DOT_RADIUS**2:
@@ -421,11 +433,9 @@ def _seam_boundary_records(
         radius: float,
     ):
         closed_ring = [ring[0], *reversed(ring[1:]), ring[0]]
-        uvs = [
-            _bottom_uv(ms.points[vertex], radius)
-            if center == _BOTTOM_UV_CENTER else _circle_uv(ms.points[vertex], center, radius)
-            for vertex in closed_ring
-        ]
+        uvs = [_circle_uv(ms.points[vertex], center, radius) for vertex in closed_ring]
+        if center == _BOTTOM_UV_CENTER:
+            uvs = [(u, 2 * center[1] - v) for u, v in uvs]
         return closed_ring, uvs
 
     top_side = [top_ring[0], *reversed(top_ring[1:]), top_ring[0]]
@@ -468,6 +478,12 @@ def _write_obj_with_uv(
         ms.points[bottom_ring[0]][0],
         ms.points[bottom_ring[0]][2],
     )
+    if not ms.calyx_ring:
+        raise ValueError("The bottom cap must have a calyx ring.")
+    calyx_point = ms.points[ms.calyx_ring[0]]
+    calyx_radius = math.hypot(calyx_point[0], calyx_point[2])
+    if not 0 < calyx_radius < bottom_radius or not 0 < _UV_CALYX_RADIUS < _UV_RADIUS:
+        raise ValueError("The calyx radii must be positive and smaller than their bottom boundary radii.")
     bottom_y = ms.points[bottom_ring[0]][1]
     top_y = ms.points[top_ring[0]][1]
     material_path = output_path.with_suffix(".mtl")
@@ -475,7 +491,7 @@ def _write_obj_with_uv(
     seam_path = output_path.with_name(f"{output_path.stem}_seam_topology.json")
     lowest_y = min(point[1] for point in ms.points)
     peak_uvs = tuple(
-        _bottom_uv(point, bottom_radius)
+        _bottom_uv(point, bottom_radius, calyx_radius)
         for point in ms.points
         if point[1] <= lowest_y + 1e-6
     )
@@ -505,12 +521,11 @@ def _write_obj_with_uv(
             name, ids, [ms.points[vertex] for vertex in ids],
             [uv_copies[vertex] for vertex in ids], center, radius,
         ))
-    if ms.calyx_ring:
-        topology.add_seam("calyx", SeamInfo(
-            "calyx", ms.calyx_ring, [ms.points[vertex] for vertex in ms.calyx_ring],
-            [[_bottom_uv(ms.points[vertex], bottom_radius)] for vertex in ms.calyx_ring],
-            bottom_point, math.hypot(*[ms.points[ms.calyx_ring[0]][i] for i in (0, 2)]),
-        ))
+    topology.add_seam("calyx", SeamInfo(
+        "calyx", ms.calyx_ring, [ms.points[vertex] for vertex in ms.calyx_ring],
+        [[_bottom_uv(ms.points[vertex], bottom_radius, calyx_radius)] for vertex in ms.calyx_ring],
+        bottom_point, calyx_radius,
+    ))
     with seam_path.open("w", encoding="utf-8") as seam_file:
         json.dump(topology.to_dict(), seam_file)
 
@@ -535,7 +550,7 @@ def _write_obj_with_uv(
                 if is_top:
                     uv = _circle_uv(point, _TOP_UV_CENTER, top_radius)
                 elif is_bottom:
-                    uv = _bottom_uv(point, bottom_radius)
+                    uv = _bottom_uv(point, bottom_radius, calyx_radius)
                 else:
                     uv = _middle_uv(point, longitudes[corner], bottom_y, top_y)
                 face_uvs.append(uv)

@@ -43,7 +43,9 @@ the companion topology JSON, or matching `Parameterized` seam data (with legacy
 endpoints. The canonical topology JSON is in the same folder as the canonical OBJ;
 legacy canonical seam CSV files are also accepted.
 The canonical body ends at -70° latitude; its bottom cap has rings down to a
-calyx boundary at -85°, with spacing based on the body boundary edges.
+calyx boundary at -85°, with spacing based on the body boundary edges. In the
+bottom UV chart, the calyx ring maps to `_UV_CALYX_RADIUS` and the outer boundary
+remains at `_UV_RADIUS`.
 Run normalization before alignment; rebaked UV charts are not necessarily
 normalized. The batch command uses `--operation align_meshes` and selects
 `Canonical/apple_fullres.obj` by default (or `--canonical hires`, etc.).
