@@ -42,14 +42,14 @@ def _write_blank_texture(n_vs: int, seam_vs: list[list[list[int]]], uvs: np.ndar
     image_data = np.full((image_size, image_size, 3), 255, dtype=np.uint8)
     # Color all the pixels that belong to vertices grey
     pixels = np.clip(uvs * image_size, 0, image_size - 1).astype(np.uint)
-    image_data[pixels[:, 1], pixels[:, 0]] = (128, 128, 128)
+    image_data[image_size - 1 - pixels[:, 1], pixels[:, 0]] = (128, 128, 128)
 
     def color_pixels(uv_locs: np.ndarray, color: tuple[int, int, int]) -> None:
         pixels = np.clip(uv_locs * image_size, 0, image_size - 1).astype(np.uint)
         if pixels.ndim == 1:
-            image_data[pixels[1], pixels[0]] = color
+            image_data[image_size - 1 - pixels[1], pixels[0]] = color
         else:
-            image_data[pixels[:, 1], pixels[:, 0]] = color
+            image_data[image_size - 1 - pixels[:, 1], pixels[:, 0]] = color
 
     def color_seam(seam_vertices: list[list[int]], uvs: np.ndarray, color: tuple[int, int, int]) -> None:
         seam_vs_side1 = []
@@ -130,7 +130,7 @@ def _export_obj_with_uv(
         raise ValueError("Face indices are outside the output vertex/UV arrays.")
 
     material_path = output_path.with_suffix(".mtl")
-    texture_path = output_path.with_suffix(".png")
+    texture_path = output_path.with_suffix(".jpg")
     _write_blank_texture(n_vs=len(mesh.vertices), seam_vs=seam_vs, uvs=uvs, texture_path=texture_path)
     _write_material_file(material_path, texture_path.name)
 
@@ -867,58 +867,20 @@ def _write_seam_mesh(
     seam_mesh.export(str(seam_output_path), file_type="ply")
 
 
-def _write_seams_as_txt_file(seams: list[list[int]], seams_uv: list[list[list[int]]], uvs: np.ndarray,
-                             centers: list[np.ndarray], output_path: Path):
-    """ Write out the seam locations. For each seam write
-       - the vertex coordinates in the mesh of the seam
-       - the uv coordinates of the seam on the top/bottom
-       - the uv coordinates of the seam on the side for the top/bottom seam
-       - the uv coordinates of the two parts of the side seam
-       - the top and bottom center coordinates, one point per row"""
-    seam_output_path = output_path.with_name(f"{output_path.stem}_seam.csv")
-
-    with open(str(seam_output_path), 'w') as fp:
-        # Write the top and bottom seam vertices and their UV coordinates
-        # These are circles
-        for seam_indx in range(0, 2):
-            v_str = ""
-            for v in seams[seam_indx]:
-                v_str += f"{v}, "
-            fp.write(v_str + "\n")
-
-            # u then v
-            for indx in [0, 1]:
-                v_str = ""
-                for vindx in seams_uv[seam_indx]:
-                    uv = uvs[vindx[-1]]
-                    v_str += f"{uv[indx]}, "
-                fp.write(v_str + "\n")
-
-        # Now write the four sides of the middle mesh seams
-        for seam_index, indx_offset, b_reverse in [(0, 0, False), (2, 0, False), (1, 0, True), (2, 1, True)]:
-            v_str = ""
-            if b_reverse:
-                seam_list = list(reversed(seams[seam_index]))
-            else:
-                seam_list = seams[seam_index]
-            for v in seam_list:
-                v_str += f"{v}, "
-            fp.write(v_str + "\n")
-
-            # u then v
-            for indx in [0, 1]:
-                v_str = ""
-                if b_reverse:
-                    seams_uv_list = list(reversed(seams_uv[seam_index]))
-                else:
-                    seams_uv_list = seams_uv[seam_index]
-                for vindx in seams_uv_list:
-                    uv = uvs[vindx[indx_offset]]
-                    v_str += f"{uv[indx]}, "
-                fp.write(v_str + "\n")
-
-        for center in centers:
-            fp.write(", ".join(str(coordinate) for coordinate in center) + "\n")
+def _store_boundary_paths(seam_topology: SeamTopology, seams: list[list[int]],
+                          seams_uv: list[list[list[int]]], uvs: np.ndarray) -> None:
+    records = []
+    for seam_index, uv_index, reverse in (
+        (0, -1, False), (1, -1, False), (0, 0, False),
+        (2, 0, False), (1, 0, True), (2, 1, True),
+    ):
+        ids = seams[seam_index]
+        mapped = seams_uv[seam_index]
+        if reverse:
+            ids = list(reversed(ids))
+            mapped = list(reversed(mapped))
+        records.append((ids, [uvs[indices[uv_index]] for indices in mapped]))
+    seam_topology.set_boundary_paths(records)
     
 def _update_seam_topology(
     seam_topology: SeamTopology,
@@ -1050,12 +1012,8 @@ def uv_texture(input_path: Path, output_path: Path, seam_topology: SeamTopology)
         seam_topology, mesh, [top_seam_vs[:-1], bottom_seam_vs[:-1], side_seam_vs],
         centers, (top_radius, bottom_radius), map_vs_back, uvs,
     )
+    _store_boundary_paths(seam_topology, seam_vs, seam_vs_mapped, uvs)
     _export_obj_with_uv(mesh=mesh, seam_vs=seam_vs_mapped, vmapping=vmapping, face_indices=indices, uvs=uvs, output_path=output_path)    
-    _write_seams_as_txt_file(seams=seam_vs, 
-                             seams_uv=seam_vs_mapped,
-                             uvs=uvs,
-                             centers=centers,
-                             output_path=output_path)
     print(f"✓ Asset exported with manual UV seams to: {output_path}")
 
 
@@ -1073,6 +1031,9 @@ def main():
     with topology_path.open(encoding="utf-8") as handle:
         seam_topology = SeamTopology.from_dict(json.load(handle))
     uv_texture(input_path, output_path, seam_topology)
+    output_topology = output_path.with_name(output_path.stem + "_seam_topology.json")
+    with output_topology.open("w", encoding="utf-8") as handle:
+        json.dump(seam_topology.to_dict(), handle)
 
 
 if __name__ == "__main__":

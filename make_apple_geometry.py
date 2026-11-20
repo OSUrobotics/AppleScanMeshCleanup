@@ -5,13 +5,14 @@ Creates the canonical apple mesh, the corresponding texture map with the tops an
 
 The mesh is a spherical lat-long parameterized mesh with longitude density adjusted to keep the
 triangles roughly equilateral. The Y axis runs from the bottom (-Y) to the top (+Y).
-The top and bottom caps use lat-long grids that meet at their respective poles.
+The top cap uses latitude rings; the bottom has latitude rings down to a
+calyx boundary at -85 degrees and a Cartesian grid inside that boundary.
 
 
 """
 
 import argparse
-import csv
+import json
 import math
 import struct
 import sys
@@ -20,6 +21,7 @@ from pathlib import Path
 import zlib
 from meshlib import mrmeshpy as mm
 from filename_fixing import _write_material_file
+from seam_topology import SeamInfo, SeamTopology
 import numpy as np
 from scipy.spatial import Delaunay
 
@@ -39,6 +41,7 @@ _VERTEX_DOT_RADIUS = 0.003
 class _MeshAssembly:
     points: list[tuple[float, float, float]] = field(default_factory=list)
     triangles: list[tuple[int, int, int]] = field(default_factory=list)
+    calyx_ring: list[int] = field(default_factory=list)
 
 
 def _longitude_count(latitude: float, latitude_step: float) -> int:
@@ -159,7 +162,7 @@ def _create_apple_bottom(
     ms: _MeshAssembly,
     bottom_ring: list[int],
 ) -> tuple[int, int]:
-    """Fill the bottom cap with a Cartesian grid projected onto the apple surface."""
+    """Connect the body to the calyx ring, then fill it with a projected grid."""
     first_face = len(ms.triangles)
     boundary_edge_lengths = [
         math.dist(
@@ -168,38 +171,33 @@ def _create_apple_bottom(
         )
         for index, vertex in enumerate(bottom_ring)
     ]
-    target_edge_length = sum(boundary_edge_lengths) / (2 * len(boundary_edge_lengths))
+    target_edge_length = sum(boundary_edge_lengths) / len(boundary_edge_lengths)
     bottom_latitude = math.degrees(
         math.atan2(
             ms.points[bottom_ring[0]][1],
             math.hypot(ms.points[bottom_ring[0]][0], ms.points[bottom_ring[0]][2]),
         )
     )
-    pole_distance = math.dist(
-        (0.5 * math.cos(math.radians(bottom_latitude)),
-         0.5 * math.sin(math.radians(bottom_latitude))),
-        (0.0, -0.5),
-    )
-    target_edge_length = min(target_edge_length, 2 * pole_distance / 3)
-    ring_latitude = bottom_latitude - math.degrees(
-        2 * math.asin(min(1.0, target_edge_length))
-    )
-    ring_count = max(
-        3,
-        round(
-            len(bottom_ring)
-            * math.cos(math.radians(ring_latitude))
-            / math.cos(math.radians(bottom_latitude))
-        ),
-    )
-    transition_ring = _add_ring(ms, ring_latitude, ring_count)
-    _connect_rings(ms, transition_ring, bottom_ring)
+    calyx_latitude = -85.0
+    intervals = max(1, math.ceil(
+        0.5 * math.radians(bottom_latitude - calyx_latitude) / target_edge_length
+    ))
+    previous_ring = bottom_ring
+    for index in range(1, intervals + 1):
+        latitude = bottom_latitude + (calyx_latitude - bottom_latitude) * index / intervals
+        circumference = math.pi * math.cos(math.radians(latitude))
+        ring_count = max(3, round(circumference / target_edge_length))
+        ring = _add_ring(ms, latitude, ring_count)
+        _connect_rings(ms, ring, previous_ring)
+        previous_ring = ring
+    ms.calyx_ring = previous_ring
 
     boundary = np.asarray(
-        [(ms.points[vertex][0], ms.points[vertex][2]) for vertex in transition_ring],
+        [(ms.points[vertex][0], ms.points[vertex][2]) for vertex in ms.calyx_ring],
         dtype=np.float64,
     )
     radius = max(np.linalg.norm(boundary, axis=1))
+    target_edge_length = min(target_edge_length, radius)
     grid_radius = radius - target_edge_length / 2
     if grid_radius <= 0:
         raise ValueError("The bottom boundary is too small for the requested grid spacing.")
@@ -208,21 +206,22 @@ def _create_apple_bottom(
         grid_extent = math.ceil(grid_radius / grid_spacing)
         grid_axis = np.arange(-grid_extent, grid_extent + 1) * grid_spacing
         grid_points = []
-        for x in grid_axis:
-            for z in grid_axis:
-                if x * x + z * z >= grid_radius * grid_radius:
-                    continue
-                crosses = [
-                    (boundary[(index + 1) % len(boundary), 0] - boundary[index, 0])
-                    * (z - boundary[index, 1])
-                    - (boundary[(index + 1) % len(boundary), 1] - boundary[index, 1])
-                    * (x - boundary[index, 0])
-                    for index in range(len(boundary))
-                ]
-                if all(value >= -1e-12 for value in crosses) or all(
-                    value <= 1e-12 for value in crosses
-                ):
-                    grid_points.append((x, z))
+        if target_edge_length < 0.7 * radius:
+            for x in grid_axis:
+                for z in grid_axis:
+                    if x * x + z * z >= grid_radius * grid_radius:
+                        continue
+                    crosses = [
+                        (boundary[(index + 1) % len(boundary), 0] - boundary[index, 0])
+                        * (z - boundary[index, 1])
+                        - (boundary[(index + 1) % len(boundary), 1] - boundary[index, 1])
+                        * (x - boundary[index, 0])
+                        for index in range(len(boundary))
+                    ]
+                    if all(value >= -1e-12 for value in crosses) or all(
+                        value <= 1e-12 for value in crosses
+                    ):
+                        grid_points.append((x, z))
         grid_points.append((0.0, 0.0))
         unique_points = np.unique(np.vstack((boundary, grid_points)), axis=0)
         simplices = Delaunay(unique_points).simplices
@@ -245,7 +244,8 @@ def _create_apple_bottom(
             axis=1,
         )
         measured_length = float(edge_lengths.mean())
-        if abs(measured_length - target_edge_length) <= target_edge_length * 0.03:
+        if (target_edge_length >= 0.7 * radius
+                or abs(measured_length - target_edge_length) <= target_edge_length * 0.03):
             break
         grid_spacing = min(
             grid_spacing * target_edge_length / measured_length,
@@ -257,7 +257,7 @@ def _create_apple_bottom(
     )
     boundary_vertex_by_point = {
         int(point_index): int(vertex)
-        for point_index, vertex in zip(boundary_indices, transition_ring)
+        for point_index, vertex in zip(boundary_indices, ms.calyx_ring)
     }
     point_indices = []
     for point_index, point in enumerate(unique_points):
@@ -407,34 +407,26 @@ def _write_texture_map(
     )
 
 
-def _write_seam_csv(
-    csv_path: Path,
+def _seam_boundary_records(
     ms: _MeshAssembly,
     top_ring: list[int],
     bottom_ring: list[int],
     side_seam: list[int],
     top_radius: float,
     bottom_radius: float,
-) -> None:
-    """Write vertex, U and V rows for both rings and the four body-chart sides."""
-    def write_rows(writer, vertices, uvs):
-        writer.writerow(vertices)
-        writer.writerow([uv[0] for uv in uvs])
-        writer.writerow([uv[1] for uv in uvs])
-
-    def write_ring_rows(
-        writer,
+) -> list[tuple[list[int], list[tuple[float, float]]]]:
+    def ring_record(
         ring: list[int],
         center: tuple[float, float],
         radius: float,
-    ) -> None:
+    ):
         closed_ring = [ring[0], *reversed(ring[1:]), ring[0]]
         uvs = [
             _bottom_uv(ms.points[vertex], radius)
             if center == _BOTTOM_UV_CENTER else _circle_uv(ms.points[vertex], center, radius)
             for vertex in closed_ring
         ]
-        write_rows(writer, closed_ring, uvs)
+        return closed_ring, uvs
 
     top_side = [top_ring[0], *reversed(top_ring[1:]), top_ring[0]]
     right_side = list(reversed(side_seam))
@@ -449,18 +441,17 @@ def _write_seam_csv(
         [*[_longitude(ms.points[vertex]) for vertex in bottom_ring], 1.0],
         [1.0] * len(left_side),
     ]
-    with csv_path.open("w", encoding="utf-8", newline="") as seam_file:
-        writer = csv.writer(seam_file)
-        write_ring_rows(writer, top_ring, _TOP_UV_CENTER, top_radius)
-        write_ring_rows(writer, bottom_ring, _BOTTOM_UV_CENTER, bottom_radius)
-        for side, longitudes in zip(
-            (top_side, right_side, bottom_side, left_side), side_longitudes
-        ):
-            uvs = [
-                _middle_uv(ms.points[vertex], angle, bottom_y, top_y)
-                for vertex, angle in zip(side, longitudes)
-            ]
-            write_rows(writer, side, uvs)
+    records = [
+        ring_record(top_ring, _TOP_UV_CENTER, top_radius),
+        ring_record(bottom_ring, _BOTTOM_UV_CENTER, bottom_radius),
+    ]
+    for side, longitudes in zip((top_side, right_side, bottom_side, left_side), side_longitudes):
+        uvs = [
+            _middle_uv(ms.points[vertex], angle, bottom_y, top_y)
+            for vertex, angle in zip(side, longitudes)
+        ]
+        records.append((side, uvs))
+    return records
 
 
 def _write_obj_with_uv(
@@ -481,7 +472,7 @@ def _write_obj_with_uv(
     top_y = ms.points[top_ring[0]][1]
     material_path = output_path.with_suffix(".mtl")
     texture_path = output_path.with_suffix(".png")
-    seam_path = output_path.with_name(f"{output_path.stem}_seam.csv")
+    seam_path = output_path.with_name(f"{output_path.stem}_seam_topology.json")
     lowest_y = min(point[1] for point in ms.points)
     peak_uvs = tuple(
         _bottom_uv(point, bottom_radius)
@@ -491,15 +482,37 @@ def _write_obj_with_uv(
     seam_vertices = set(top_ring) | set(bottom_ring) | set(side_seam)
     vertex_uvs: dict[int, tuple[float, float]] = {}
     _write_material_file(material_path, texture_path.name)
-    _write_seam_csv(
-        seam_path,
-        ms,
-        top_ring,
-        bottom_ring,
-        side_seam,
-        top_radius,
-        bottom_radius,
+    records = _seam_boundary_records(ms, top_ring, bottom_ring, side_seam, top_radius, bottom_radius)
+    top_point = max(ms.points, key=lambda point: point[1])
+    bottom_point = min(ms.points, key=lambda point: point[1])
+    topology = SeamTopology(
+        ymin=bottom_point[1], ymax=top_point[1], top_point=top_point, bottom_point=bottom_point,
+        top_shoulder_radius=top_radius, bottom_shoulder_radius=bottom_radius,
     )
+    topology.set_boundary_paths(records)
+    uv_copies = {}
+    for ids, uvs in records:
+        for vertex, uv in zip(ids, uvs):
+            copies = uv_copies.setdefault(vertex, [])
+            if uv not in copies:
+                copies.append(uv)
+    for name, ids, center, radius in (
+        ("top", top_ring, top_point, top_radius),
+        ("bottom", bottom_ring, bottom_point, bottom_radius),
+        ("side", side_seam, None, None),
+    ):
+        topology.add_seam(name, SeamInfo(
+            name, ids, [ms.points[vertex] for vertex in ids],
+            [uv_copies[vertex] for vertex in ids], center, radius,
+        ))
+    if ms.calyx_ring:
+        topology.add_seam("calyx", SeamInfo(
+            "calyx", ms.calyx_ring, [ms.points[vertex] for vertex in ms.calyx_ring],
+            [[_bottom_uv(ms.points[vertex], bottom_radius)] for vertex in ms.calyx_ring],
+            bottom_point, math.hypot(*[ms.points[ms.calyx_ring[0]][i] for i in (0, 2)]),
+        ))
+    with seam_path.open("w", encoding="utf-8") as seam_file:
+        json.dump(topology.to_dict(), seam_file)
 
     with output_path.open("w", encoding="utf-8", newline="\n") as obj_file:
         obj_file.write(f"mtllib {material_path.name}\n")

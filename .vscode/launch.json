@@ -180,9 +180,9 @@
                 "--root-dir",
                 "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
                 "--input-path",
-                "Voxelized/Envy_003_FullRes_voxel.obj",
+                "Voxelized/Envy_019_FullRes.obj",
                 "--output-path",
-                "CalyxRemoved/Envy_003_NoCalyx.obj"
+                "CalyxRemoved/Envy_019_NoCalyx.obj"
             ]
         },
     ]

@@ -1,4 +1,4 @@
-import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,14 +6,32 @@ from unittest.mock import patch
 
 import numpy as np
 import trimesh
+import uv_texture as uv_module
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 from seam_topology import SeamInfo, SeamTopology
-from uv_texture import _define_seam, _load_mesh, _orient_mesh, _update_seam_topology, _write_seam_mesh, _write_seams_as_txt_file, uv_texture
+from uv_texture import _define_seam, _load_mesh, _orient_mesh, _store_boundary_paths, _update_seam_topology, _write_seam_mesh, uv_texture
 
 
 class UVSeamExportTests(unittest.TestCase):
+    def test_standalone_saves_updated_topology(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            input_path = Path(temporary) / "apple.obj"
+            output_path = Path(temporary) / "apple_uv.obj"
+            topology = SeamTopology(-1, 1, (0, 1, 0), (0, -1, 0))
+            input_path.with_name("apple_seam_topology.json").write_text(json.dumps(topology.to_dict()))
+
+            def update(input_path, output_path, seam_topology):
+                seam_topology.top_shoulder_radius = 2.0
+
+            with (patch("uv_texture.Path", side_effect=[input_path, output_path]),
+                  patch("uv_texture.uv_texture", side_effect=update)):
+                uv_module.main()
+            result = json.loads(output_path.with_name("apple_uv_seam_topology.json").read_text())
+            self.assertEqual(result["top_shoulder_radius"], 2.0)
+            self.assertFalse(output_path.with_name("apple_uv_seam.csv").exists())
+
     def test_texture_real_mesh_preserves_and_updates_ring_vertices(self):
         mesh = mm.makeUVSphere(50.0, 32, 32)
         vertices = mn.getNumpyVerts(mesh)
@@ -182,34 +200,18 @@ class UVSeamExportTests(unittest.TestCase):
                 _write_seam_mesh(mesh, [], [np.array([0, 0, np.nan]), np.zeros(3)], output_path)
             self.assertFalse(output_path.with_name("apple_seam.ply").exists())
 
-    def test_writes_centers_after_seam_rows(self):
+    def test_stores_ordered_uv_boundary_paths(self):
         seams = [[0], [1], [2]]
         seams_uv = [[[0, 1]], [[2, 3]], [[4, 5]]]
         uvs = np.array([
             [0.1, 0.2], [0.3, 0.4], [0.5, 0.6],
             [0.7, 0.8], [0.9, 1.0], [0.2, 0.3],
         ])
-        centers = [np.array([1.25, 2.5, -3.0]), np.array([-4.0, 5.5, 6.0])]
-
-        with tempfile.TemporaryDirectory() as temporary:
-            output_path = Path(temporary) / "apple.obj"
-            _write_seams_as_txt_file(seams, seams_uv, uvs, centers, output_path)
-            with (Path(temporary) / "apple_seam.csv").open(newline="") as file:
-                rows = list(csv.reader(file, skipinitialspace=True))
-
-        self.assertEqual(len(rows), 20)
-        self.assertEqual(rows[0], ["0", ""])
-        self.assertEqual(rows[1], ["0.3", ""])
-        self.assertEqual(rows[2], ["0.4", ""])
-        self.assertEqual(rows[3:18], [
-            ["1", ""], ["0.7", ""], ["0.8", ""],
-            ["0", ""], ["0.1", ""], ["0.2", ""],
-            ["2", ""], ["0.9", ""], ["1.0", ""],
-            ["1", ""], ["0.5", ""], ["0.6", ""],
-            ["2", ""], ["0.2", ""], ["0.3", ""],
-        ])
-        self.assertEqual([float(value) for value in rows[-2]], centers[0].tolist())
-        self.assertEqual([float(value) for value in rows[-1]], centers[1].tolist())
+        topology = SeamTopology(-1, 1, (1.25, 2.5, -3.0), (-4.0, 5.5, 6.0))
+        _store_boundary_paths(topology, seams, seams_uv, uvs)
+        self.assertEqual([path["vertex_ids"] for path in topology.boundary_paths], [[0], [1], [0], [2], [1], [2]])
+        self.assertEqual([path["uv_coords"][0] for path in topology.boundary_paths],
+                         [[0.3, 0.4], [0.7, 0.8], [0.1, 0.2], [0.9, 1.0], [0.5, 0.6], [0.2, 0.3]])
 
 
 if __name__ == "__main__":

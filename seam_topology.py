@@ -3,6 +3,8 @@ Store information about the following:
 Top and bottom vertex locations
 Top and bottom closest vertex ids (id for stem and calyx patching)"""
 
+import math
+
 class SeamInfo:
     """ Stores the vertex ids, their 3D locations, and their uv coordinates for one seam. Also includes the seam name (one of top, bottom, side, calyx, stem)
     Keeps the center used to create the seam (for the top, bottom, calyx, and stem) as well as the radius of the seam ring.
@@ -66,15 +68,17 @@ class SeamTopology:
     Supports reading and writing to a .json file.
     Supports adding a seam with a name and SeamInfo object.
     """
-    def __init__(self, ymin: float, ymax: float, top_point: tuple, bottom_point: tuple, seams: dict = {},
-                 top_shoulder_radius: float | None = None, bottom_shoulder_radius: float | None = None):
+    def __init__(self, ymin: float, ymax: float, top_point: tuple, bottom_point: tuple, seams: dict | None = None,
+                 top_shoulder_radius: float | None = None, bottom_shoulder_radius: float | None = None,
+                 boundary_paths: list[dict] | None = None):
         self.ymin = ymin
         self.ymax = ymax
         self.top_point = top_point
         self.bottom_point = bottom_point
-        self.seams = seams  # Dictionary with seam names as keys and SeamInfo objects as values
+        self.seams = {} if seams is None else seams
         self.top_shoulder_radius = top_shoulder_radius
         self.bottom_shoulder_radius = bottom_shoulder_radius
+        self.boundary_paths = [] if boundary_paths is None else boundary_paths
 
     def to_dict(self) -> dict:
         return {
@@ -85,6 +89,7 @@ class SeamTopology:
             "top_shoulder_radius": self.top_shoulder_radius,
             "bottom_shoulder_radius": self.bottom_shoulder_radius,
             "seams": {name: seam.to_dict() for name, seam in self.seams.items()},
+            "boundary_paths": self.boundary_paths,
         }
 
     @classmethod
@@ -98,7 +103,23 @@ class SeamTopology:
             seams=seams,
             top_shoulder_radius=data.get("top_shoulder_radius"),
             bottom_shoulder_radius=data.get("bottom_shoulder_radius"),
+            boundary_paths=data.get("boundary_paths"),
         )
+
+    def set_boundary_paths(self, records) -> None:
+        """Store top and bottom cap paths followed by the four body-chart paths."""
+        paths = []
+        for vertex_ids, coordinates in records:
+            ids = [int(vertex_id) for vertex_id in vertex_ids]
+            uvs = [[float(value) for value in uv] for uv in coordinates]
+            if not ids or len(ids) != len(uvs) or min(ids) < 0:
+                raise ValueError("Seam boundary paths require matching, non-negative vertex IDs and UVs.")
+            if any(len(uv) != 2 or not all(math.isfinite(value) for value in uv) for uv in uvs):
+                raise ValueError("Seam boundary paths require finite 2D UV coordinates.")
+            paths.append({"vertex_ids": ids, "uv_coords": uvs})
+        if len(paths) != 6:
+            raise ValueError("Expected six ordered seam boundary paths.")
+        self.boundary_paths = paths
 
     def add_seam(self, name: str, seam_info: SeamInfo) -> None:
         """Add a seam with the given name and SeamInfo object."""
@@ -108,3 +129,5 @@ class SeamTopology:
         """Renumber the vertex ids for all seams based on a provided mapping from old to new ids."""
         for seam in self.seams.values():
             seam.renumber_vertices(vertex_map)
+        for path in self.boundary_paths:
+            path["vertex_ids"] = [vertex_map.get(vid, vid) for vid in path["vertex_ids"]]

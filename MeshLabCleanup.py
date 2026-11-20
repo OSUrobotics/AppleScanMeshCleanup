@@ -203,9 +203,22 @@ def downsample_mesh(
     padded_texture = input_path.with_name(input_path.stem + "_padded" + source_texture.suffix)
     if padded_texture.resolve() in {input_path.resolve(), source_material.resolve(), source_texture.resolve()}:
         raise ValueError("The padded texture must not overwrite an input file.")
-    normalized_seam = input_path.with_name(input_path.stem + "_seam.csv")
-    seam_path = (normalized_seam if normalized_seam.is_file()
-                 else _find_seam_file(input_path, input_path.parent.parent / "Voxelized"))
+    normalized_seam = input_path.with_name(input_path.stem + "_seam_topology.json")
+    legacy_seam = input_path.with_name(input_path.stem + "_seam.csv")
+    seam_dir = input_path.parent.parent / "Parameterized"
+    if not seam_dir.is_dir():
+        seam_dir = input_path.parent.parent / "Voxelized"
+    if normalized_seam.is_file():
+        seam_path = normalized_seam
+    elif legacy_seam.is_file():
+        seam_path = legacy_seam
+    else:
+        try:
+            seam_path = _find_seam_file(input_path, seam_dir, legacy_only=seam_dir.name == "Voxelized")
+        except FileNotFoundError:
+            if seam_dir.name != "Parameterized":
+                raise
+            seam_path = _find_seam_file(input_path, input_path.parent.parent / "Voxelized", legacy_only=True)
     flood_fill_texture_map(source_texture, input_path, seam_path, padded_texture)
 
     for mlx_script_path in mlx_script_paths:
@@ -376,15 +389,17 @@ def parameterize_mesh(input_path: Path, output_path: Path) -> Path:
     with open(seam_topology_path, "r") as handle:
         seam_topology = SeamTopology.from_dict(json.load(handle))
 
+    mesh=mm.loadMesh(str(input_path))
     # Patch the stem connection with a ring of vertices and add a split ring around the calyx region
     # Also computes the size of the ring for the bottom part of the apple and center points
     patched_mesh = patch_stem_and_ring_calyx(
-        mesh=mm.loadMesh(str(input_path)), seam_topology=seam_topology, output_path=output_path
+        mesh=mesh, seam_topology=seam_topology, output_path=output_path
     )
 
     # 5. Save the patched mesh
     patch_path = output_path.with_name(output_path.stem + "_patch" + output_path.suffix)
-    mm.saveMesh(patched_mesh, str(patch_path))
+    save_settings = mm.SaveSettings()
+    mm.saveMesh(patched_mesh, str(patch_path), save_settings)
     print("patched mesh topology")
     print_mesh_topology(patch_path)
 

@@ -13,22 +13,21 @@ A note on scanning: You need to leave the stem on the apple. Otherwise, RevoScan
 - Downsample and clean up mesh artifacts (cleanup)
 - (Manual) remove the stem, break any tunnels in the calyx, and mark the top (stem junction) and bottom (center of calyx)
 - Use Blender's baking function with smart uv mapping to fix the texture map (bake_textures with use_smart_uv option)
-- Use voxelization to create a clean mesh with spherical topology and three texture seams: a circle on the top, one on the bottom, and a side seam (voxelize)
+- Use voxelization to create a clean mesh with spherical topology (voxelize), then add the stem/calyx rings and three texture seams (parameterize).
 - Each cap chart is centered using the median of its UV vertices and uniformly scaled to a maximum radius of 0.1 (diameter 0.2), with padding from the texture edges.
 - If the middle chart overlaps either cap, it is contracted along the cap-to-cap diagonal until it clears both caps, preserving triangle orientation.
-- The generated `_seam.csv` ends with two rows containing the top and bottom center coordinates, respectively, in `x, y, z` order.
-- Voxelization also writes `_seam_topology.json` with the original Y bounds, selected center points, top and bottom shoulder radii, and calyx, stem, top, bottom, and side seam data. The shoulder radii determine the top and bottom UV seam targets. Each seam vertex has a list of its UV coordinates, including copies on different charts; the side seam has no ring center or radius.
+- Voxelization writes `_seam_topology.json` with the Y bounds and selected center points. Parameterization adds the top and bottom shoulder radii, calyx, stem, top, bottom, and side seam data, and six ordered UV boundary paths. The shoulder radii determine the top and bottom UV seam targets. Each seam vertex has a list of its UV coordinates, including copies on different charts; the side seam has no ring center or radius.
 - The standalone UV entry point requires a matching `_seam_topology.json` containing both shoulder radii; for a `_voxel` mesh it looks for the JSON without the `_voxel` suffix.
-- The companion `_seam.ply` marks seam vertices black and the vertices nearest the top and bottom centers, plus their first two rings of mesh neighbors, green; green takes precedence where they overlap.
-- UV normalization maps the mesh vertices nearest those 3D points to the centers of the top and bottom circular charts; each must have an interior UV on its respective chart. The normalized seam CSV retains both center rows.
-- Normalization looks in the voxelized seam directory for one `_seam.csv` with the same apple name and number as the input OBJ, ignoring zero-padding and any suffix after the number. Missing or multiple matches are errors.
+- The companion `_seam.ply` marks seam vertices black and the vertices nearest the top and bottom centers, plus their first six rings of mesh neighbors, green; green takes precedence where they overlap.
+- UV normalization maps the mesh vertices nearest those 3D points to the centers of the top and bottom circular charts; each must have an interior UV on its respective chart. It writes a companion topology JSON with normalized seam UVs.
+- Normalization looks in `Parameterized` for a matching `_seam_topology.json`, or a legacy `_seam.csv` if no JSON exists, using the apple name and number and ignoring zero-padding and suffixes after the number. Missing or multiple matches are errors.
 - Degenerate or non-manifold UV edges produce a warning and small, deterministic UV perturbations during normalization. This does not repair invalid topology, so parameterization can still fail.
 - Use Blender's baking function to re-create the texture map (bake_textures, no use_smart_uv option)
 - (Manual) Use Blender's texture paint (or any painting program) to clean up any holes in the texture and erase the stem 
 - Downsample to a high, medium, and low res version, orient along the y axis, and place the stem at the origin (downsample_fullres, downsample_hires, downsample_lowres)
-- Downsampling pads the original texture once per mesh, saving `<mesh stem>_padded` with the original image extension in the input directory, then copies it to each Final texture. It uses the input mesh's companion seam CSV when present, otherwise the matching `Voxelized` seam CSV. Padding extends colors across seams using five rings of neighboring faces, with seam vertices pinned to the opposite chart. Faces with edges on both the side seam and a top or bottom seam are excluded. Flipped or degenerate reprojected faces and those with a UV edge longer than 0.25 are skipped with a warning. Only white RGB or fully transparent pixels outside the original UV charts are filled by reprojection; pixels beyond the projected faces remain unchanged. Missing pixels along seam edges are filled using the mean of valid adjacent pixels, including inside the chart. The mesh UVs and seam CSV must correspond; missing or ambiguous seams are errors.
+- Downsampling pads the original texture once per mesh, saving `<mesh stem>_padded` with the original image extension in the input directory, then copies it to each Final texture. It uses the input mesh's companion topology JSON or legacy CSV when present, otherwise matching seams from `Parameterized` or legacy `Voxelized` data. Padding extends colors across seams using five rings of neighboring faces, with seam vertices pinned to the opposite chart. Faces with edges on both the side seam and a top or bottom seam are excluded. Flipped or degenerate reprojected faces and those with a UV edge longer than 0.25 are skipped with a warning. Only white RGB or fully transparent pixels outside the original UV charts are filled by reprojection; pixels beyond the projected faces remain unchanged. Missing pixels along seam edges are filled using the mean of valid adjacent pixels, including inside the chart. The mesh UVs and seam data must correspond; missing or ambiguous seams are errors.
 
-To fill an image independently, run `python fix_texture_maps.py TEXTURE MESH.obj SEAMS.csv OUTPUT.png`. The output can be the input image; the original mesh and seam CSV are never overwritten.
+To fill an image independently, run `python fix_texture_maps.py TEXTURE MESH.obj SEAMS.json OUTPUT.png` (legacy seam CSV input is also supported). The output can be the input image; the original mesh and seam file are never overwritten.
 
 There's more information on how to clean up the scans and the Blender processing here: [Instructions](https://docs.google.com/document/d/1VNYZVNQCl2NPY8_LQbEhR_85cBMGDxbPyeexvK_tSUA/edit?tab=t.0)
 
@@ -39,8 +38,12 @@ The code will not over-write an existing file unless replace_existing is set.
 ## Normalization process
 
 Alignment reads meshes from `NormalizedTexture`, using their matching
-`Voxelized/<input stem>_seam.csv` for seam vertices and the scan's top and
-bottom XYZ endpoints. The canonical seam CSV is in the same folder as the canonical OBJ.
+the companion topology JSON, or matching `Parameterized` seam data (with legacy
+`Voxelized` CSV fallback), for seam vertices and the scan's top and bottom XYZ
+endpoints. The canonical topology JSON is in the same folder as the canonical OBJ;
+legacy canonical seam CSV files are also accepted.
+The canonical body ends at -70° latitude; its bottom cap has rings down to a
+calyx boundary at -85°, with spacing based on the body boundary edges.
 Run normalization before alignment; rebaked UV charts are not necessarily
 normalized. The batch command uses `--operation align_meshes` and selects
 `Canonical/apple_fullres.obj` by default (or `--canonical hires`, etc.).

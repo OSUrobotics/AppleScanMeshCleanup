@@ -1,4 +1,5 @@
 import csv
+import json
 import shutil
 import sys
 import tempfile
@@ -21,7 +22,9 @@ class AlignMeshesTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.canonical = self.root / "canonical.obj"
         _create_apple(12, self.canonical)
-        self.seams = self.root / "canonical_seam.csv"
+        self.seams = self.root / "canonical_seam_topology.json"
+        self.assertTrue(self.seams.is_file())
+        self.assertFalse((self.root / "canonical_seam.csv").exists())
         lines, self.vertices, self.faces, uv, uv_faces, _ = alignment._mesh(self.canonical)
         vertex_uvs = alignment._vertex_uvs(self.vertices, self.faces, uv, uv_faces)
         self.poles = [
@@ -49,9 +52,14 @@ class AlignMeshesTests(unittest.TestCase):
                 scan_lines.append(line)
         self.scan.write_text("\n".join(scan_lines) + "\n", encoding="utf-8")
         self.scan_seams = voxel_dir / "scan_seam.csv"
-        self.scan_seams.write_bytes(self.seams.read_bytes())
-        with self.scan_seams.open("a", encoding="utf-8", newline="") as stream:
-            csv.writer(stream).writerows(self.scan_vertices[self.poles])
+        records, _ = alignment._read_seam_data(self.seams)
+        with self.scan_seams.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.writer(stream)
+            for ids, uvs in records:
+                writer.writerow(ids)
+                writer.writerow(uvs[:, 0])
+                writer.writerow(uvs[:, 1])
+            writer.writerows(self.scan_vertices[self.poles])
         self.output = self.root / "aligned" / "result.obj"
 
     def test_similarity_alignment_and_correspondence(self):
@@ -80,6 +88,33 @@ class AlignMeshesTests(unittest.TestCase):
             weights = np.array(row[2:], dtype=float)
             self.assertAlmostEqual(float(weights.sum()), 1)
             self.assertLess(np.linalg.norm(weights @ fitted[faces[face]] - self.scan_vertices[vertex]), 0.09)
+
+    def test_alignment_reads_topology_json_for_scan_and_canonical(self):
+        data = json.loads(self.seams.read_text(encoding="utf-8"))
+        data["top_point"], data["bottom_point"] = self.scan_vertices[self.poles].tolist()
+        parameterized = self.root / "Parameterized"
+        parameterized.mkdir()
+        scan_topology = parameterized / "scan_seam_topology.json"
+        scan_topology.write_text(json.dumps(data), encoding="utf-8")
+        np.testing.assert_array_equal(alignment._endpoints(scan_topology), self.scan_vertices[self.poles])
+        self.assertEqual(alignment._seam_ids(scan_topology, len(self.vertices)),
+                         alignment._seam_ids(self.seams, len(self.vertices)))
+        with (patch("align_meshes.flood_fill_texture_map") as fill,
+              patch("align_meshes._endpoints", wraps=alignment._endpoints) as endpoints):
+            alignment.align_meshes(self.scan, self.output, self.canonical)
+        self.assertEqual(fill.call_args.kwargs["seam_path"], self.seams)
+        endpoints.assert_called_once_with(scan_topology)
+        self.assertTrue(self.output.is_file())
+
+    def test_alignment_prefers_normalized_companion_topology(self):
+        data = json.loads(self.seams.read_text(encoding="utf-8"))
+        data["top_point"], data["bottom_point"] = self.scan_vertices[self.poles].tolist()
+        companion = self.scan.with_name("scan_seam_topology.json")
+        companion.write_text(json.dumps(data), encoding="utf-8")
+        with (patch("align_meshes.flood_fill_texture_map"),
+              patch("align_meshes._endpoints", wraps=alignment._endpoints) as endpoints):
+            alignment.align_meshes(self.scan, self.output, self.canonical)
+        endpoints.assert_called_once_with(companion)
 
     def test_texture_resampling_uses_correspondences_and_chart_specific_seam_uvs(self):
         size = 256
@@ -344,8 +379,10 @@ class AlignMeshesTests(unittest.TestCase):
             alignment._oriented_seams(seams, self.vertices, self.faces)
 
     def test_reads_legacy_ten_row_canonical_seams(self):
-        with self.seams.open(newline="") as stream:
-            rows = list(csv.reader(stream))
+        records, _ = alignment._read_seam_data(self.seams)
+        rows = []
+        for ids, uvs in records:
+            rows.extend((ids, uvs[:, 0], uvs[:, 1]))
         old_path = self.root / "legacy_seams.csv"
         with old_path.open("w", newline="") as stream:
             csv.writer(stream).writerows(rows[:6] + [rows[index] for index in (6, 9, 12, 15)])

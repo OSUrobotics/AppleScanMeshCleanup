@@ -107,7 +107,7 @@ def _seam_edges(uvs: np.ndarray, faces: np.ndarray, records):
             (side_faces if group in (3, 5) else ring_faces).add(face)
     corner_faces = ring_faces & side_faces
     if not edges:
-        raise ValueError("The seam CSV contains no paired edges.")
+        raise ValueError("The seam data contains no paired edges.")
     return labels, edges, corner_faces
 
 
@@ -349,7 +349,7 @@ def flood_fill_texture_map(
         Path, (input_path, mesh_path, seam_path, output_path)
     )
     if output_path.resolve() in {mesh_path.resolve(), seam_path.resolve()}:
-        raise ValueError("The output texture must not overwrite the mesh or seam CSV.")
+        raise ValueError("The output texture must not overwrite the mesh or seam file.")
     lines, uvs, faces, material_path = _read_obj(mesh_path)
     vertices, vertex_faces = _mesh_geometry(lines, mesh_path)
     if output_path.resolve() == material_path.resolve():
@@ -423,7 +423,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("texture", type=Path)
     parser.add_argument("mesh", type=Path, help="Original full-resolution textured OBJ")
-    parser.add_argument("seams", type=Path, help="Matching seam CSV")
+    parser.add_argument("seams", type=Path, help="Matching seam topology JSON or legacy seam CSV")
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
     flood_fill_texture_map(args.texture, args.mesh, args.seams, args.output)

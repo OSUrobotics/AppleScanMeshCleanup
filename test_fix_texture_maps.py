@@ -1,4 +1,5 @@
 import csv
+import json
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from fix_texture_maps import (
 from MeshLabCleanup import downsample_mesh
 import main
 from normalize_uv_projection import _read_obj, _read_seam_records
+from seam_topology import SeamTopology
 
 
 class FillTextureTests(unittest.TestCase):
@@ -88,6 +90,17 @@ class FillTextureTests(unittest.TestCase):
         np.testing.assert_array_equal(after[19, 72], [200, 10, 10])
         np.testing.assert_array_equal(after[66, 30], [10, 200, 10])
         np.testing.assert_array_equal(after[0, 0], [255, 255, 255])
+
+    def test_fill_accepts_topology_json_with_legacy_equivalent_paths(self):
+        topology = SeamTopology(-1, 1, (0, 1, 0), (0, -1, 0))
+        topology.set_boundary_paths(_read_seam_records(self.seams))
+        topology_path = self.root / "Apple1_seam_topology.json"
+        topology_path.write_text(json.dumps(topology.to_dict()), encoding="utf-8")
+        legacy_output = self.root / "legacy.png"
+        flood_fill_texture_map(self.texture, self.mesh, self.seams, legacy_output)
+        flood_fill_texture_map(self.texture, self.mesh, topology_path, self.output)
+        with Image.open(legacy_output) as legacy, Image.open(self.output) as result:
+            np.testing.assert_array_equal(np.asarray(result), np.asarray(legacy))
 
     def test_transparency_and_in_place_output(self):
         with Image.open(self.texture) as image:
@@ -281,7 +294,7 @@ class FillTextureTests(unittest.TestCase):
         def read_texture(material):
             return self.texture if material == source_material else material.with_suffix(".png")
         def fill_texture(texture, mesh, seam, output):
-            output.write_bytes(b"padded image")
+            Image.new("RGB", (16, 16), (12, 34, 56)).save(output)
         with (patch("MeshLabCleanup._find_seam_file", return_value=self.seams),
               patch("MeshLabCleanup._process_mesh") as process,
               patch("MeshLabCleanup._reorient_mesh"),
@@ -292,8 +305,9 @@ class FillTextureTests(unittest.TestCase):
             downsample_mesh(source, destination, scripts)
         self.assertEqual(process.call_count, 3)
         fill.assert_called_once_with(self.texture, source, self.seams, padded)
-        self.assertEqual(padded.read_bytes(), b"padded image")
-        for texture in output_textures:
+        with Image.open(output_textures[0]) as lowres:
+            self.assertEqual(lowres.size, (4, 4))
+        for texture in output_textures[1:]:
             self.assertEqual(texture.read_bytes(), padded.read_bytes())
 
     def test_downsample_uses_companion_normalized_seam(self):
@@ -301,8 +315,9 @@ class FillTextureTests(unittest.TestCase):
         destination = self.root / "Final" / "Apple1.obj"
         source.parent.mkdir()
         destination.parent.mkdir()
-        seam = source.with_name("Apple1_seam.csv")
+        seam = source.with_name("Apple1_seam_topology.json")
         seam.touch()
+        source.with_name("Apple1_seam.csv").touch()
         source_material = source.with_suffix(".mtl")
         output_material = destination.with_name("Apple_001_lowres.mtl")
         with (patch("MeshLabCleanup._find_seam_file") as find_seam,
@@ -311,12 +326,34 @@ class FillTextureTests(unittest.TestCase):
               patch("MeshLabCleanup._read_obj", side_effect=[
                   (None, None, None, source_material), (None, None, None, output_material)]),
               patch("MeshLabCleanup._read_texture", side_effect=[self.texture, output_material.with_suffix(".png")]),
-              patch("MeshLabCleanup.flood_fill_texture_map") as fill,
+              patch("MeshLabCleanup.flood_fill_texture_map",
+                    side_effect=lambda texture, mesh, seam, output: Image.new("RGB", (16, 16)).save(output)) as fill,
               patch("MeshLabCleanup.shutil.copyfile"),
               patch("MeshLabCleanup.print_mesh_topology")):
             downsample_mesh(source, destination, [Path("downsample_lowres.mlx")])
         fill.assert_called_once_with(self.texture, source, seam, source.with_name("Apple1_padded.png"))
         find_seam.assert_not_called()
+
+    def test_downsample_prefers_parameterized_and_falls_back_to_legacy(self):
+        source = self.root / "BlenderRebaked" / "Apple1.obj"
+        parameterized = self.root / "Parameterized"
+        voxelized = self.root / "Voxelized"
+        parameterized.mkdir()
+        voxelized.mkdir()
+        topology = parameterized / "Apple1_seam_topology.json"
+        topology.touch()
+        (voxelized / "Apple1_seam_topology.json").touch()
+        legacy = voxelized / "Apple1_seam.csv"
+        legacy.touch()
+        with (patch("MeshLabCleanup._read_obj", return_value=(None, None, None, source.with_suffix(".mtl"))),
+              patch("MeshLabCleanup._read_texture", return_value=self.texture),
+              patch("MeshLabCleanup.flood_fill_texture_map", side_effect=ValueError("stop")) as fill,
+              patch("MeshLabCleanup.print_mesh_topology")):
+            for expected in (topology, legacy):
+                with self.assertRaisesRegex(ValueError, "stop"):
+                    downsample_mesh(source, self.root / "Final" / "Apple1.obj", [])
+                self.assertEqual(fill.call_args.args[2], expected)
+                topology.unlink(missing_ok=True)
 
     def test_downsample_stops_if_padding_fails(self):
         source = self.root / "BlenderRebaked" / "Apple1.obj"

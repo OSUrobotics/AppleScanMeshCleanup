@@ -14,7 +14,7 @@ Directories
    Parameterized : Derived from Voxelized by adding the cylindrical parameterization.
            - it is safe to overwrite these
    BlenderTextured : Manually Bake the texture map from the meshlabcleaned and clean up the stem texture
-   NormalizedTexture : Normalize UV charts and warp the rebaked texture using seams from Voxelized
+   NormalizedTexture : Normalize UV charts and warp the rebaked texture using seams from Parameterized
    Final : Generate Hi and Low res meshees from BlenderTextured.
    """
 from MeshLabCleanup import (

@@ -7,7 +7,7 @@ from unittest.mock import patch
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
-from MeshLabCleanup import voxelize_mesh
+from MeshLabCleanup import parameterize_mesh, voxelize_mesh
 from seam_topology import SeamInfo, SeamTopology
 
 
@@ -25,9 +25,6 @@ class VoxelizeMeshTests(unittest.TestCase):
             )
             output_path = root / "output" / "apple1.obj"
             output_path.parent.mkdir()
-            def record_uvs(*, input_path, output_path, seam_topology):
-                seam_topology.add_seam("top", SeamInfo("top", [0], [[0, 0, 0]], [[[0.1, 0.2]]], None, None))
-
             with (
                 patch("MeshLabCleanup.print_mesh_topology"),
                 patch("MeshLabCleanup.mm.loadMesh", return_value=mesh),
@@ -35,24 +32,42 @@ class VoxelizeMeshTests(unittest.TestCase):
                 patch("MeshLabCleanup._remove_zero_area_face"),
                 patch("MeshLabCleanup._remove_unconnected"),
                 patch("MeshLabCleanup.mm.relaxKeepVolume"),
-                patch("MeshLabCleanup.patch_stem_and_ring_calyx") as patch_rings,
                 patch("MeshLabCleanup.mm.saveMesh"),
-                patch("MeshLabCleanup.uv_texture", side_effect=record_uvs) as texture,
                 patch("MeshLabCleanup.SeamTopology", wraps=SeamTopology) as topology_class,
             ):
                 voxelize_mesh(input_path, output_path)
             saved = json.loads(output_path.with_name("apple1_seam_topology.json").read_text())
-            self.assertEqual(saved["seams"]["top"]["uv_coords"], [[[0.1, 0.2]]])
+            self.assertEqual(saved["seams"], {})
+            self.assertFalse(output_path.with_name("apple1_seam.csv").exists())
 
         topology_class.assert_called_once()
         self.assertEqual(topology_class.call_args.kwargs["ymin"], float(vertices[:, 1].min()))
         self.assertEqual(topology_class.call_args.kwargs["ymax"], float(vertices[:, 1].max()))
         self.assertEqual(topology_class.call_args.kwargs["top_point"], (1.0, 9.0, 2.0))
         self.assertEqual(topology_class.call_args.kwargs["bottom_point"], (3.0, -8.0, 4.0))
-        self.assertIs(patch_rings.call_args.kwargs["mesh"], mesh)
-        self.assertIsInstance(patch_rings.call_args.kwargs["seam_topology"], SeamTopology)
-        self.assertEqual(patch_rings.call_args.kwargs["seam_topology"].top_point, (1.0, 9.0, 2.0))
-        self.assertIs(texture.call_args.kwargs["seam_topology"], patch_rings.call_args.kwargs["seam_topology"])
+
+    def test_parameterize_saves_completed_topology(self):
+        mesh = mm.makeUVSphere(10.0, 16, 16)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_path = root / "voxel.obj"
+            output_path = root / "apple1.obj"
+            topology = SeamTopology(-10, 10, (0, 10, 0), (0, -10, 0))
+            input_path.with_name("voxel_seam_topology.json").write_text(json.dumps(topology.to_dict()))
+
+            def record_uvs(*, input_path, output_path, seam_topology):
+                seam_topology.add_seam("top", SeamInfo("top", [0], [[0, 0, 0]], [[[0.1, 0.2]]], None, None))
+
+            with (patch("MeshLabCleanup.print_mesh_topology"),
+                  patch("MeshLabCleanup.mm.loadMesh", return_value=mesh),
+                  patch("MeshLabCleanup.patch_stem_and_ring_calyx", return_value=mesh) as patch_rings,
+                  patch("MeshLabCleanup.mm.saveMesh"),
+                  patch("MeshLabCleanup.uv_texture", side_effect=record_uvs) as texture):
+                parameterize_mesh(input_path, output_path)
+            saved = json.loads(output_path.with_name("apple1_seam_topology.json").read_text())
+            self.assertEqual(saved["seams"]["top"]["uv_coords"], [[[0.1, 0.2]]])
+            self.assertFalse(output_path.with_name("apple1_seam.csv").exists())
+            self.assertIs(texture.call_args.kwargs["seam_topology"], patch_rings.call_args.kwargs["seam_topology"])
 
 
 if __name__ == "__main__":

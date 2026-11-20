@@ -2,17 +2,17 @@
 
 The top and bottom boundaries become circles of radius 0.1 centered at
 (0.9, 0.1) and (0.1, 0.9). The body boundary becomes the diamond with
-corners (0.5, 0), (1, 0.5), (0.5, 1), and (0, 0.5). The seam CSV contains
-six groups of three rows: vertex indices, U coordinates, and V coordinates,
-for the top, bottom, and the four clockwise sides of the body.
-Two additional rows contain the top and bottom center positions in 3D.
+corners (0.5, 0), (1, 0.5), (0.5, 1), and (0, 0.5). Seam topology JSON
+contains six ordered boundary paths and the top and bottom center positions.
+Legacy seam CSV files are also accepted as input.
 Each circular chart's first seam vertex lies on the positive U axis.
 The warped texture is padded by four pixels outside the rasterized charts.
-The output OBJ has a companion <output stem>_seam.csv with normalized UVs.
+The output OBJ has a companion <output stem>_seam_topology.json with normalized UVs.
 """
 
 import argparse
 import csv
+import json
 import math
 import shlex
 import warnings
@@ -27,6 +27,7 @@ from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
 from filename_fixing import _split_filename_into_apple_type_and_number
+from seam_topology import SeamTopology
 
 
 _SEAM_TOLERANCE = 2e-6
@@ -99,6 +100,20 @@ def _read_texture(material_path: Path) -> Path:
 def _read_seam_data(
     seam_path: Path,
 ) -> tuple[list[tuple[list[int], np.ndarray]], np.ndarray | None]:
+    if seam_path.suffix.lower() == ".json":
+        with seam_path.open(encoding="utf-8") as seam_file:
+            topology = SeamTopology.from_dict(json.load(seam_file))
+        topology.set_boundary_paths(
+            (path["vertex_ids"], path["uv_coords"]) for path in topology.boundary_paths
+        )
+        records = [
+            (path["vertex_ids"], np.asarray(path["uv_coords"], dtype=np.float64))
+            for path in topology.boundary_paths
+        ]
+        centers = np.asarray([topology.top_point, topology.bottom_point], dtype=np.float64)
+        if centers.shape != (2, 3) or not np.isfinite(centers).all():
+            raise ValueError(f"Expected two finite 3D center coordinates in {seam_path}.")
+        return records, centers
     with seam_path.open(encoding="utf-8", newline="") as seam_file:
         rows = [[entry.strip() for entry in row] for row in csv.reader(seam_file)]
     if len(rows) not in (18, 20):
@@ -145,28 +160,10 @@ def _match_seam_uvs(original_uvs: np.ndarray, seams: list[np.ndarray]) -> list[n
         if np.max(distances) > _SEAM_TOLERANCE:
             raise ValueError(
                 f"Seam {index + 1} does not match the OBJ UVs "
-                f"(maximum error {np.max(distances):.6g}); use the matching voxelized CSV."
+                f"(maximum error {np.max(distances):.6g}); use the matching seam topology."
             )
         seam_indices.append(matches)
     return seam_indices
-
-
-def _write_seam_csv(
-    output_path: Path,
-    records: list[tuple[list[int], np.ndarray]],
-    seam_indices: list[np.ndarray],
-    normalized_uvs: np.ndarray,
-    centers: np.ndarray | None = None,
-) -> None:
-    with output_path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.writer(stream)
-        for (ids, _), indices in zip(records, seam_indices):
-            coordinates = normalized_uvs[indices]
-            writer.writerow(ids)
-            writer.writerow([f"{u:.9g}" for u in coordinates[:, 0]])
-            writer.writerow([f"{v:.9g}" for v in coordinates[:, 1]])
-        if centers is not None:
-            writer.writerows(centers)
 
 
 def _center_uv_indices(
@@ -257,10 +254,10 @@ def _parameterize(
     for seam in seam_indices:
         unique = np.unique(labels[seam])
         if len(unique) != 1:
-            raise ValueError("A seam CSV row crosses multiple UV charts.")
+            raise ValueError("A seam boundary path crosses multiple UV charts.")
         chart_labels.append(int(unique[0]))
     if len(set(chart_labels[:2] + [chart_labels[2]])) != 3 or len(set(chart_labels[2:])) != 1:
-        raise ValueError("The seam CSV does not identify separate top, bottom, and body charts.")
+        raise ValueError("The seam data does not identify separate top, bottom, and body charts.")
 
     result = perturbed_uvs.copy()
     for chart_index, chart_label in enumerate(chart_labels[:3]):
@@ -398,30 +395,34 @@ def _warp_texture(
     Image.fromarray(output).save(output_texture)
 
 
-def _find_seam_file(input_path: Path, seam_dir: Path) -> Path:
+def _find_seam_file(input_path: Path, seam_dir: Path, *, legacy_only: bool = False) -> Path:
     if not seam_dir.is_dir():
         raise NotADirectoryError(f"Seam directory not found or not a directory: {seam_dir}")
     apple = _split_filename_into_apple_type_and_number(input_path.name)
-    matches = []
-    for candidate in seam_dir.glob("*_seam.csv"):
-        if not candidate.is_file():
-            continue
-        try:
-            candidate_apple = _split_filename_into_apple_type_and_number(candidate.name)
-        except ValueError:
-            continue
-        if candidate_apple == apple:
-            matches.append(candidate)
-    if not matches:
-        raise FileNotFoundError(f"No seam CSV found for {input_path.name} in {seam_dir}.")
-    if len(matches) > 1:
-        names = ", ".join(sorted(path.name for path in matches))
-        raise ValueError(f"Multiple seam CSV files match {input_path.name} in {seam_dir}: {names}")
-    return matches[0]
+    patterns = (("*_seam.csv", "CSV"),) if legacy_only else (
+        ("*_seam_topology.json", "topology JSON"), ("*_seam.csv", "CSV")
+    )
+    for pattern, kind in patterns:
+        matches = []
+        for candidate in seam_dir.glob(pattern):
+            if not candidate.is_file():
+                continue
+            try:
+                candidate_apple = _split_filename_into_apple_type_and_number(candidate.name)
+            except ValueError:
+                continue
+            if candidate_apple == apple:
+                matches.append(candidate)
+        if len(matches) > 1:
+            names = ", ".join(sorted(path.name for path in matches))
+            raise ValueError(f"Multiple seam {kind} files match {input_path.name} in {seam_dir}: {names}")
+        if matches:
+            return matches[0]
+    raise FileNotFoundError(f"No seam CSV found or topology JSON found for {input_path.name} in {seam_dir}.")
 
 
 def normalize_uv_projection(input_path: Path, output_path: Path, seam_path: Path) -> Path:
-    """Normalize one textured OBJ using its matching seam CSV in seam_path."""
+    """Normalize one textured OBJ using matching seam topology in seam_path."""
     input_path, seam_dir, output_path = Path(input_path), Path(seam_path), Path(output_path)
     if input_path.resolve() == output_path.resolve():
         raise ValueError("The output OBJ must differ from the input OBJ.")
@@ -441,13 +442,41 @@ def normalize_uv_projection(input_path: Path, output_path: Path, seam_path: Path
     seam_indices = _match_seam_uvs(original_uvs, seams)
     output_texture = output_path.with_suffix(".png")
     output_material = output_path.with_suffix(".mtl")
-    output_seams = output_path.with_name(output_path.stem + "_seam.csv")
+    output_seams = output_path.with_name(output_path.stem + "_seam_topology.json")
     sources = {input_path.resolve(), seam_path.resolve(), material_path.resolve(), texture_path.resolve()}
     if any(path.resolve() in sources for path in (output_path, output_material, output_texture, output_seams)):
         raise ValueError("Output files must not overwrite the input mesh, seam, material, or texture.")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _warp_texture(texture_path, output_texture, original_uvs, normalized_uvs, faces)
-    _write_seam_csv(output_seams, records, seam_indices, normalized_uvs, centers)
+    if seam_path.suffix.lower() == ".json":
+        with seam_path.open(encoding="utf-8") as stream:
+            topology = SeamTopology.from_dict(json.load(stream))
+        coordinates = []
+        targets = []
+        for seam in topology.seams.values():
+            for index, copies in enumerate(seam.uv_coords):
+                if copies:
+                    start = len(coordinates)
+                    coordinates.extend(copies)
+                    targets.append((seam, index, start, len(coordinates)))
+        if coordinates:
+            matched = _match_seam_uvs(original_uvs, [np.asarray(coordinates, dtype=np.float64)])[0]
+            for seam, index, start, end in targets:
+                seam.uv_coords[index] = normalized_uvs[matched[start:end]].tolist()
+    else:
+        vertices = np.asarray([
+            [float(value) for value in line.split()[1:4]]
+            for line in lines if line.split() and line.split()[0] == "v"
+        ])
+        topology = SeamTopology(
+            float(vertices[:, 1].min()), float(vertices[:, 1].max()),
+            tuple(centers[0]), tuple(centers[1]),
+        )
+    topology.set_boundary_paths(
+        (ids, normalized_uvs[indices]) for (ids, _), indices in zip(records, seam_indices)
+    )
+    with output_seams.open("w", encoding="utf-8") as stream:
+        json.dump(topology.to_dict(), stream)
     material_lines = material_path.read_text(encoding="utf-8").splitlines()
     with output_material.open("w", encoding="utf-8", newline="\n") as material_file:
         for line in material_lines:
@@ -472,7 +501,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Normalize an OBJ's UV charts and texture.")
     parser.add_argument("input", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/BlenderRebaked/Envy_002_FullRes.obj", type=Path, help="Rebaked textured OBJ")
     parser.add_argument("output", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/NormalizedTexture/Envy_002_FullRes_seam.obj", type=Path, help="Output OBJ path")
-    parser.add_argument("seams", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/Voxelized", type=Path, help="Directory containing voxelized seam CSV files")
+    parser.add_argument("seams", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/Parameterized", type=Path, help="Directory containing seam topology JSON or legacy seam CSV files")
     args = parser.parse_args()
     normalize_uv_projection(args.input, args.output, args.seams)
 

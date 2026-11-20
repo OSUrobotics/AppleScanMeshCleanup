@@ -3,14 +3,14 @@ Input:
     - mesh: The input mesh to be aligned.
     - canonical_mesh: The reference canonical mesh.
     - seam files, that define the top, bottom, and side seams of both meshes
-    - the input seam CSV ends with the two polar endpoint locations on the input mesh
+    - the input seam topology contains the two polar endpoint locations on the input mesh
 
 Output:
     - correspondence: A mapping from vertices of the input mesh to the canonical mesh.
     - The canonical mesh re-shaped to be the same shape as the input mesh
 
 Objective: The top and bottom polar vertices should go to the input
-mesh vertices closest to the endpoints in the input seam CSV.
+mesh vertices closest to the endpoints in the input seam data.
 Fit the two halves separated by the midpoint along the pole axis without
 constraining the seams.
 
@@ -38,7 +38,7 @@ from scipy.sparse import coo_matrix, diags
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
-from normalize_uv_projection import _read_obj, _read_seam_data, _read_texture, _warp_texture
+from normalize_uv_projection import _find_seam_file, _read_obj, _read_seam_data, _read_texture, _warp_texture
 from fix_texture_maps import flood_fill_texture_map
 
 
@@ -68,14 +68,17 @@ def _mesh(path: Path):
 
 
 def _seam_ids(path: Path, vertex_count: int) -> list[list[int]]:
-    with path.open(encoding="utf-8", newline="") as stream:
-        rows = [[entry.strip() for entry in row if entry.strip()] for row in csv.reader(stream)]
-    if len(rows) in (18, 20):
-        rows = [rows[i] for i in (0, 3, 6, 9, 12, 15)]
-    elif len(rows) == 10:
-        rows = [rows[i] for i in (0, 3, 6, 7, 8, 9)]
+    if path.suffix.lower() == ".json":
+        rows = [ids for ids, _ in _read_seam_data(path)[0]]
     else:
-        raise ValueError(f"Expected 10, 18, or 20 rows in seam CSV {path}.")
+        with path.open(encoding="utf-8", newline="") as stream:
+            rows = [[entry.strip() for entry in row if entry.strip()] for row in csv.reader(stream)]
+        if len(rows) in (18, 20):
+            rows = [rows[i] for i in (0, 3, 6, 9, 12, 15)]
+        elif len(rows) == 10:
+            rows = [rows[i] for i in (0, 3, 6, 7, 8, 9)]
+        else:
+            raise ValueError(f"Expected 10, 18, or 20 rows in seam CSV {path}.")
     seams = [[int(value) for value in row] for row in rows]
     for seam in seams:
         if len(seam) < 2 or min(seam) < 0 or max(seam) >= vertex_count:
@@ -559,8 +562,26 @@ def align_meshes(
     """Fit the canonical mesh to the normalized scan and write input-to-canonical correspondence."""
     input_path, canonical_path = Path(input_path), Path(canonical_path)
     output_path = Path(output_path)
-    canonical_seams_path = canonical_path.with_name(canonical_path.stem + "_seam.csv")
-    input_seams_path = input_path.parent.parent / "Voxelized" / (input_path.stem + "_seam.csv")
+    canonical_seams_path = canonical_path.with_name(canonical_path.stem + "_seam_topology.json")
+    if not canonical_seams_path.is_file():
+        canonical_seams_path = canonical_path.with_name(canonical_path.stem + "_seam.csv")
+    input_seams_path = input_path.with_name(input_path.stem + "_seam_topology.json")
+    if not input_seams_path.is_file():
+        companion_csv = input_path.with_name(input_path.stem + "_seam.csv")
+        parameterized = input_path.parent.parent / "Parameterized"
+        voxelized = input_path.parent.parent / "Voxelized"
+        if companion_csv.is_file():
+            input_seams_path = companion_csv
+        elif parameterized.is_dir():
+            exact = parameterized / (input_path.stem + "_seam_topology.json")
+            try:
+                input_seams_path = exact if exact.is_file() else _find_seam_file(input_path, parameterized)
+            except FileNotFoundError:
+                exact = voxelized / (input_path.stem + "_seam.csv")
+                input_seams_path = exact if exact.is_file() else _find_seam_file(input_path, voxelized, legacy_only=True)
+        else:
+            exact = voxelized / (input_path.stem + "_seam.csv")
+            input_seams_path = exact if exact.is_file() else _find_seam_file(input_path, voxelized, legacy_only=True)
     _, points, faces, uv, uv_faces, input_material = _mesh(input_path)
     lines, template, template_faces, template_uv, template_uv_faces, material_path = _mesh(canonical_path)
     scan_seams = _seam_ids(Path(input_seams_path), len(points))

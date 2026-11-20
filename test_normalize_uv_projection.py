@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ import main
 import normalize_uv_projection as normalization
 from align_meshes import _seam_ids
 from normalize_uv_projection import _read_obj, normalize_uv_projection
+from seam_topology import SeamInfo, SeamTopology
 
 
 class NormalizeUVProjectionTests(unittest.TestCase):
@@ -21,7 +23,7 @@ class NormalizeUVProjectionTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.input_dir = self.root / "BlenderRebaked"
-        self.seam_dir = self.root / "Voxelized"
+        self.seam_dir = self.root / "Parameterized"
         self.input_dir.mkdir()
         self.seam_dir.mkdir()
         self.input_path = self.input_dir / "Apple_001_NoStemHiRes.obj"
@@ -95,6 +97,15 @@ class NormalizeUVProjectionTests(unittest.TestCase):
         normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
         self.assertTrue(self.output_path.is_file())
 
+    def test_prefers_topology_and_can_select_legacy_csv(self):
+        topology = self.seam_dir / "Apple_001_seam_topology.json"
+        topology.touch()
+        self.assertEqual(normalization._find_seam_file(self.input_path, self.seam_dir), topology)
+        self.assertEqual(
+            normalization._find_seam_file(self.input_path, self.seam_dir, legacy_only=True),
+            self.seam_path,
+        )
+
     def test_rejects_missing_or_ambiguous_seam_files(self):
         self.seam_path.unlink()
         (self.seam_dir / "Apple10_seam.csv").touch()
@@ -152,9 +163,9 @@ class NormalizeUVProjectionTests(unittest.TestCase):
                     self.assertGreater(np.max(np.abs(result[:4] - reference[:4])), 0)
                     self.assertLess(np.max(np.abs(result[:4] - reference[:4])), 1e-6)
 
-    def test_normalized_seam_csv_preserves_ids_and_uses_output_uvs(self):
+    def test_normalized_topology_preserves_ids_and_uses_output_uvs(self):
         normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
-        output_seam = self.output_path.with_name(self.output_path.stem + "_seam.csv")
+        output_seam = self.output_path.with_name(self.output_path.stem + "_seam_topology.json")
         input_records = normalization._read_seam_records(self.seam_path)
         output_records = normalization._read_seam_records(output_seam)
         _, before, _, _ = _read_obj(self.input_path)
@@ -168,6 +179,40 @@ class NormalizeUVProjectionTests(unittest.TestCase):
         _, output_centers = normalization._read_seam_data(output_seam)
         np.testing.assert_array_equal(output_centers, input_centers)
         self.assertEqual(_seam_ids(output_seam, 15), [ids for ids, _ in input_records])
+        self.assertFalse(self.output_path.with_name(self.output_path.stem + "_seam.csv").exists())
+
+    def test_normalizes_topology_json_and_updates_existing_seam_uvs(self):
+        records, centers = normalization._read_seam_data(self.seam_path)
+        topology = SeamTopology(
+            0, 1, tuple(centers[0]), tuple(centers[1]),
+            top_shoulder_radius=2.0, bottom_shoulder_radius=3.0,
+        )
+        topology.set_boundary_paths(records)
+        topology.add_seam("stem", SeamInfo(
+            "stem", [0], [[0, 0, 0]], [[records[0][1][0].tolist(), records[2][1][0].tolist()]], (0, 0, 0), 1.0,
+        ))
+        topology_path = self.seam_dir / "Apple1_seam_topology.json"
+        topology_path.write_text(json.dumps(topology.to_dict()), encoding="utf-8")
+        normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
+        output_path = self.output_path.with_name(self.output_path.stem + "_seam_topology.json")
+        result = SeamTopology.from_dict(json.loads(output_path.read_text()))
+        self.assertEqual((result.top_shoulder_radius, result.bottom_shoulder_radius), (2.0, 3.0))
+        _, before, _, _ = _read_obj(self.input_path)
+        _, after, _, _ = _read_obj(self.output_path)
+        matches = normalization._match_seam_uvs(before, [np.asarray(topology.seams["stem"].uv_coords[0])])[0]
+        np.testing.assert_allclose(result.seams["stem"].uv_coords[0], after[matches], atol=1e-8)
+        np.testing.assert_array_equal(result.top_point, centers[0])
+
+    def test_refuses_to_overwrite_source_topology(self):
+        records, centers = normalization._read_seam_data(self.seam_path)
+        topology = SeamTopology(0, 1, tuple(centers[0]), tuple(centers[1]))
+        topology.set_boundary_paths(records)
+        source = self.seam_dir / "Apple1_seam_topology.json"
+        original = json.dumps(topology.to_dict())
+        source.write_text(original, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "must not overwrite"):
+            normalize_uv_projection(self.input_path, self.seam_dir / "Apple1.obj", self.seam_dir)
+        self.assertEqual(source.read_text(encoding="utf-8"), original)
 
     def test_pins_nearest_3d_vertex_and_solves_remaining_interior(self):
         obj = self.input_path.read_text(encoding="utf-8")
@@ -222,14 +267,14 @@ class NormalizeUVProjectionTests(unittest.TestCase):
                     normalize_uv_projection(self.input_path, self.output_path, self.seam_dir)
                 self.assertFalse(self.output_path.exists())
 
-    def test_refuses_to_overwrite_source_seam(self):
+    def test_preserves_legacy_source_seam(self):
         source_seam = self.seam_path
         self.seam_path = self.input_dir / "Apple_001_seam.csv"
         self.seam_path.write_text(source_seam.read_text())
         original = self.seam_path.read_bytes()
-        with self.assertRaisesRegex(ValueError, "must not overwrite"):
-            normalize_uv_projection(self.input_path, self.input_dir / "Apple_001.obj", self.input_dir)
+        normalize_uv_projection(self.input_path, self.input_dir / "Apple_001.obj", self.input_dir)
         self.assertEqual(self.seam_path.read_bytes(), original)
+        self.assertTrue((self.input_dir / "Apple_001_seam_topology.json").is_file())
 
     def test_rejects_mismatched_seam(self):
         with self.seam_path.open(encoding="utf-8", newline="") as seam_file:
@@ -266,7 +311,7 @@ class NormalizeUVProjectionTests(unittest.TestCase):
                 np.testing.assert_allclose(pixel[:2], expected, atol=6)
                 self.assertEqual(pixel[3], 255)
 
-    def test_main_normalize_uses_voxelized_seams(self):
+    def test_main_normalize_uses_parameterized_seams(self):
         with patch.object(sys, "argv", ["main.py", "--operation", "normalize_uv_projection", "--root-dir", str(self.root)]):
             main.main()
         self.assertTrue(self.output_path.is_file())
@@ -312,7 +357,7 @@ class NormalizeUVProjectionTests(unittest.TestCase):
             normalize.assert_called_once_with(
                 root / "BlenderRebaked/Envy_002_FullRes.obj",
                 root / "NormalizedTexture/Envy_002_FullRes_seam.obj",
-                root / "Voxelized",
+                root / "Parameterized",
             )
             normalize.reset_mock()
             with patch.object(
