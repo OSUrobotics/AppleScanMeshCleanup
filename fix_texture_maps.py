@@ -13,6 +13,7 @@ from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import lsqr
 
 from normalize_uv_projection import _match_seam_uvs, _read_obj, _read_seam_records
+from legacy_seams import _read_legacy_seam_data
 
 
 _MAX_PROJECTED_EDGE_LENGTH = 0.01  # Maximum allowed projected edge length in UV space
@@ -356,7 +357,9 @@ def flood_fill_texture_map(
         raise ValueError("The output texture must not overwrite the mesh material.")
     if np.any(uvs < 0) or np.any(uvs > 1):
         raise ValueError("The mesh UVs must lie within the texture image.")
-    _, edges, excluded_faces = _seam_edges(uvs, faces, _read_seam_records(seam_path))
+    records = (_read_seam_records(seam_path) if seam_path.suffix.lower() == ".json"
+               else _read_legacy_seam_data(seam_path)[0])
+    _, edges, excluded_faces = _seam_edges(uvs, faces, records)
     uv_vertices = {}
     for face, vertex_face in zip(faces, vertex_faces):
         for uv, vertex in zip(face, vertex_face):

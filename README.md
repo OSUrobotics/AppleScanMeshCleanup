@@ -19,8 +19,8 @@ A note on scanning: You need to leave the stem on the apple. Otherwise, RevoScan
 - Voxelization writes `_seam_topology.json` with the Y bounds and selected center points. Parameterization adds the top and bottom shoulder radii, calyx, stem, top, bottom, and side seam data, and six ordered UV boundary paths. The shoulder radii determine the top and bottom UV seam targets. Each seam vertex has a list of its UV coordinates, including copies on different charts; the side seam has no ring center or radius.
 - The standalone UV entry point requires a matching `_seam_topology.json` containing both shoulder radii; for a `_voxel` mesh it looks for the JSON without the `_voxel` suffix.
 - The companion `_seam.ply` marks seam vertices black and the vertices nearest the top and bottom centers, plus their first six rings of mesh neighbors, green; green takes precedence where they overlap.
-- UV normalization maps the mesh vertices nearest those 3D points to the centers of the top and bottom circular charts; each must have an interior UV on its respective chart. It writes a companion topology JSON with normalized seam UVs.
-- Normalization looks in `Parameterized` for a matching `_seam_topology.json`, or a legacy `_seam.csv` if no JSON exists, using the apple name and number and ignoring zero-padding and suffixes after the number. Missing or multiple matches are errors.
+- UV normalization maps the mesh vertices nearest those 3D points to the centers of the top and bottom circular charts; each must have an interior UV on its respective chart. The calyx ring is mapped to radius 0.05 around the bottom chart center. It writes a companion topology JSON with normalized seam UVs.
+- Normalization looks in `Parameterized` for a matching `_seam_topology.json`, using the apple name and number and ignoring zero-padding and suffixes after the number. It requires a calyx ring with UV coordinates; missing or multiple matches are errors.
 - Degenerate or non-manifold UV edges produce a warning and small, deterministic UV perturbations during normalization. This does not repair invalid topology, so parameterization can still fail.
 - Use Blender's baking function to re-create the texture map (bake_textures, no use_smart_uv option)
 - (Manual) Use Blender's texture paint (or any painting program) to clean up any holes in the texture and erase the stem 
@@ -28,6 +28,19 @@ A note on scanning: You need to leave the stem on the apple. Otherwise, RevoScan
 - Downsampling pads the original texture once per mesh, saving `<mesh stem>_padded` with the original image extension in the input directory, then copies it to each Final texture. It uses the input mesh's companion topology JSON or legacy CSV when present, otherwise matching seams from `Parameterized` or legacy `Voxelized` data. Padding extends colors across seams using five rings of neighboring faces, with seam vertices pinned to the opposite chart. Faces with edges on both the side seam and a top or bottom seam are excluded. Flipped or degenerate reprojected faces and those with a UV edge longer than 0.25 are skipped with a warning. Only white RGB or fully transparent pixels outside the original UV charts are filled by reprojection; pixels beyond the projected faces remain unchanged. Missing pixels along seam edges are filled using the mean of valid adjacent pixels, including inside the chart. The mesh UVs and seam data must correspond; missing or ambiguous seams are errors.
 
 To fill an image independently, run `python fix_texture_maps.py TEXTURE MESH.obj SEAMS.json OUTPUT.png` (legacy seam CSV input is also supported). The output can be the input image; the original mesh and seam file are never overwritten.
+
+To separate the calyx, run `python remove_calyx.py --input-path INPUT.obj --output-path OUTPUT.obj`.
+The input must be a triangular, textured OBJ with a single diffuse material and a
+matching `INPUT_seam_topology.json`; pass `--seam-path` to specify another JSON.
+The calyx ring must be a simple mesh-edge loop, with matching vertex positions
+and UVs, enclosing an interior vertex near the recorded bottom center. Its XZ
+projection must be a simple polygon containing the ring center. The command
+writes `OUTPUT_calyx.obj` with a 256×256 PNG containing the calyx UV area and
+eight pixels of padding, and `OUTPUT.obj` with the original calyx replaced by a
+grid patch. The patch center uses the UV of the original interior vertex nearest
+the recorded bottom center; boundary UVs and the rest of the apple texture are
+preserved. Each OBJ has its own material and texture. Vertex IDs change, so the
+input seam JSON does not describe the outputs.
 
 There's more information on how to clean up the scans and the Blender processing here: [Instructions](https://docs.google.com/document/d/1VNYZVNQCl2NPY8_LQbEhR_85cBMGDxbPyeexvK_tSUA/edit?tab=t.0)
 

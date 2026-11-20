@@ -487,7 +487,7 @@ def _write_obj_with_uv(
     bottom_y = ms.points[bottom_ring[0]][1]
     top_y = ms.points[top_ring[0]][1]
     material_path = output_path.with_suffix(".mtl")
-    texture_path = output_path.with_suffix(".png")
+    texture_path = output_path.with_suffix(".jpg")
     seam_path = output_path.with_name(f"{output_path.stem}_seam_topology.json")
     lowest_y = min(point[1] for point in ms.points)
     peak_uvs = tuple(

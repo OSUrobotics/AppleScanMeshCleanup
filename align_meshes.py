@@ -38,7 +38,8 @@ from scipy.sparse import coo_matrix, diags
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
-from normalize_uv_projection import _find_seam_file, _read_obj, _read_seam_data, _read_texture, _warp_texture
+from normalize_uv_projection import _read_obj, _read_seam_data, _read_texture, _warp_texture
+from legacy_seams import _find_compatible_seam_file as _find_seam_file, _read_legacy_seam_data
 from fix_texture_maps import flood_fill_texture_map
 
 
@@ -87,7 +88,8 @@ def _seam_ids(path: Path, vertex_count: int) -> list[list[int]]:
 
 
 def _endpoints(path: Path) -> np.ndarray:
-    _, points = _read_seam_data(path)
+    _, points = (_read_seam_data(path) if path.suffix.lower() == ".json"
+                 else _read_legacy_seam_data(path))
     if points is None:
         raise ValueError(f"Expected top and bottom XYZ coordinates at the end of {path}.")
     if np.linalg.norm(points[0] - points[1]) == 0:
@@ -592,7 +594,7 @@ def align_meshes(
     texture_path = _read_texture(material_path)
     scan_texture_path = _read_texture(input_material)
     output_material = output_path.with_suffix(".mtl")
-    output_texture = output_path.with_suffix(".png")
+    output_texture = output_path.with_suffix(".jpg")
     correspondence_path = output_path.with_name(output_path.stem + "_correspondence.csv")
     sources = {
         p.resolve() for p in (input_path, canonical_path, input_seams_path,

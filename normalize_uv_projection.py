@@ -3,15 +3,14 @@
 The top and bottom boundaries become circles of radius 0.1 centered at
 (0.9, 0.1) and (0.1, 0.9). The body boundary becomes the diamond with
 corners (0.5, 0), (1, 0.5), (0.5, 1), and (0, 0.5). Seam topology JSON
-contains six ordered boundary paths and the top and bottom center positions.
-Legacy seam CSV files are also accepted as input.
+contains six ordered boundary paths, the calyx ring, and the top and bottom
+center positions. The calyx ring maps to radius 0.05 on the bottom chart.
 Each circular chart's first seam vertex lies on the positive U axis.
 The warped texture is padded by four pixels outside the rasterized charts.
 The output OBJ has a companion <output stem>_seam_topology.json with normalized UVs.
 """
 
 import argparse
-import csv
 import json
 import math
 import shlex
@@ -27,10 +26,11 @@ from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
 from filename_fixing import _split_filename_into_apple_type_and_number
-from seam_topology import SeamTopology
+from seam_topology import SeamInfo, SeamTopology
 
 
 _SEAM_TOLERANCE = 2e-6
+_CALYX_UV_RADIUS = 0.05
 _TEXTURE_PADDING_PIXELS = 4
 _DIAMOND_CORNERS = np.array(
     [[0.5, 0.0], [1.0, 0.5], [0.5, 1.0], [0.0, 0.5]]
@@ -99,49 +99,25 @@ def _read_texture(material_path: Path) -> Path:
 
 def _read_seam_data(
     seam_path: Path,
-) -> tuple[list[tuple[list[int], np.ndarray]], np.ndarray | None]:
-    if seam_path.suffix.lower() == ".json":
-        with seam_path.open(encoding="utf-8") as seam_file:
-            topology = SeamTopology.from_dict(json.load(seam_file))
-        topology.set_boundary_paths(
-            (path["vertex_ids"], path["uv_coords"]) for path in topology.boundary_paths
-        )
-        records = [
-            (path["vertex_ids"], np.asarray(path["uv_coords"], dtype=np.float64))
-            for path in topology.boundary_paths
-        ]
+) -> tuple[list[tuple[list[int], np.ndarray]], np.ndarray]:
+    if seam_path.suffix.lower() != ".json":
+        raise ValueError(f"Expected a seam topology JSON file: {seam_path}.")
+    with seam_path.open(encoding="utf-8") as seam_file:
+        topology = SeamTopology.from_dict(json.load(seam_file))
+    topology.set_boundary_paths(
+        (path["vertex_ids"], path["uv_coords"]) for path in topology.boundary_paths
+    )
+    records = [
+        (path["vertex_ids"], np.asarray(path["uv_coords"], dtype=np.float64))
+        for path in topology.boundary_paths
+    ]
+    try:
         centers = np.asarray([topology.top_point, topology.bottom_point], dtype=np.float64)
-        if centers.shape != (2, 3) or not np.isfinite(centers).all():
-            raise ValueError(f"Expected two finite 3D center coordinates in {seam_path}.")
-        return records, centers
-    with seam_path.open(encoding="utf-8", newline="") as seam_file:
-        rows = [[entry.strip() for entry in row] for row in csv.reader(seam_file)]
-    if len(rows) not in (18, 20):
-        raise ValueError(f"Expected 18 or 20 seam CSV rows in {seam_path}, found {len(rows)}.")
-    seams = []
-    for start in range(0, 18, 3):
-        group = [row[:-1] if row and not row[-1] else row for row in rows[start:start + 3]]
-        if not group[0] or len({len(row) for row in group}) != 1:
-            raise ValueError(f"Seam rows {start + 1}-{start + 3} have inconsistent lengths.")
-        ids = [int(value) for value in group[0]]
-        if min(ids) < 0:
-            raise ValueError(f"Negative mesh vertex index in {seam_path}.")
-        points = np.column_stack((
-            np.asarray(group[1], dtype=np.float64),
-            np.asarray(group[2], dtype=np.float64),
-        ))
-        if not np.isfinite(points).all():
-            raise ValueError(f"Non-finite seam coordinates in {seam_path}.")
-        seams.append((ids, points))
-    centers = None
-    if len(rows) == 20:
-        try:
-            centers = np.asarray([[float(value) for value in row] for row in rows[18:]], dtype=np.float64)
-        except ValueError as exc:
-            raise ValueError(f"Expected two finite 3D center coordinates in {seam_path}.") from exc
-        if centers.shape != (2, 3) or not np.isfinite(centers).all():
-            raise ValueError(f"Expected two finite 3D center coordinates in {seam_path}.")
-    return seams, centers
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Expected two finite 3D center coordinates in {seam_path}.") from exc
+    if centers.shape != (2, 3) or not np.isfinite(centers).all():
+        raise ValueError(f"Expected two finite 3D center coordinates in {seam_path}.")
+    return records, centers
 
 
 def _read_seam_records(seam_path: Path) -> list[tuple[list[int], np.ndarray]]:
@@ -166,9 +142,9 @@ def _match_seam_uvs(original_uvs: np.ndarray, seams: list[np.ndarray]) -> list[n
     return seam_indices
 
 
-def _center_uv_indices(
-    lines: list[str], faces: np.ndarray, centers: np.ndarray, input_path: Path
-) -> list[np.ndarray]:
+def _vertex_geometry(
+    lines: list[str], faces: np.ndarray, input_path: Path
+) -> tuple[np.ndarray, np.ndarray]:
     vertices = []
     vertex_faces = []
     for line in lines:
@@ -188,8 +164,38 @@ def _center_uv_indices(
         raise ValueError(f"Expected finite 3D vertices in {input_path}.")
     if triangles.shape != faces.shape or triangles.min() < 0 or triangles.max() >= len(coordinates):
         raise ValueError(f"Face vertex index is out of range in {input_path}.")
+    return coordinates, triangles
+
+
+def _center_uv_indices(
+    lines: list[str], faces: np.ndarray, centers: np.ndarray, input_path: Path
+) -> list[np.ndarray]:
+    coordinates, triangles = _vertex_geometry(lines, faces, input_path)
     closest = cKDTree(coordinates).query(centers)[1]
     return [np.unique(faces[triangles == index]) for index in closest]
+
+
+def _calyx_uv_candidates(
+    lines: list[str], faces: np.ndarray, uvs: np.ndarray, calyx: SeamInfo, input_path: Path
+) -> list[np.ndarray]:
+    coordinates, triangles = _vertex_geometry(lines, faces, input_path)
+    ids = calyx.vertex_ids
+    if len(ids) < 3 or len(set(ids)) != len(ids) or len(calyx.uv_coords) != len(ids):
+        raise ValueError("The calyx seam must contain at least three distinct vertices with UV coordinates.")
+    candidates = []
+    for vertex_id, copies in zip(ids, calyx.uv_coords):
+        if not isinstance(vertex_id, int) or vertex_id < 0 or vertex_id >= len(coordinates):
+            raise ValueError(f"Invalid calyx vertex index {vertex_id} in {input_path}.")
+        saved = np.asarray(copies, dtype=np.float64)
+        if saved.ndim != 2 or saved.shape[1] != 2 or len(saved) == 0 or not np.isfinite(saved).all():
+            raise ValueError(f"Invalid calyx UV coordinates for vertex {vertex_id}.")
+        indices = np.unique(faces[triangles == vertex_id])
+        distances = np.linalg.norm(uvs[indices, None, :] - saved[None, :, :], axis=2)
+        matches = indices[np.any(distances <= _SEAM_TOLERANCE, axis=1)]
+        if len(matches) == 0:
+            raise ValueError(f"Calyx UV coordinates for vertex {vertex_id} do not match {input_path}.")
+        candidates.append(matches)
+    return candidates
 
 
 def _ordered_boundary(edges: np.ndarray) -> list[int]:
@@ -224,6 +230,7 @@ def _parameterize(
     faces: np.ndarray,
     seams: list[np.ndarray],
     center_uv_indices: list[np.ndarray],
+    calyx_uv_candidates: list[np.ndarray],
 ) -> np.ndarray:
     all_edges = np.concatenate((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
     all_edges.sort(axis=1)
@@ -322,6 +329,40 @@ def _parameterize(
                 raise ValueError("The closest center vertex must be inside its circular chart, not on its boundary.")
             fixed_indices = np.r_[boundary_array, matches]
             fixed_targets = np.vstack((target, center))
+            if chart_index == 1:
+                ring = []
+                for candidates in calyx_uv_candidates:
+                    chart_matches = candidates[labels[candidates] == chart_label]
+                    if len(chart_matches) != 1:
+                        raise ValueError("Each calyx vertex must have exactly one UV on the bottom chart.")
+                    ring.append(int(chart_matches[0]))
+                if len(set(ring)) != len(ring) or set(ring) & (boundary_set | {int(matches[0])}):
+                    raise ValueError("The calyx ring must have distinct interior UV vertices away from the center.")
+                ring_edges = edges[np.isin(edges[:, 0], ring) & np.isin(edges[:, 1], ring)]
+                ring_order = _ordered_boundary(ring_edges)
+                if set(ring_order) != set(ring):
+                    raise ValueError("Calyx vertices must form one connected ring on the bottom chart.")
+                ring_source = perturbed_uvs[ring_order]
+                ring_area = np.sum(
+                    ring_source[:, 0] * np.roll(ring_source[:, 1], -1)
+                    - ring_source[:, 1] * np.roll(ring_source[:, 0], -1)
+                )
+                lengths = np.linalg.norm(np.roll(ring_source, -1, axis=0) - ring_source, axis=1)
+                if abs(ring_area) < 1e-14 or np.any(lengths <= 1e-14):
+                    raise ValueError("The calyx ring must enclose a nonzero UV area with nonzero edges.")
+                center_source = perturbed_uvs[int(matches[0])]
+                ring_direction = ring_source[0] - center_source
+                anchor_direction = perturbed_uvs[int(seam_indices[1][0])] - center_source
+                if np.linalg.norm(ring_direction) <= 1e-14 or np.linalg.norm(anchor_direction) <= 1e-14:
+                    raise ValueError("The calyx ring and bottom boundary must be away from the bottom center.")
+                offset = (math.atan2(ring_direction[1], ring_direction[0])
+                          - math.atan2(anchor_direction[1], anchor_direction[0]))
+                angles = offset + (1 if ring_area > 0 else -1) * (
+                    np.r_[0.0, np.cumsum(lengths[:-1])] / lengths.sum() * (2 * math.pi)
+                )
+                ring_targets = center + _CALYX_UV_RADIUS * np.column_stack((np.cos(angles), np.sin(angles)))
+                fixed_indices = np.r_[fixed_indices, ring_order]
+                fixed_targets = np.vstack((fixed_targets, ring_targets))
         result[fixed_indices] = fixed_targets
         interior = np.setdiff1d(vertices, fixed_indices)
         if len(interior):
@@ -343,7 +384,7 @@ def _warp_texture(
     faces: np.ndarray,
 ) -> None:
     with Image.open(texture_path) as input_image:
-        source = np.asarray(input_image.convert("RGBA"))
+        source = np.asarray(input_image.convert("RGB"))
     height, width = source.shape[:2]
     output = np.zeros_like(source)
     covered = np.zeros((height, width), dtype=bool)
@@ -395,30 +436,26 @@ def _warp_texture(
     Image.fromarray(output).save(output_texture)
 
 
-def _find_seam_file(input_path: Path, seam_dir: Path, *, legacy_only: bool = False) -> Path:
+def _find_seam_file(input_path: Path, seam_dir: Path) -> Path:
     if not seam_dir.is_dir():
         raise NotADirectoryError(f"Seam directory not found or not a directory: {seam_dir}")
     apple = _split_filename_into_apple_type_and_number(input_path.name)
-    patterns = (("*_seam.csv", "CSV"),) if legacy_only else (
-        ("*_seam_topology.json", "topology JSON"), ("*_seam.csv", "CSV")
-    )
-    for pattern, kind in patterns:
-        matches = []
-        for candidate in seam_dir.glob(pattern):
-            if not candidate.is_file():
-                continue
-            try:
-                candidate_apple = _split_filename_into_apple_type_and_number(candidate.name)
-            except ValueError:
-                continue
-            if candidate_apple == apple:
-                matches.append(candidate)
-        if len(matches) > 1:
-            names = ", ".join(sorted(path.name for path in matches))
-            raise ValueError(f"Multiple seam {kind} files match {input_path.name} in {seam_dir}: {names}")
-        if matches:
-            return matches[0]
-    raise FileNotFoundError(f"No seam CSV found or topology JSON found for {input_path.name} in {seam_dir}.")
+    matches = []
+    for candidate in seam_dir.glob("*_seam_topology.json"):
+        if not candidate.is_file():
+            continue
+        try:
+            candidate_apple = _split_filename_into_apple_type_and_number(candidate.name)
+        except ValueError:
+            continue
+        if candidate_apple == apple:
+            matches.append(candidate)
+    if len(matches) > 1:
+        names = ", ".join(sorted(path.name for path in matches))
+        raise ValueError(f"Multiple seam topology JSON files match {input_path.name} in {seam_dir}: {names}")
+    if matches:
+        return matches[0]
+    raise FileNotFoundError(f"No seam topology JSON found for {input_path.name} in {seam_dir}.")
 
 
 def normalize_uv_projection(input_path: Path, output_path: Path, seam_path: Path) -> Path:
@@ -433,48 +470,50 @@ def normalize_uv_projection(input_path: Path, output_path: Path, seam_path: Path
     texture_path = _read_texture(material_path)
     if np.any(original_uvs < -1e-8) or np.any(original_uvs > 1.0 + 1e-8):
         raise ValueError("The input UVs must lie within the texture image; tiled UVs are not supported.")
+    with seam_path.open(encoding="utf-8") as stream:
+        topology = SeamTopology.from_dict(json.load(stream))
+    if "calyx" not in topology.seams:
+        raise ValueError(f"Seam topology {seam_path} must contain a calyx ring.")
     records, centers = _read_seam_data(seam_path)
-    if centers is None:
-        raise ValueError(f"Expected top and bottom 3D center rows in {seam_path}.")
     seams = [uv for _, uv in records]
     center_uv_indices = _center_uv_indices(lines, faces, centers, input_path)
-    normalized_uvs = _parameterize(original_uvs, faces, seams, center_uv_indices)
+    calyx_uvs = _calyx_uv_candidates(lines, faces, original_uvs, topology.seams["calyx"], input_path)
+    normalized_uvs = _parameterize(original_uvs, faces, seams, center_uv_indices, calyx_uvs)
     seam_indices = _match_seam_uvs(original_uvs, seams)
-    output_texture = output_path.with_suffix(".png")
+    output_texture = output_path.with_suffix(".jpg")
     output_material = output_path.with_suffix(".mtl")
     output_seams = output_path.with_name(output_path.stem + "_seam_topology.json")
     sources = {input_path.resolve(), seam_path.resolve(), material_path.resolve(), texture_path.resolve()}
     if any(path.resolve() in sources for path in (output_path, output_material, output_texture, output_seams)):
         raise ValueError("Output files must not overwrite the input mesh, seam, material, or texture.")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    _warp_texture(texture_path, output_texture, original_uvs, normalized_uvs, faces)
-    if seam_path.suffix.lower() == ".json":
-        with seam_path.open(encoding="utf-8") as stream:
-            topology = SeamTopology.from_dict(json.load(stream))
-        coordinates = []
-        targets = []
-        for seam in topology.seams.values():
-            for index, copies in enumerate(seam.uv_coords):
-                if copies:
-                    start = len(coordinates)
-                    coordinates.extend(copies)
-                    targets.append((seam, index, start, len(coordinates)))
-        if coordinates:
-            matched = _match_seam_uvs(original_uvs, [np.asarray(coordinates, dtype=np.float64)])[0]
-            for seam, index, start, end in targets:
-                seam.uv_coords[index] = normalized_uvs[matched[start:end]].tolist()
-    else:
-        vertices = np.asarray([
-            [float(value) for value in line.split()[1:4]]
-            for line in lines if line.split() and line.split()[0] == "v"
-        ])
-        topology = SeamTopology(
-            float(vertices[:, 1].min()), float(vertices[:, 1].max()),
-            tuple(centers[0]), tuple(centers[1]),
-        )
+    coordinates = []
+    targets = []
+    for name, seam in topology.seams.items():
+        for index, copies in enumerate(seam.uv_coords):
+            if copies:
+                if name == "calyx":
+                    saved = np.asarray(copies, dtype=np.float64)
+                    candidate_indices = calyx_uvs[index]
+                    distances = np.linalg.norm(
+                        original_uvs[candidate_indices, None, :] - saved[None, :, :], axis=2
+                    )
+                    closest = np.argmin(distances, axis=0)
+                    if np.any(distances[closest, np.arange(len(saved))] > _SEAM_TOLERANCE):
+                        raise ValueError(f"Calyx UV coordinates for vertex {seam.vertex_ids[index]} do not match {input_path}.")
+                    seam.uv_coords[index] = normalized_uvs[candidate_indices[closest]].tolist()
+                    continue
+                start = len(coordinates)
+                coordinates.extend(copies)
+                targets.append((seam, index, start, len(coordinates)))
+    if coordinates:
+        matched = _match_seam_uvs(original_uvs, [np.asarray(coordinates, dtype=np.float64)])[0]
+        for seam, index, start, end in targets:
+            seam.uv_coords[index] = normalized_uvs[matched[start:end]].tolist()
     topology.set_boundary_paths(
         (ids, normalized_uvs[indices]) for (ids, _), indices in zip(records, seam_indices)
     )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _warp_texture(texture_path, output_texture, original_uvs, normalized_uvs, faces)
     with output_seams.open("w", encoding="utf-8") as stream:
         json.dump(topology.to_dict(), stream)
     material_lines = material_path.read_text(encoding="utf-8").splitlines()
@@ -501,7 +540,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Normalize an OBJ's UV charts and texture.")
     parser.add_argument("input", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/BlenderRebaked/Envy_002_FullRes.obj", type=Path, help="Rebaked textured OBJ")
     parser.add_argument("output", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/NormalizedTexture/Envy_002_FullRes_seam.obj", type=Path, help="Output OBJ path")
-    parser.add_argument("seams", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/Parameterized", type=Path, help="Directory containing seam topology JSON or legacy seam CSV files")
+    parser.add_argument("seams", nargs="?", default="/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples/Parameterized", type=Path, help="Directory containing seam topology JSON files")
     args = parser.parse_args()
     normalize_uv_projection(args.input, args.output, args.seams)
 

@@ -6,7 +6,7 @@ Can be run either in Blender or as a standalone Python script.
 
     python bake_textures.py target.obj source_dir output/result.obj --use_smart_uv
 
-The output consists of result.obj, result.mtl, and result.png. By default the
+The output consists of result.obj, result.mtl, and result.jpg. By default the
 target's existing UV coordinates are retained; --use_smart_uv replaces them.
 The image dimensions are taken from the source texture(s). Blender must be on
 PATH, or its executable can be supplied with --blender.
@@ -151,9 +151,9 @@ def _bake_in_blender(target, source, destination, use_smart_uv,
     if not source_images:
         raise ValueError(f"Source mesh has no image texture: {source}")
 
-    outputs = {destination, destination.with_suffix(".mtl"), destination.with_suffix(".png")}
+    outputs = {destination, destination.with_suffix(".mtl"), destination.with_suffix(".jpg")}
     if outputs & protected:
-        raise ValueError("Output OBJ, MTL, and PNG must not overwrite an input mesh, material, or texture.")
+        raise ValueError("Output OBJ, MTL, and JPG must not overwrite an input mesh, material, or texture.")
 
     bpy.ops.object.select_all(action="DESELECT")
     target_obj.select_set(True)
@@ -184,8 +184,8 @@ def _bake_in_blender(target, source, destination, use_smart_uv,
     material.node_tree.links.new(texture.outputs["Color"], nodes.get("Principled BSDF").inputs["Base Color"])
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    image.filepath_raw = str(destination.with_suffix(".png"))
-    image.file_format = "PNG"
+    image.filepath_raw = str(destination.with_suffix(".jpg"))
+    image.file_format = "JPEG"
     image.save()
     source_obj.select_set(False)
     bpy.ops.wm.obj_export(filepath=str(destination), export_selected_objects=True, export_materials=True)

@@ -32,7 +32,8 @@ from seam_topology import SeamTopology
 from uv_texture import uv_texture, _find_centers
 from filename_fixing import _write_material_file, _apple_name_base, _split_filename_into_apple_type_and_number
 from fix_texture_maps import flood_fill_texture_map
-from normalize_uv_projection import _find_seam_file, _read_obj, _read_texture
+from normalize_uv_projection import _read_obj, _read_texture
+from legacy_seams import _find_compatible_seam_file as _find_seam_file
 
 from remove_calyx import patch_stem_and_ring_calyx
 

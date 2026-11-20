@@ -1,27 +1,24 @@
-"""Remove an apple calyx, close the opening, and export the removed region (MeshLib).
-
-The calyx is at the bottom (min y) of the apple and is roughly 10-20 units across. The bottom center is
-estimated from the lowest vertices near the horizontal center. The calyx region is every face connected to
-that center whose vertices lie within a circle in the x-z plane. The region is cut out, the opening is
-patched with a smooth surface (edge lengths about the mesh average), and the calyx is saved separately.
-
-Outputs: the patched mesh (output_path), <stem>_calyx.ply and <stem>_seam_topology.json next to it.
-The mesh is used as loaded; vertices are not welded."""
+"""Split a textured OBJ at its saved calyx ring and grid-patch the remaining apple."""
 
 import argparse
 import json
 import math
+import shlex
+import shutil
 from pathlib import Path
 
 import numpy as np
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
+from PIL import Image
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+from scipy.sparse.linalg import spsolve
 
 import numpy as np
 from scipy.sparse import csr_matrix
 from seam_topology import SeamInfo, SeamTopology
+from normalize_uv_projection import _calyx_uv_candidates, _read_obj, _read_texture, _vertex_geometry
 from uv_texture import _find_centers
 
 
@@ -670,81 +667,360 @@ def check_calyx_and_stem(input_path: Path, output_path: Path) -> Path:
     )
 
 
-def remove_calyx(input_path: Path, output_path: Path) -> Path:
-    """Cut the calyx out of the mesh at input_path, patch the hole, and write the result to output_path."""
+def _calyx_faces(vertices, faces, seam, bottom_point):
+    """Find the component inside the ring without relying on seam vertex order."""
+    ids = seam.vertex_ids
+    if len(ids) < 3 or len(set(ids)) != len(ids) or any(
+        not isinstance(v, int) or v < 0 or v >= len(vertices) for v in ids
+    ):
+        raise ValueError("The calyx seam must contain at least three distinct valid vertex IDs.")
+    locations = np.asarray(seam.vertex_locations, dtype=float)
+    if locations.shape != (len(ids), 3) or not np.allclose(
+        vertices[ids], locations, rtol=1e-5, atol=1e-5
+    ):
+        raise ValueError("Calyx seam vertex locations do not match the OBJ.")
+    ring_set = set(ids)
+    edges = {}
+    for face_id, face in enumerate(faces):
+        for a, b in zip(face, np.roll(face, -1)):
+            edges.setdefault(tuple(sorted((int(a), int(b)))), []).append(face_id)
+    ring_edges = {edge for edge in edges if edge[0] in ring_set and edge[1] in ring_set}
+    neighbors = {v: [] for v in ids}
+    for a, b in ring_edges:
+        neighbors[a].append(b)
+        neighbors[b].append(a)
+        if len(edges[(a, b)]) != 2:
+            raise ValueError("Every calyx ring edge must have two adjacent faces.")
+    if any(len(n) != 2 for n in neighbors.values()):
+        raise ValueError("Calyx seam vertices must form one simple mesh-edge ring.")
+    ring = [ids[0]]
+    while True:
+        choices = [v for v in neighbors[ring[-1]] if len(ring) == 1 or v != ring[-2]]
+        following = choices[0]
+        if following == ring[0]:
+            break
+        if following in ring:
+            raise ValueError("Calyx seam contains multiple or intersecting rings.")
+        ring.append(following)
+    if len(ring) != len(ids):
+        raise ValueError("Calyx seam contains multiple rings.")
+
+    adjacency = [[] for _ in faces]
+    for edge, incident in edges.items():
+        if len(incident) > 2:
+            raise ValueError(f"Non-manifold OBJ edge {edge}.")
+        if edge not in ring_edges and len(incident) == 2:
+            a, b = incident
+            adjacency[a].append(b)
+            adjacency[b].append(a)
+    center = np.asarray(bottom_point, dtype=float)
+    if center.shape != (3,) or not np.isfinite(center).all():
+        raise ValueError("The seam topology must contain a finite bottom center.")
+    candidates = np.array([v for v in np.unique(faces) if v not in ring_set])
+    if not len(candidates):
+        raise ValueError("No vertices are available inside the calyx ring.")
+    polygon = vertices[ring][:, [0, 2]]
+    max_distance = float(np.max(np.linalg.norm(vertices[ring] - center, axis=1)))
+    center_vertex = None
+    for candidate in candidates[np.argsort(np.linalg.norm(vertices[candidates] - center, axis=1))]:
+        if np.linalg.norm(vertices[candidate] - center) > max_distance + 1e-8:
+            break
+        x, z = vertices[candidate, [0, 2]]
+        is_inside = False
+        for a, b in zip(polygon, np.roll(polygon, -1, axis=0)):
+            if (a[1] > z) != (b[1] > z) and x < (b[0] - a[0]) * (z - a[1]) / (b[1] - a[1]) + a[0]:
+                is_inside = not is_inside
+        if is_inside:
+            center_vertex = int(candidate)
+            break
+    if center_vertex is None:
+        raise ValueError("No interior calyx vertex was found within the projected ring.")
+    seed = int(np.flatnonzero(np.any(faces == center_vertex, axis=1))[0])
+    inside = {seed}
+    stack = [seed]
+    while stack:
+        for neighbor in adjacency[stack.pop()]:
+            if neighbor not in inside:
+                inside.add(neighbor)
+                stack.append(neighbor)
+    if any(sum(face in inside for face in edges[edge]) != 1 for edge in ring_edges):
+        raise ValueError("Calyx ring does not separate the mesh into an inside and outside.")
+    # Match the patch winding to the removed faces.
+    for face_id in edges[tuple(sorted((ring[0], ring[1])))]:
+        if face_id in inside:
+            face = list(faces[face_id])
+            if face[(face.index(ring[0]) + 1) % 3] != ring[1]:
+                ring = [ring[0], *reversed(ring[1:])]
+            break
+    return ring, np.array(sorted(inside), dtype=int), center_vertex
+
+
+def _cross(a, b, c):
+    return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+
+
+def _grid_patch(vertices, faces, uv_faces, uvs, ring, inside, center_vertex, center):
+    """Triangulate the ring in XZ, inserting a Cartesian grid and the center."""
+    boundary = vertices[ring][:, [0, 2]]
+    scale = float(np.max(np.ptp(boundary, axis=0)))
+    if scale <= 0:
+        raise ValueError("Calyx ring has no XZ extent.")
+    tolerance = scale * scale * 1e-10
+    area = sum(_cross(np.zeros(2), boundary[i], boundary[(i + 1) % len(ring)])
+               for i in range(len(ring)))
+    if abs(area) <= tolerance:
+        raise ValueError("Calyx ring has zero projected area.")
+    sign = 1 if area > 0 else -1
+    points = list(boundary)
+    remaining = list(range(len(ring)))
+    triangles = []
+    while len(remaining) > 3:
+        for i, current in enumerate(remaining):
+            a, b, c = remaining[i - 1], current, remaining[(i + 1) % len(remaining)]
+            if sign * _cross(points[a], points[b], points[c]) <= tolerance:
+                continue
+            if any(
+                min(sign * _cross(points[a], points[b], points[p]),
+                    sign * _cross(points[b], points[c], points[p]),
+                    sign * _cross(points[c], points[a], points[p])) >= -tolerance
+                for p in remaining if p not in (a, b, c)
+            ):
+                continue
+            triangles.append((a, b, c))
+            remaining.pop(i)
+            break
+        else:
+            raise ValueError("Calyx ring is self-intersecting or cannot be triangulated in XZ.")
+    triangles.append(tuple(remaining))
+
+    center = np.asarray(center, dtype=float)
+    if center.shape != (3,) or not np.isfinite(center).all():
+        raise ValueError("Calyx ring must have a finite 3D center.")
+    spacing = float(np.max(np.abs(boundary - center[[0, 2]]))) / 4
+    if spacing <= scale * 1e-8:
+        raise ValueError("Calyx ring is too small for a grid.")
+    bucket_size = 2 * spacing
+    bucket_origin = boundary.min(axis=0)
+    buckets = {}
+    triangle_bins = {}
+    active_triangles = {}
+    next_triangle_id = 0
+
+    def add_triangle(triangle):
+        nonlocal next_triangle_id
+        triangle_id = next_triangle_id
+        next_triangle_id += 1
+        active_triangles[triangle_id] = triangle
+        coordinates = np.asarray([points[v] for v in triangle])
+        low = np.floor((coordinates.min(axis=0) - bucket_origin - scale * 1e-9) / bucket_size).astype(int)
+        high = np.floor((coordinates.max(axis=0) - bucket_origin + scale * 1e-9) / bucket_size).astype(int)
+        cells = [(x, z) for x in range(low[0], high[0] + 1) for z in range(low[1], high[1] + 1)]
+        triangle_bins[triangle_id] = cells
+        for cell in cells:
+            buckets.setdefault(cell, set()).add(triangle_id)
+
+    for triangle in triangles:
+        add_triangle(triangle)
+
+    def insert(point, required=False):
+        cell = tuple(np.floor((point - bucket_origin) / bucket_size).astype(int))
+        matches = []
+        for index in buckets.get(cell, ()):
+            a, b, c = active_triangles[index]
+            crosses = np.array([sign * _cross(points[a], points[b], point),
+                                sign * _cross(points[b], points[c], point),
+                                sign * _cross(points[c], points[a], point)])
+            if np.min(crosses) >= -tolerance:
+                matches.append((index, (a, b, c), crosses))
+        if not matches or any(
+            np.linalg.norm(point - points[v]) <= scale * 1e-9
+            for _, triangle, _ in matches for v in triangle
+        ):
+            if required:
+                raise ValueError("Calyx center must be strictly inside the projected ring.")
+            return
+        new_index = len(points)
+        replacement = []
+        for _, triangle, crosses in matches:
+            for edge in range(3):
+                if crosses[edge] > tolerance:
+                    replacement.append((triangle[edge], triangle[(edge + 1) % 3], new_index))
+        if not replacement or (required and len(matches) == 1 and np.min(matches[0][2]) <= tolerance):
+            raise ValueError("Calyx center lies on the boundary of the projected ring.")
+        for index, _, _ in matches:
+            del active_triangles[index]
+            for bucket in triangle_bins.pop(index):
+                buckets[bucket].remove(index)
+        points.append(point)
+        for triangle in replacement:
+            add_triangle(triangle)
+
+    insert(center[[0, 2]], required=True)
+    for x in range(-4, 5):
+        for z in range(-4, 5):
+            if x or z:
+                point = center[[0, 2]] + spacing * np.array([x, z])
+                edge_vectors = np.roll(boundary, -1, axis=0) - boundary
+                edge_lengths = np.sum(edge_vectors * edge_vectors, axis=1)
+                if np.any(edge_lengths <= tolerance):
+                    raise ValueError("Calyx ring has coincident projected vertices.")
+                t = np.clip(np.sum((point - boundary) * edge_vectors, axis=1) / edge_lengths, 0, 1)
+                distance = np.min(np.linalg.norm(point - boundary - t[:, None] * edge_vectors, axis=1))
+                if distance > 0.2 * spacing:
+                    insert(point)
+    triangles = list(active_triangles.values())
+
+    def unique_uv(vertex):
+        values = uvs[uv_faces[inside][faces[inside] == vertex]]
+        if not len(values) or not np.allclose(values, values[0], rtol=0, atol=2e-6):
+            raise ValueError(f"Calyx vertex {vertex} must have one UV coordinate on the calyx.")
+        return values[0]
+
+    ring_uvs = np.array([unique_uv(v) for v in ring])
+    center_uv = unique_uv(center_vertex)
+    # Harmonic interpolation preserves the boundary UVs and the original center UV.
+    fixed = np.vstack((np.column_stack((vertices[ring, 1], ring_uvs)),
+                       [float(np.mean(vertices[ring, 1])), *center_uv]))
+    adjacency = [set() for _ in points]
+    for a, b, c in triangles:
+        for v, w in ((a, b), (b, c), (c, a)):
+            adjacency[v].add(w)
+            adjacency[w].add(v)
+    n_fixed = len(fixed)
+    rows, cols, data = [], [], []
+    rhs = np.zeros((len(points) - n_fixed, 3))
+    for vertex in range(n_fixed, len(points)):
+        row = vertex - n_fixed
+        rows.append(row)
+        cols.append(row)
+        data.append(len(adjacency[vertex]))
+        for neighbor in adjacency[vertex]:
+            if neighbor < n_fixed:
+                rhs[row] += fixed[neighbor]
+            else:
+                rows.append(row)
+                cols.append(neighbor - n_fixed)
+                data.append(-1)
+    if len(rhs):
+        values = np.vstack((fixed, spsolve(coo_matrix((data, (rows, cols)),
+                                                     shape=(len(rhs), len(rhs))).tocsr(), rhs)))
+    else:
+        values = fixed
+    points = np.asarray(points)
+    patch_vertices = np.column_stack((points[:, 0], values[:, 0], points[:, 1]))
+    triangles = np.asarray(triangles, dtype=int)
+    patch_uvs = values[:, 1:]
+    uv_triangles = patch_uvs[triangles]
+    uv_a = uv_triangles[:, 1] - uv_triangles[:, 0]
+    uv_b = uv_triangles[:, 2] - uv_triangles[:, 0]
+    uv_areas = uv_a[:, 0] * uv_b[:, 1] - uv_a[:, 1] * uv_b[:, 0]
+    if not (np.all(uv_areas > 1e-14) or np.all(uv_areas < -1raise ValueError("The calyx center and ring UVs produce a degenerate or inverted grid patch.")
+    return patch_vertices, patch_uvs, triangles
+
+
+def _write_textured_obj(path, vertices, faces, uvs, uv_faces, material_name):
+    used_vertices = np.unique(faces)
+    used_uvs = np.unique(uv_faces)
+    vertex_map = np.full(len(vertices), -1, dtype=int)
+    uv_map = np.full(len(uvs), -1, dtype=int)
+    vertex_map[used_vertices] = np.arange(1, len(used_vertices) + 1)
+    uv_map[used_uvs] = np.arange(1, len(used_uvs) + 1)
+    with path.open("w", encoding="utf-8", newline="\n") as out:
+        out.write(f"mtllib {shlex.quote(path.with_suffix('.mtl').name)}\n")
+        for point in vertices[used_vertices]:
+            out.write("v " + " ".join(f"{value:.12g}" for value in point) + "\n")
+        for uv in uvs[used_uvs]:
+            out.write(f"vt {uv[0]:.12g} {uv[1]:.12g}\n")
+        out.write(f"usemtl {material_name}\n")
+        for face, uv_face in zip(faces, uv_faces):
+            out.write("f " + " ".join(f"{vertex_map[v]}/{uv_map[t]}"
+                                        for v, t in zip(face, uv_face)) + "\n")
+
+
+def remove_calyx(input_path: Path, output_path: Path, seam_path: Path | None = None) -> Path:
+    """Write the patched OBJ and a separate textured ``<output>_calyx.obj``."""
     input_path, output_path = Path(input_path), Path(output_path)
     if not input_path.exists():
         raise FileNotFoundError(f"Input mesh not found: {input_path}")
+    if input_path.suffix.lower() != ".obj" or output_path.suffix.lower() != ".obj":
+        raise ValueError("Input and output meshes must be OBJ files.")
+    seam_path = Path(seam_path) if seam_path is not None else input_path.with_name(
+        input_path.stem + "_seam_topology.json"
+    )
+    lines, uvs, uv_faces, material_path = _read_obj(input_path)
+    vertices, faces = _vertex_geometry(lines, uv_faces, input_path)
+    texture_path = _read_texture(material_path)
+    if np.any(uvs < 0) or np.any(uvs > 1):
+        raise ValueError("Tiled UV coordinates are not supported.")
+    with seam_path.open(encoding="utf-8") as stream:
+        topology = SeamTopology.from_dict(json.load(stream))
+    if "calyx" not in topology.seams:
+        raise ValueError("Seam topology must contain a calyx ring.")
+    seam = topology.seams["calyx"]
+    _calyx_uv_candidates(lines, uv_faces, uvs, seam, input_path)
+    ring, inside, center_vertex = _calyx_faces(vertices, faces, seam, topology.bottom_point)
+    patch_vertices, patch_uvs, patch_faces = _grid_patch(
+        vertices, faces, uv_faces, uvs, ring, inside, center_vertex, seam.center
+    )
+    saved_uvs = dict(zip(seam.vertex_ids, seam.uv_coords))
+    for vertex, uv in zip(ring, patch_uvs):
+        if not np.any(np.linalg.norm(np.asarray(saved_uvs[vertex]) - uv, axis=1) <= 2e-6):
+            raise ValueError(f"Saved calyx UV for vertex {vertex} does not match the calyx side of the OBJ.")
+    material_lines = material_path.read_text(encoding="utf-8").splitlines()
+    material_names = [shlex.split(line, comments=True)[1] for line in material_lines
+                      if shlex.split(line, comments=True)[:1] == ["newmtl"]]
+    material_name = material_names[0]
+    used_materials = {shlex.split(line, comments=True)[1] for line in lines
+                      if shlex.split(line, comments=True)[:1] == ["usemtl"]}
+    if used_materials != {material_name}:
+        raise ValueError("All OBJ faces must use the single diffuse material.")
+
+    calyx_path = output_path.with_name(output_path.stem + "_calyx.obj")
+    body_texture = output_path.with_suffix(texture_path.suffix)
+    calyx_texture = calyx_path.with_suffix(".png")
+    outputs = [output_path, output_path.with_suffix(".mtl"), body_texture,
+               calyx_path, calyx_path.with_suffix(".mtl"), calyx_texture]
+    sources = {p.resolve() for p in (input_path, seam_path, material_path, texture_path)}
+    if len({p.resolve() for p in outputs}) != len(outputs) or any(p.resolve() in sources for p in outputs):
+        raise ValueError("Output files must be distinct and must not overwrite input files.")
+
+    calyx_uv_faces = uv_faces[inside]
+    selected_uvs = uvs[np.unique(calyx_uv_faces)]
+    lower = selected_uvs.min(axis=0)
+    upper = selected_uvs.max(axis=0)
+    extent = float(np.max(upper - lower))
+    if extent <= 0:
+        raise ValueError("Calyx UVs have zero extent.")
+    # Eight output pixels of padding, with a uniform scale to avoid distortion.
+    side = extent * 256 / 240
+    origin = (lower + upper - side) / 2
+    cropped_uvs = (uvs - origin) / side
+    with Image.open(texture_path) as image:
+        width, height = image.size
+        transform = (side * width / 256, 0, origin[0] * width,
+                     0, side * height / 256, (1 - origin[1] - side) * height)
+        mode = "RGBA" if "A" in image.getbands() or "transparency" in image.info else "RGB"
+        cropped = image.convert(mode).transform((256, 256), Image.Transform.AFFINE, transform,
+                                                resample=Image.Resampling.BICUBIC)
+
+    keep = np.ones(len(faces), dtype=bool)
+    keep[inside] = False
+    patch_ids = np.concatenate((np.asarray(ring), np.arange(len(vertices), len(vertices) + len(patch_vertices) - len(ring))))
+    all_vertices = np.vstack((vertices, patch_vertices[len(ring):]))
+    all_uvs = np.vstack((uvs, patch_uvs))
+    body_faces = np.vstack((faces[keep], patch_ids[patch_faces]))
+    body_uv_faces = np.vstack((uv_faces[keep], len(uvs) + patch_faces))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    mesh: mm.Mesh = mm.loadMesh(str(input_path))
-    vertices = mn.getNumpyVerts(mesh)
-    top_point, bottom_point = _find_centers(input_path=input_path, vertices=vertices)
-    seam_topology = SeamTopology(
-        ymin=float(np.min(vertices[:, 1])),
-        ymax=float(np.max(vertices[:, 1])),
-        top_point=tuple(top_point),
-        bottom_point=tuple(bottom_point),
-        seams={},
-    )
-    mesh_patched = patch_stem_and_ring_calyx(
-        mesh=mesh, seam_topology=seam_topology, output_path=output_path, b_do_debug=True
-    )
-
-    calyx = mm.Mesh(mesh_patched)
-    # Create a bitset from all the vertices inside the calyx region
-    calyx_vs = mm.VertBitSet()
-    calyx_seam = seam_topology.seams.get("calyx", [])
-    for v in calyx_seam:
-        calyx_vs.add(mm.VertId(v))  
-    calyx.topology.deleteVertices(~calyx_vs)
-    calyx.pack()
-    calyx_path = output_path.with_name(output_path.stem + "_calyx" + ".ply")
-    mm.saveMesh(calyx, str(calyx_path))
-
-    # Now delete the calyx region from the original mesh
-    no_calyx = mm.Mesh(mesh_patched)
-    # Create a bitset from all the vertices not in the calyx region
-    no_calyx_vs = mm.VertBitSet()
-    calyx_seam = seam_topology.seams.get("calyx", [])
-    for v in calyx_seam:
-        calyx_vs.add(mm.VertId(v))  
-    calyx.topology.deleteVertices(~calyx_vs)
-    calyx.pack()
-    calyx_path = output_path.with_name(output_path.stem + "_calyx" + ".ply")
-    mm.saveMesh(calyx, str(calyx_path))
-
-
-    # Only fill holes created by the cut; the scan may have other boundaries (such as UV chart edges).
-    seam_points = []
-    seam_vertex_ids = []
-    settings = mm.FillHoleNicelySettings()
-    settings.triangulateOnly = False
-    settings.subdivideSettings.maxEdgeLen = 1.5 * float(mesh.averageEdgeLength())
-    settings.subdivideSettings.maxEdgeSplits = 1_000_000
-    settings.smoothCurvature = True
-    for edge in patched.topology.findHoleRepresentiveEdges():
-        point = patched.orgPnt(edge)
-        if math.hypot(point.x - bottom_point[0], point.z - bottom_point[2]) > float(seam_topology.bottom_shoulder_radius) * 1.5:
-            continue
-        ring = patched.topology.getLeftRing(edge)
-        seam_points.extend((p.x, p.y, p.z) for p in (patched.orgPnt(e) for e in ring))
-        seam_vertex_ids.extend(patched.topology.org(e).get() for e in ring)
-        mm.fillHoleNicely(patched, edge, settings)
-    if not seam_points:
-        raise ValueError("Cutting the calyx did not leave an opening to patch.")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    stem = output_path.with_suffix("")
-    mm.saveMesh(patched, str(output_path))
-    mm.saveMesh(calyx, str(stem) + "_calyx.ply")
-    calyx_seam = seam_topology.seams["calyx"]
-    calyx_seam.vertex_ids = seam_vertex_ids
-    calyx_seam.vertex_locations = seam_points
-    calyx_seam.uv_coords = []
-    with open(str(stem) + "_seam_topology.json", "w", encoding="utf-8") as handle:
-        json.dump(seam_topology.to_dict(), handle)
+    shutil.copyfile(texture_path, body_texture)
+    cropped.save(calyx_texture)
+    for path, texture in ((output_path, body_texture), (calyx_path, calyx_texture)):
+        with path.with_suffix(".mtl").open("w", encoding="utf-8", newline="\n") as stream:
+            for line in material_lines:
+                parts = shlex.split(line, comments=True)
+                stream.write(f"map_Kd {shlex.quote(texture.name)}\n" if parts[:1] == ["map_Kd"] else line + "\n")
+    _write_textured_obj(output_path, all_vertices, body_faces, all_uvs, body_uv_faces, material_name)
+    _write_textured_obj(calyx_path, vertices, faces[inside], cropped_uvs, calyx_uv_faces, material_name)
     return output_path
 
 
@@ -753,12 +1029,15 @@ def main() -> None:
     parser.add_argument("--root-dir", type=Path, default=None, help="Directory the paths are relative to")
     parser.add_argument("--input-path", type=Path, required=True, help="Apple scan mesh")
     parser.add_argument("--output-path", type=Path, required=True, help="Patched mesh to write")
+    parser.add_argument("--seam-path", type=Path, help="Calyx seam topology JSON (default: companion JSON)")
     args = parser.parse_args()
     input_path, output_path = args.input_path, args.output_path
     if args.root_dir is not None:
         input_path, output_path = args.root_dir / input_path, args.root_dir / output_path
-    remove_calyx(input_path, output_path)
-    print(f"Wrote {remove_calyx(input_path, output_path)}")
+    seam_path = args.seam_path
+    if seam_path is not None and args.root_dir is not None:
+        seam_path = args.root_dir / seam_path
+    print(f"Wrote {remove_calyx(input_path, output_path, seam_path)}")
 
 
 if __name__ == "__main__":

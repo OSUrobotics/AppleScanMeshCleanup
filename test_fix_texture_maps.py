@@ -18,7 +18,8 @@ from fix_texture_maps import (
 )
 from MeshLabCleanup import downsample_mesh
 import main
-from normalize_uv_projection import _read_obj, _read_seam_records
+from normalize_uv_projection import _read_obj
+from legacy_seams import _read_legacy_seam_data
 from seam_topology import SeamTopology
 
 
@@ -93,7 +94,7 @@ class FillTextureTests(unittest.TestCase):
 
     def test_fill_accepts_topology_json_with_legacy_equivalent_paths(self):
         topology = SeamTopology(-1, 1, (0, 1, 0), (0, -1, 0))
-        topology.set_boundary_paths(_read_seam_records(self.seams))
+        topology.set_boundary_paths(_read_legacy_seam_data(self.seams)[0])
         topology_path = self.root / "Apple1_seam_topology.json"
         topology_path.write_text(json.dumps(topology.to_dict()), encoding="utf-8")
         legacy_output = self.root / "legacy.png"
@@ -149,7 +150,7 @@ class FillTextureTests(unittest.TestCase):
 
     def test_excludes_corner_faces_from_all_seam_patches(self):
         _, uvs, faces, _ = _read_obj(self.mesh)
-        _, edges, excluded = _seam_edges(uvs, faces, _read_seam_records(self.seams))
+        _, edges, excluded = _seam_edges(uvs, faces, _read_legacy_seam_data(self.seams)[0])
         self.assertEqual(excluded, {(6, 7, 10), (9, 12, 13)})
         patches = list(_seam_patches(faces, edges, excluded))
         self.assertTrue(patches)
@@ -212,7 +213,7 @@ class FillTextureTests(unittest.TestCase):
         projected = {i: point for i, point in enumerate(long_face)}
         with (patch("fix_texture_maps._read_obj", return_value=([], source_face, faces, self.root / "mesh.mtl")),
               patch("fix_texture_maps._mesh_geometry", return_value=(vertices, faces)),
-              patch("fix_texture_maps._read_seam_records"),
+              patch("fix_texture_maps._read_legacy_seam_data", return_value=([], None)),
               patch("fix_texture_maps._seam_edges", return_value=(None, [edge], set())),
               patch("fix_texture_maps._seam_patches", return_value=[([0], {0: 0, 1: 1}, edge)]),
               patch("fix_texture_maps._project_patch", return_value=(projected, 1)),
@@ -224,7 +225,7 @@ class FillTextureTests(unittest.TestCase):
         projected = {i: point for i, point in enumerate(boundary_face)}
         with (patch("fix_texture_maps._read_obj", return_value=([], source_face, faces, self.root / "mesh.mtl")),
               patch("fix_texture_maps._mesh_geometry", return_value=(vertices, faces)),
-              patch("fix_texture_maps._read_seam_records"),
+              patch("fix_texture_maps._read_legacy_seam_data", return_value=([], None)),
               patch("fix_texture_maps._seam_edges", return_value=(None, [edge], set())),
               patch("fix_texture_maps._seam_patches", return_value=[([0], {0: 0, 1: 1}, edge)]),
               patch("fix_texture_maps._project_patch", return_value=(projected, 1)),

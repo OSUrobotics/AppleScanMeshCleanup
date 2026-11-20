@@ -11,6 +11,7 @@ import align_meshes
 import make_apple_geometry as geometry
 import normalize_uv_projection as normalization
 from normalize_uv_projection import _read_obj
+from legacy_seams import _read_legacy_seam_data
 
 
 _ENVY_NORMALIZED = Path(
@@ -270,7 +271,7 @@ class AppleGeometryUVTests(unittest.TestCase):
         _, original_uvs, original_faces, _ = _read_obj(source)
         _, normalized_uvs, normalized_faces, _ = _read_obj(normalized)
         np.testing.assert_array_equal(original_faces, normalized_faces)
-        records = normalization._read_seam_records(source_seams)
+        records = _read_legacy_seam_data(source_seams)[0]
         matches = normalization._match_seam_uvs(original_uvs, [uv for _, uv in records])
         assembly, top, bottom, side = geometry._create_apple_body(32)
         with tempfile.TemporaryDirectory() as directory:
@@ -284,8 +285,8 @@ class AppleGeometryUVTests(unittest.TestCase):
             _write_legacy_seams(scan_path, [
                 (ids, normalized_uvs[indices]) for (ids, _), indices in zip(records, matches)
             ])
-            canonical = normalization._read_seams(canonical_path)
-            scan = normalization._read_seams(scan_path)
+            canonical = [uv for _, uv in _read_legacy_seam_data(canonical_path)[0]]
+            scan = [uv for _, uv in _read_legacy_seam_data(scan_path)[0]]
 
         for index, center in enumerate(((0.9, 0.1), (0.1, 0.9))):
             with self.subTest(seam=("top", "bottom")[index]):

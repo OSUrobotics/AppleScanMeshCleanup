@@ -1,15 +1,20 @@
-import csv
 import json
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
+from PIL import Image
 
-from remove_calyx import _pack_with_seams, _patch_stem, patch_stem_and_ring_calyx, remove_calyx
+from make_apple_geometry import _BOTTOM_UV_CENTER, _create_apple
+from normalize_uv_projection import _read_obj, _vertex_geometry
+from remove_calyx import (
+    _calyx_faces, _grid_patch, _pack_with_seams, _patch_stem, patch_stem_and_ring_calyx, remove_calyx,
+)
 from seam_topology import SeamInfo, SeamTopology
 
 
@@ -61,7 +66,7 @@ class RemoveCalyxTest(unittest.TestCase):
             patch("remove_calyx._top_center", return_value=(np.array([0.1, 10, 0]), 4.0, 3.0, 0, [])) as top_center,
             patch("remove_calyx._patch_stem", side_effect=patch_stem),
         ):
-            patch_stem_and_ring_calyx(mesh, topology)
+            patch_stem_and_ring_calyx(mesh, topology, Path("unused.ply"))
 
         np.testing.assert_array_equal(bottom_center.call_args.kwargs["center"], topology.bottom_point)
         np.testing.assert_array_equal(top_center.call_args.kwargs["center"], topology.top_point)
@@ -70,7 +75,8 @@ class RemoveCalyxTest(unittest.TestCase):
         self.assertNotEqual(original_calyx_ids, topology.seams["calyx"].vertex_ids)
         self.assertEqual(topology.seams["calyx"].center, (0, -10, 0))
         self.assertAlmostEqual(topology.seams["calyx"].radius, 4.2)
-        self.assertEqual(topology.seams["stem"].center, (0.1, 10, 0))
+        np.testing.assert_allclose(topology.seams["stem"].center,
+                                   np.mean(topology.seams["stem"].vertex_locations, axis=0))
         self.assertEqual(topology.seams["stem"].radius, 1.5)
         self.assertEqual(topology.top_shoulder_radius, 4.0)
         self.assertEqual(topology.bottom_shoulder_radius, 5.0)
@@ -84,18 +90,93 @@ class RemoveCalyxTest(unittest.TestCase):
         self.assertEqual(restored.top_shoulder_radius, 4.0)
         self.assertEqual(restored.bottom_shoulder_radius, 5.0)
 
-    def test_patches_sphere_bottom(self):
+    def test_splits_textured_apple_and_fills_ring(self):
         with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp) / "sphere.obj"
-            mm.saveMesh(mn.meshFromFacesVerts(*reversed(_sphere())), str(source))
-            output = remove_calyx(source, Path(tmp) / "out.ply")
+            source = Path(tmp) / "apple.obj"
+            _create_apple(60, source)
+            source_lines, source_uvs, source_uv_faces, _ = _read_obj(source)
+            source_vertices, source_faces = _vertex_geometry(source_lines, source_uv_faces, source)
+            topology = SeamTopology.from_dict(json.loads(source.with_name("apple_seam_topology.json").read_text()))
+            ring, inside, _ = _calyx_faces(source_vertices, source_faces, topology.seams["calyx"], topology.bottom_point)
+            # Give the texture a position-dependent color to verify the crop's UV mapping.
+            y, x = np.indices((1024, 1024))
+            pixels = np.stack((x // 4, y // 4, np.full_like(x, 100)), axis=2).astype(np.uint8)
+            Image.fromarray(pixels).save(source.with_suffix(".jpg"), quality=100, subsampling=0)
+            output = remove_calyx(source, Path(tmp) / "out.obj")
 
-            patched = mm.loadMesh(str(output))
-            calyx = mm.loadMesh(str(Path(tmp) / "out_calyx.ply"))
-            self.assertEqual(patched.topology.findNumHoles(), 0)
-            self.assertGreater(calyx.topology.numValidFaces(), 0)
-            with open(Path(tmp) / "out_calyx_seam.csv") as handle:
-                self.assertGreaterEqual(len(list(csv.reader(handle))) - 1, 8)
+            def read(path):
+                lines, uvs, uv_faces, _ = _read_obj(path)
+                vertices, faces = _vertex_geometry(lines, uv_faces, path)
+                return vertices, faces, uvs, uv_faces
+
+            body_vertices, body_faces, body_uvs, body_uv_faces = read(output)
+            calyx_vertices, calyx_faces, calyx_uvs, calyx_uv_faces = read(Path(tmp) / "out_calyx.obj")
+
+            def face_coordinates(vertices, faces):
+                return {tuple(sorted(tuple(vertices[v]) for v in face)) for face in faces}
+
+            original_calyx_faces = face_coordinates(source_vertices, source_faces[inside])
+            self.assertEqual(face_coordinates(calyx_vertices, calyx_faces), original_calyx_faces)
+            self.assertFalse(original_calyx_faces & face_coordinates(body_vertices, body_faces))
+            for point in source_vertices[ring]:
+                self.assertTrue(np.any(np.all(np.isclose(body_vertices, point, atol=1e-10), axis=1)))
+                self.assertTrue(np.any(np.all(np.isclose(calyx_vertices, point, atol=1e-10), axis=1)))
+            edges = Counter(tuple(sorted((int(face[i]), int(face[(i + 1) % 3]))))
+                            for face in body_faces for i in range(3))
+            self.assertEqual(set(edges.values()), {2})
+
+            center_xz = np.asarray(topology.seams["calyx"].center)[[0, 2]]
+            center_id = np.flatnonzero(
+                np.all(np.isclose(body_vertices[:, [0, 2]], center_xz, atol=1e-10), axis=1)
+                & (body_vertices[:, 1] < 0)
+            )
+            self.assertEqual(len(center_id), 1)
+            center_uvs = body_uvs[body_uv_faces[body_faces == center_id[0]]]
+            np.testing.assert_allclose(center_uvs, np.tile(_BOTTOM_UV_CENTER, (len(center_uvs), 1)), atol=1e-8)
+            new_points = {tuple(p) for p in body_vertices} - {tuple(p) for p in source_vertices}
+            self.assertGreater(len(new_points), 1)
+            with Image.open(Path(tmp) / "out_calyx.png") as cropped, Image.open(source.with_suffix(".jpg")) as original:
+                self.assertEqual(cropped.size, (256, 256))
+                used_uvs = calyx_uvs[np.unique(calyx_uv_faces)]
+                self.assertGreaterEqual(used_uvs.min(), 8 / 256 - 1e-8)
+                self.assertLessEqual(used_uvs.max(), 1 - 8 / 256 + 1e-8)
+                for face, uv_face in zip(calyx_faces[:10], calyx_uv_faces[:10]):
+                    point = tuple(calyx_vertices[face[0]])
+                    source_vertex = np.flatnonzero(np.all(source_vertices == point, axis=1))[0]
+                    source_uv = source_uvs[source_uv_faces[source_faces == source_vertex][0]]
+                    target_uv = calyx_uvs[uv_face[0]]
+                    def sample(image, uv):
+                        return np.asarray(image.getpixel((min(image.width - 1, int(uv[0] * image.width)),
+                                                          min(image.height - 1, int((1 - uv[1]) * image.height)))))[:3]
+                    np.testing.assert_allclose(sample(cropped, target_uv), sample(original, source_uv), atol=3)
+            self.assertEqual(output.with_suffix(".jpg").read_bytes(), source.with_suffix(".jpg").read_bytes())
+
+    def test_rejects_mismatched_calyx_seam(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "apple.obj"
+            _create_apple(15, source)
+            seam_path = source.with_name("apple_seam_topology.json")
+            topology = json.loads(seam_path.read_text())
+            topology["seams"]["calyx"]["vertex_locations"][0][0] += 1
+            seam_path.write_text(json.dumps(topology))
+            with self.assertRaisesRegex(ValueError, "locations do not match"):
+                remove_calyx(source, Path(tmp) / "out.obj")
+            self.assertFalse((Path(tmp) / "out.obj").exists())
+
+    def test_grid_patch_handles_concave_ring(self):
+        xz = np.array([[0, 0], [3, 0], [3, 1], [1, 1], [1, 3], [0, 3], [.5, .5]])
+        vertices = np.column_stack((xz[:, 0], np.zeros(len(xz)), xz[:, 1]))
+        faces = np.array([[i, (i + 1) % 6, 6] for i in range(6)])
+        uvs = xz / 4
+        points, patch_uvs, triangles = _grid_patch(
+            vertices, faces, faces, uvs, list(range(6)), np.arange(6), 6, vertices[6]
+        )
+        projected = points[:, [0, 2]][triangles]
+        cross = ((projected[:, 1, 0] - projected[:, 0, 0]) * (projected[:, 2, 1] - projected[:, 0, 1])
+                 - (projected[:, 1, 1] - projected[:, 0, 1]) * (projected[:, 2, 0] - projected[:, 0, 0]))
+        self.assertTrue(np.all(cross > 0))
+        self.assertAlmostEqual(float(np.sum(cross) / 2), 5.0)
+        np.testing.assert_allclose(patch_uvs[6], uvs[6])
 
     def test_missing_input(self):
         with self.assertRaisesRegex(FileNotFoundError, "Input mesh not found"):
