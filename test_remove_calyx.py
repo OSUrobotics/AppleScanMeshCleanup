@@ -126,9 +126,10 @@ class RemoveCalyxTest(unittest.TestCase):
             self.assertEqual(set(edges.values()), {2})
 
             center_xz = np.asarray(topology.seams["calyx"].center)[[0, 2]]
+            center_y = float(np.mean(source_vertices[ring, 1])) + 2
             center_id = np.flatnonzero(
                 np.all(np.isclose(body_vertices[:, [0, 2]], center_xz, atol=1e-10), axis=1)
-                & (body_vertices[:, 1] < 0)
+                & np.isclose(body_vertices[:, 1], center_y, atol=1e-8)
             )
             self.assertEqual(len(center_id), 1)
             center_uvs = body_uvs[body_uv_faces[body_faces == center_id[0]]]
@@ -178,7 +179,7 @@ class RemoveCalyxTest(unittest.TestCase):
         self.assertAlmostEqual(float(np.sum(cross) / 2), 5.0)
         np.testing.assert_allclose(patch_uvs[6], uvs[6])
 
-    def test_patch_uses_eight_by_eight_cells_with_center(self):
+    def test_patch_uses_minimum_grid_and_parabolic_height(self):
         xz = np.array([[-4, -4], [4, -4], [4, 4], [-4, 4], [0, 0]], dtype=float)
         vertices = np.column_stack((xz[:, 0], np.zeros(len(xz)), xz[:, 1]))
         faces = np.array([[i, (i + 1) % 4, 4] for i in range(4)])
@@ -187,8 +188,42 @@ class RemoveCalyxTest(unittest.TestCase):
             vertices, faces, faces, uvs, list(range(4)), np.arange(4), 4, vertices[4]
         )
         grid = {tuple(point) for point in points[4:, [0, 2]]}
-        self.assertEqual(grid, {(x, z) for x in range(-3, 4) for z in range(-3, 4)})
+        expected = {(x * 8 / 3, z * 8 / 3) for x in range(-1, 2) for z in range(-1, 2)}
+        np.testing.assert_allclose(sorted(grid), sorted(expected))
         np.testing.assert_allclose(patch_uvs[4], uvs[4])
+        np.testing.assert_allclose(points[:4], vertices[:4])
+        self.assertAlmostEqual(points[4, 1], 2)
+        edge_point = next(point for point in points[5:] if np.allclose(point[[0, 2]], [8 / 3, 0]))
+        self.assertAlmostEqual(edge_point[1], 2 * (1 - (2 / 3) ** 2))
+        corner_point = next(point for point in points[5:] if np.allclose(point[[0, 2]], [8 / 3, 8 / 3]))
+        self.assertAlmostEqual(corner_point[1], edge_point[1])
+
+    def test_patch_preserves_nonflat_ring_and_lifts_center(self):
+        xz = np.array([[-4, -4], [4, -4], [4, 4], [-4, 4], [0, 0]], dtype=float)
+        vertices = np.column_stack((xz[:, 0], [1, 2, 3, 4, -1], xz[:, 1]))
+        faces = np.array([[i, (i + 1) % 4, 4] for i in range(4)])
+        points, _, _ = _grid_patch(
+            vertices, faces, faces, (xz + 4) / 8, list(range(4)), np.arange(4), 4, vertices[4]
+        )
+        np.testing.assert_allclose(points[:4], vertices[:4])
+        self.assertAlmostEqual(points[4, 1], 4.5)
+
+    def test_grid_size_scales_with_ring_vertex_count(self):
+        for count, expected_size in ((16, 3), (80, 4), (160, 8)):
+            with self.subTest(count=count):
+                angles = np.arange(count) * 2 * np.pi / count
+                boundary = np.column_stack((np.cos(angles), np.sin(angles)))
+                xz = np.vstack((boundary, [0, 0]))
+                vertices = np.column_stack((xz[:, 0], np.zeros(len(xz)), xz[:, 1]))
+                faces = np.array([[i, (i + 1) % count, count] for i in range(count)])
+                uvs = 0.5 + 0.4 * xz
+                points, _, _ = _grid_patch(
+                    vertices, faces, faces, uvs, list(range(count)), np.arange(count), count, vertices[count]
+                )
+                grid = points[count:, [0, 2]]
+                spacing = 2 / expected_size
+                np.testing.assert_allclose(grid / spacing, np.round(grid / spacing), atol=1e-10)
+                self.assertEqual(np.max(np.abs(np.round(grid / spacing))), expected_size // 2 - (expected_size % 2 == 0))
 
     def test_patch_avoids_uv_inversions_with_offset_center(self):
         count = 16

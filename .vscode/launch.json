@@ -5,7 +5,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug cleanup",
+            "name": "Debug cleanup (all)",
             "type": "debugpy",
             "request": "launch",
             "program": "main.py",
@@ -20,7 +20,7 @@
             ]
         },
         {
-            "name": "Debug stem removal bake",
+            "name": "Debug stem removal bake (all)",
             "type": "debugpy",
             "request": "launch",
             "program": "main.py",
@@ -36,7 +36,7 @@
             ]
         },
         {
-            "name": "Debug voxelize",
+            "name": "Debug voxelize (all)",
             "type": "debugpy",
             "request": "launch",
             "program": "main.py",
@@ -49,7 +49,7 @@
             ]
         },
         {
-            "name": "Debug parameterize",
+            "name": "Debug parameterize (all)",
             "type": "debugpy",
             "request": "launch",
             "program": "main.py",
@@ -62,7 +62,7 @@
             ]
         },
         {
-            "name": "Debug after voxelize bake",
+            "name": "Debug after voxelize bake (all)",
             "type": "debugpy",
             "request": "launch",
             "program": "main.py",
@@ -77,7 +77,7 @@
             ]
         },
         {
-            "name": "Debug downsample",
+            "name": "Debug downsample (all)",
             "type": "debugpy",
             "request": "launch",
             "program": "main.py",
@@ -90,7 +90,46 @@
             ]
         },
         {
-            "name": "Debug normalize uv projection",
+            "name": "Debug downsample fullres (all)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "internalConsole",
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "downsample_fullres"
+            ]
+        },
+        {
+            "name": "Debug downsample hires (all)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "internalConsole",
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "downsample_hires"
+            ]
+        },
+        {
+            "name": "Debug downsample lowres (all)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "internalConsole",
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "downsample_lowres"
+            ]
+        },
+        {
+            "name": "Debug normalize uv projection (all)",
             "type": "debugpy",
             "request": "launch",
             "program": "main.py",
@@ -103,7 +142,20 @@
             ]
         },
         {
-            "name": "Debug align meshes",
+            "name": "Debug remove calyx (all)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "internalConsole",
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "remove_calyx",
+            ]
+        },
+        {
+            "name": "Debug align meshes (all)",
             "type": "debugpy",
             "request": "launch",
             "program": "main.py",
@@ -118,7 +170,22 @@
             ]
         },
         {
-            "name": "Debug rename",
+            "name": "Debug check topology (all)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "internalConsole",
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--source-dir",
+                "Parameterized",
+                "--operation",
+                "check_topology"
+            ]
+        },
+        {
+            "name": "Debug rename (all)",
             "type": "debugpy",
             "request": "launch",
             "program": "main.py",
@@ -171,7 +238,7 @@
             ]
         },
         {
-            "name": "Debug remove calyx",
+            "name": "Debug remove calyx (one)",
             "type": "debugpy",
             "request": "launch",
             "program": "remove_calyx.py",

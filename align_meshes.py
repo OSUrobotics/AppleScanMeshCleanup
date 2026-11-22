@@ -2,7 +2,7 @@
 Input:
     - mesh: The input mesh to be aligned.
     - canonical_mesh: The reference canonical mesh.
-    - seam files, that define the top, bottom, and side seams of both meshes
+    - seam files defining the top, bottom, side, and calyx seams of both meshes
     - the input seam topology contains the two polar endpoint locations on the input mesh
 
 Output:
@@ -11,14 +11,14 @@ Output:
 
 Objective: The top and bottom polar vertices should go to the input
 mesh vertices closest to the endpoints in the input seam data.
-Fit the two halves separated by the midpoint along the pole axis without
-constraining the seams.
+Fit the two halves separated by the midpoint along the pole axis, pinning
+the calyx seam to the corresponding scan ring.
 
 The other objective is to minimize the distortion of the canonical mesh as it is reshaped to match the input mesh.
 
 Run with optional positional arguments:
     python align_meshes.py [input.obj [canonical.obj [output.obj]]]
-The default input is in NormalizedTexture. The output retains the canonical
+The default input is in RemoveCalyx. The output retains the canonical
 material and uses the scan texture resampled into canonical UV space.
 The companion _correspondence.csv contains zero-based
 input vertex and canonical face indices followed by three barycentric weights.
@@ -27,7 +27,9 @@ guarantee a globally optimal or intersection-free deformation.
 """
 
 import argparse
+import collections
 import csv
+import json
 import math
 import warnings
 from pathlib import Path
@@ -38,9 +40,11 @@ from scipy.sparse import coo_matrix, diags
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
+from filename_fixing import _apple_name_base
 from normalize_uv_projection import _read_obj, _read_seam_data, _read_texture, _warp_texture
-from legacy_seams import _find_compatible_seam_file as _find_seam_file, _read_legacy_seam_data
+from legacy_seams import _read_legacy_seam_data
 from fix_texture_maps import flood_fill_texture_map
+from seam_topology import SeamTopology
 
 
 def _mesh(path: Path):
@@ -68,33 +72,48 @@ def _mesh(path: Path):
     return lines, vertices, triangles, uv, uv_faces, material
 
 
-def _seam_ids(path: Path, vertex_count: int) -> list[list[int]]:
-    if path.suffix.lower() == ".json":
-        rows = [ids for ids, _ in _read_seam_data(path)[0]]
-    else:
-        with path.open(encoding="utf-8", newline="") as stream:
-            rows = [[entry.strip() for entry in row if entry.strip()] for row in csv.reader(stream)]
-        if len(rows) in (18, 20):
-            rows = [rows[i] for i in (0, 3, 6, 9, 12, 15)]
-        elif len(rows) == 10:
-            rows = [rows[i] for i in (0, 3, 6, 7, 8, 9)]
-        else:
-            raise ValueError(f"Expected 10, 18, or 20 rows in seam CSV {path}.")
-    seams = [[int(value) for value in row] for row in rows]
+def _seam_ids(seam_topology: SeamTopology, vertex_count: int) -> list[list[int]]:
+    seams = [seam.vertex_ids for seam in seam_topology.seams.values()]
     for seam in seams:
-        if len(seam) < 2 or min(seam) < 0 or max(seam) >= vertex_count:
-            raise ValueError(f"Invalid seam vertex indices in {path}.")
+        if len(seam) < 2 or min(seam) < 0:
+            raise ValueError(f"Invalid seam vertex indices in input seam topology.")
+        if max(seam) >= vertex_count:
+            raise ValueError(f"Invalid seam vertex indices in input seam topology.")
     return seams
 
 
-def _endpoints(path: Path) -> np.ndarray:
-    _, points = (_read_seam_data(path) if path.suffix.lower() == ".json"
-                 else _read_legacy_seam_data(path))
+def _endpoints(path: Path | SeamTopology) -> np.ndarray:
+    if isinstance(path, SeamTopology):
+        try:
+            points = np.asarray([path.top_point, path.bottom_point], dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Seam topology must contain two finite 3D center coordinates.") from exc
+        if points.shape != (2, 3) or not np.isfinite(points).all():
+            raise ValueError("Seam topology must contain two finite 3D center coordinates.")
+    else:
+        _, points = (_read_seam_data(path) if path.suffix.lower() == ".json"
+                     else _read_legacy_seam_data(path))
     if points is None:
         raise ValueError(f"Expected top and bottom XYZ coordinates at the end of {path}.")
     if np.linalg.norm(points[0] - points[1]) == 0:
         raise ValueError("The top and bottom endpoints must differ.")
     return points
+
+
+def _calyx_ids(seam_topology: SeamTopology, vertex_count: int) -> list[int] | None:
+    if "calyx" not in seam_topology.seams:
+        raise ValueError(f"Seam topology must contain a calyx ring.")
+    ids = seam_topology.seams["calyx"].vertex_ids
+
+    if len(ids) < 3 or min(ids) < 0 or max(ids) >= vertex_count:
+        raise ValueError(f"Invalid calyx seam vertex indices.")
+    if len(set(ids)) != len(ids):
+        # Find duplicate vertex indices in the calyx seam
+        duplicates = [item for item, count in collections.Counter(ids).items() if count > 1]
+        print(f"WARNING: Duplicate vertex indices in calyx seam: {duplicates}")
+        # Remove the duplicate vertex indices, keeping the original order
+        ids = list(dict.fromkeys(ids))  # Remove duplicates while preserving order
+    return ids
 
 
 def _chart(uv: np.ndarray) -> int:
@@ -379,7 +398,7 @@ def _refine_fit(fitted, graph, surface_points, surface_faces, locator, halves, p
     return refined
 
 
-def _seam_correspondence(source_ids, target_ids, source_points, target_points, closed):
+def _seam_correspondence(source_ids, target_ids, source_points, target_points, closed, offset=0.0):
     source = list(dict.fromkeys(source_ids))
     target = list(dict.fromkeys(target_ids))
     if closed:
@@ -395,11 +414,72 @@ def _seam_correspondence(source_ids, target_ids, source_points, target_points, c
     source_fraction = fractions(source, source_points)
     target_fraction = fractions(target, target_points)
     result = []
-    for vertex, fraction in zip(source, source_fraction):
+    for vertex, fraction in zip(source[:-1] if closed else source, source_fraction):
+        if closed:
+            fraction = (fraction + offset) % 1.0
         edge = min(int(np.searchsorted(target_fraction, fraction, side="right") - 1), len(target) - 2)
         weight = (fraction - target_fraction[edge]) / (target_fraction[edge + 1] - target_fraction[edge])
         result.append((vertex, target[edge], target[edge + 1], weight))
     return result
+
+
+def _oriented_calyx(ids, faces, mappings, direction):
+    """Order an unordered mesh-edge ring using its bottom-chart orientation."""
+    neighbors = {vertex: set() for vertex in ids}
+    for face in faces:
+        for first, second in zip(face, np.roll(face, -1)):
+            if first in neighbors and second in neighbors:
+                neighbors[first].add(int(second))
+                neighbors[second].add(int(first))
+    if all(second in neighbors[first] for first, second in zip(ids, ids[1:] + ids[:1])):
+        ring = list(ids)
+        start = ring.index(min(ring))
+        ring = ring[start:] + ring[:start]
+    else:
+        if any(len(adjacent) != 2 for adjacent in neighbors.values()):
+            raise ValueError("The calyx seam must form one simple mesh-edge ring.")
+        start = min(ids)
+        ring = [start]
+        previous, current = start, min(neighbors[start])
+        while current != start:
+            if current in ring:
+                raise ValueError("The calyx seam must form one simple mesh-edge ring.")
+            ring.append(current)
+            previous, current = current, next(vertex for vertex in neighbors[current] if vertex != previous)
+        if len(ring) != len(ids):
+            raise ValueError("The calyx seam contains multiple rings.")
+    coords = []
+    for vertex in ring:
+        coord = next((uv for chart, uv in mappings[vertex] if chart == 1), None)
+        if coord is None:
+            raise ValueError(f"Calyx seam vertex {vertex} is missing from the bottom UV chart.")
+        coords.append(coord)
+    coords = np.asarray(coords)
+    area = np.sum(coords[:, 0] * np.roll(coords[:, 1], -1)
+                  - coords[:, 1] * np.roll(coords[:, 0], -1))
+    if abs(area) < 1e-12:
+        raise ValueError("The calyx seam has zero bottom-chart UV area.")
+    if area * direction < 0:
+        ring = [ring[0], *reversed(ring[1:])]
+    return ring
+
+
+def _calyx_offset(source, target, source_uvs, target_uvs, target_points, transform):
+    center, matrix = transform
+    source_uv = next(uv for chart, uv in source_uvs[source[0]] if chart == 1)
+    anchor = center + matrix @ (source_uv - center)
+    coords = np.array([next(uv for chart, uv in target_uvs[v] if chart == 1) for v in target])
+    edges = np.roll(coords, -1, axis=0) - coords
+    lengths_sq = np.sum(edges * edges, axis=1)
+    if np.any(lengths_sq <= 1e-20):
+        raise ValueError("The calyx seam contains coincident UV vertices.")
+    fractions = np.clip(np.sum((anchor - coords) * edges, axis=1) / lengths_sq, 0, 1)
+    edge = int(np.argmin(np.sum((coords + fractions[:, None] * edges - anchor) ** 2, axis=1)))
+    positions = target_points[target]
+    lengths = np.linalg.norm(np.roll(positions, -1, axis=0) - positions, axis=1)
+    if np.any(lengths <= 0):
+        raise ValueError("The calyx seam contains coincident consecutive vertices.")
+    return float((np.sum(lengths[:edge]) + fractions[edge] * lengths[edge]) / np.sum(lengths))
 
 
 def _seam_uv_transforms(template_seams, scan_seams, template, points, canonical_uvs, scan_uvs):
@@ -559,38 +639,34 @@ def _resample_texture(
 def align_meshes(
     input_path: Path,
     output_path: Path,
+    seam_path: Path,
     canonical_path: Path,
 ) -> Path:
-    """Fit the canonical mesh to the normalized scan and write input-to-canonical correspondence."""
+    """Fit the canonical mesh using the input topology JSON in the seam directory."""
     input_path, canonical_path = Path(input_path), Path(canonical_path)
     output_path = Path(output_path)
     canonical_seams_path = canonical_path.with_name(canonical_path.stem + "_seam_topology.json")
     if not canonical_seams_path.is_file():
         canonical_seams_path = canonical_path.with_name(canonical_path.stem + "_seam.csv")
-    input_seams_path = input_path.with_name(input_path.stem + "_seam_topology.json")
-    if not input_seams_path.is_file():
-        companion_csv = input_path.with_name(input_path.stem + "_seam.csv")
-        parameterized = input_path.parent.parent / "Parameterized"
-        voxelized = input_path.parent.parent / "Voxelized"
-        if companion_csv.is_file():
-            input_seams_path = companion_csv
-        elif parameterized.is_dir():
-            exact = parameterized / (input_path.stem + "_seam_topology.json")
-            try:
-                input_seams_path = exact if exact.is_file() else _find_seam_file(input_path, parameterized)
-            except FileNotFoundError:
-                exact = voxelized / (input_path.stem + "_seam.csv")
-                input_seams_path = exact if exact.is_file() else _find_seam_file(input_path, voxelized, legacy_only=True)
-        else:
-            exact = voxelized / (input_path.stem + "_seam.csv")
-            input_seams_path = exact if exact.is_file() else _find_seam_file(input_path, voxelized, legacy_only=True)
+    apple_name = _apple_name_base(input_path.stem)
+    input_seams_path = Path(seam_path) / (f"{apple_name}_FullRes_seam_topology.json")
+    with input_seams_path.open(encoding="utf-8") as stream:
+        input_topology = SeamTopology.from_dict(json.load(stream))
+    with canonical_seams_path.open(encoding="utf-8") as stream:
+        canonical_topology = SeamTopology.from_dict(json.load(stream))
+
     _, points, faces, uv, uv_faces, input_material = _mesh(input_path)
+    input_topology.check_valid(len(points))
     lines, template, template_faces, template_uv, template_uv_faces, material_path = _mesh(canonical_path)
-    scan_seams = _seam_ids(Path(input_seams_path), len(points))
-    template_seams = _seam_ids(Path(canonical_seams_path), len(template))
+    canonical_topology.check_valid(len(template))
+    
+    scan_seams = _seam_ids(input_topology, len(points))
+    scan_calyx = _calyx_ids(input_topology, len(points))
+    template_calyx = _calyx_ids(canonical_topology, len(template))
+    template_seams = _seam_ids(canonical_topology, len(template))
     scan_seams = _oriented_seams(scan_seams, points, faces)
     template_seams = _oriented_seams(template_seams, template, template_faces)
-    endpoints = _endpoints(Path(input_seams_path))
+    endpoints = _endpoints(input_topology)
     texture_path = _read_texture(material_path)
     scan_texture_path = _read_texture(input_material)
     output_material = output_path.with_suffix(".mtl")
@@ -614,6 +690,18 @@ def align_meshes(
     uv_transforms = _seam_uv_transforms(
         template_seams, scan_seams, template, points, canonical_uvs, scan_uvs
     )
+    calyx_pair = None
+    if scan_calyx is not None and template_calyx is not None:
+        template_calyx = _oriented_calyx(template_calyx, template_faces, canonical_uvs, 1)
+        scan_calyx = _oriented_calyx(
+            scan_calyx, faces, scan_uvs, np.linalg.det(uv_transforms[1][1])
+        )
+        offset = _calyx_offset(template_calyx, scan_calyx, canonical_uvs, scan_uvs,
+                               points, uv_transforms[1])
+        calyx_pair = template_calyx, scan_calyx, offset
+    else:
+        warnings.warn("Calyx seams are unavailable in legacy CSV data; calyx matching is skipped.",
+                      stacklevel=2)
     target = np.empty_like(template)
     for index, mappings in enumerate(canonical_uvs):
         chart, coord = mappings[0]
@@ -630,6 +718,8 @@ def align_meshes(
 
     scan_tree = cKDTree(points)
     endpoint_ids = scan_tree.query(endpoints)[1]
+    if scan_calyx is not None and int(endpoint_ids[1]) in scan_calyx:
+        raise ValueError("The bottom endpoint resolves to a calyx seam vertex, not the patch center.")
     def chart_pole(chart, center):
         candidates = [
             (float(np.linalg.norm(coord - center)), index)
@@ -644,6 +734,14 @@ def align_meshes(
         top_pole: points[endpoint_ids[0]],
         bottom_pole: points[endpoint_ids[1]],
     }
+    if calyx_pair is not None:
+        source, dest, offset = calyx_pair
+        for vertex, first, second, weight in _seam_correspondence(
+            source, dest, template, points, True, offset
+        ):
+            if vertex in (top_pole, bottom_pole):
+                raise ValueError("A canonical pole cannot also lie on the calyx seam.")
+            constraints[vertex] = (1 - weight) * points[first] + weight * points[second]
 
     canonical_axis = template[bottom_pole] - template[top_pole]
     canonical_axis_length = np.linalg.norm(canonical_axis)
@@ -715,6 +813,22 @@ def align_meshes(
             weights[np.flatnonzero(face == first)[0]] = 1 - weight
             weights[np.flatnonzero(face == second)[0]] = weight
             seam_mapping.setdefault(vertex, (face_index, weights))
+    if calyx_pair is not None:
+        source, dest, offset = calyx_pair
+        for vertex, first, second, weight in _seam_correspondence(
+            dest, source, points, template, True, -offset
+        ):
+            edge = tuple(sorted((first, second)))
+            if edge not in edge_faces:
+                raise ValueError(f"Canonical calyx seam edge {edge} is not present in the mesh.")
+            face_index = edge_faces[edge]
+            weights = np.zeros(3)
+            face = template_faces[face_index]
+            weights[np.flatnonzero(face == first)[0]] = 1 - weight
+            weights[np.flatnonzero(face == second)[0]] = weight
+            if vertex in seam_mapping:
+                raise ValueError("The calyx seam overlaps another UV seam.")
+            seam_mapping[vertex] = face_index, weights
     for template_vertex, scan_vertex in (
         (top_pole, int(endpoint_ids[0])),
         (bottom_pole, int(endpoint_ids[1])),
@@ -744,8 +858,22 @@ def align_meshes(
     with output_material.open("w", encoding="utf-8", newline="\n") as stream:
         for line in material_path.read_text(encoding="utf-8").splitlines():
             stream.write(f"map_Kd {output_texture.name}\n" if line.strip().startswith("map_Kd ") else line + "\n")
+    uv_indices = {}
+    output_uvs = []
+    output_uv_faces = []
+    for face, uv_face in zip(template_faces, template_uv_faces):
+        mapped = []
+        for vertex, uv_index in zip(face, uv_face):
+            coord = template_uv[uv_index]
+            key = (int(vertex), float(coord[0]), float(coord[1]))
+            if key not in uv_indices:
+                uv_indices[key] = len(output_uvs) + 1
+                output_uvs.append(coord)
+            mapped.append(uv_indices[key])
+        output_uv_faces.append(mapped)
     with output_path.open("w", encoding="utf-8", newline="\n") as stream:
         vertex = 0
+        face_index = 0
         for line in lines:
             fields = line.split()
             if fields and fields[0] == "v":
@@ -754,11 +882,16 @@ def align_meshes(
                 vertex += 1
             elif fields and fields[0] == "mtllib":
                 stream.write(f"mtllib {output_material.name}\n")
-            elif fields and fields[0] == "vn":
+            elif fields and fields[0] in ("vt", "vn"):
                 continue
             elif fields and fields[0] == "f":
-                corners = ["/".join(corner.split("/")[:2]) for corner in fields[1:]]
+                if face_index == 0:
+                    for u, v in output_uvs:
+                        stream.write(f"vt {u:.9g} {v:.9g}\n")
+                corners = [f"{vertex_id + 1}/{uv_id}" for vertex_id, uv_id in
+                           zip(template_faces[face_index], output_uv_faces[face_index])]
                 stream.write("f " + " ".join(corners) + "\n")
+                face_index += 1
             else:
                 stream.write(line + "\n")
     with correspondence_path.open("w", encoding="utf-8", newline="") as stream:
@@ -774,11 +907,11 @@ def main() -> None:
     root = Path("/Users/cindygrimm/PycharmProjects/data/ScannedModels")
     scan = root / "ProsserEnvyApples"
     parser = argparse.ArgumentParser(description="Align a canonical apple mesh to a normalized scan.")
-    parser.add_argument("input", nargs="?", type=Path, default=scan / "NormalizedTexture/Envy_001_FullRes.obj")
+    parser.add_argument("input", nargs="?", type=Path, default=scan / "CalyxRemoved/Envy_001_FullRes.obj")
     parser.add_argument("canonical", nargs="?", type=Path, default=root / "Canonical/apple_fullres.obj")
     parser.add_argument("output", nargs="?", type=Path, default=scan / "AlignedMeshes/Envy_001_FullRes.obj")
     args = parser.parse_args()
-    align_meshes(args.input, args.output, args.canonical)
+    align_meshes(args.input, args.output, args.input.parent, args.canonical)
 
 
 if __name__ == "__main__":

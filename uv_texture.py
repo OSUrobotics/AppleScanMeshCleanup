@@ -29,6 +29,7 @@ import numpy as np
 import pymeshlab
 import trimesh
 from filename_fixing import _write_material_file, _split_filename_into_apple_type_and_number
+from obj_geometry import read_obj_geometry
 from seam_topology import SeamInfo, SeamTopology
 
 
@@ -131,7 +132,8 @@ def _export_obj_with_uv(
 
     material_path = output_path.with_suffix(".mtl")
     texture_path = output_path.with_suffix(".jpg")
-    _write_blank_texture(n_vs=len(mesh.vertices), seam_vs=seam_vs, uvs=uvs, texture_path=texture_path)
+    if seam_vs is not None:
+        _write_blank_texture(n_vs=len(mesh.vertices), seam_vs=seam_vs, uvs=uvs, texture_path=texture_path)
     _write_material_file(material_path, texture_path.name)
 
     with output_path.open("w", encoding="utf-8", newline="\n") as obj_file:
@@ -149,8 +151,12 @@ def _export_obj_with_uv(
 
 
 def _load_mesh(input_path: Path):
-    # 1. Load your cleaned, manifold apple mesh
-    mesh = trimesh.load(str(input_path), process=False)
+    if input_path.suffix.lower() == ".obj":
+        with input_path.open(encoding="utf-8") as source:
+            vertices, faces = read_obj_geometry(source, input_path)
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    else:
+        mesh = trimesh.load(str(input_path), process=False)
     print(f"Loaded mesh with {len(mesh.vertices)} vertices.")
     return mesh
 
@@ -691,90 +697,6 @@ def _parameterize_cut_mesh(
         np.asarray(output_uvs, dtype=np.float64),
     )
 
-def _search_better_top_vertex(mesh: trimesh.Trimesh, top_vertex: np.ndarray):
-    """ Search for a better top vertex in the mesh near the given top_vertex. 
-    The best vertex is one that is in the center of the lowest set of vertices near the top_vertex.
-    Find the lowest y value of the vertices in a 10 ring neighborhood around the top_vertex.
-    Find the max y and the min y of that 10 ring neighborhood.
-    Take all the vertices that are within 20% of the vertical range from the lowest y value.
-    Return the vertex that is in the center of these selected vertices. 
-    """
-    # Find the id of the vertex closest to the given top_vertex
-    top_vertex_id = np.argmin(np.linalg.norm(mesh.vertices - top_vertex, axis=1))
-    # Find the 10-ring neighborhood around the top_vertex using mesh adjacency information
-    vertex_neighbors = []
-    for _ in range(10):
-        if not vertex_neighbors:
-            vertex_neighbors = mesh.vertex_neighbors[top_vertex_id]
-        else:
-            new_neighbors = []
-            for v in vertex_neighbors:
-                new_neighbors.extend(mesh.vertex_neighbors[v])
-            vertex_neighbors = list(set(new_neighbors))
-
-    # Include the top_vertex itself in the neighborhood
-    vertex_neighbors.append(top_vertex_id)
-
-    # Get the coordinates of the 10-ring neighborhood vertices
-    neighborhood_vertices = mesh.vertices[vertex_neighbors]
-
-    # Find the lowest y value in the neighborhood
-    y_min = np.min(neighborhood_vertices[:, 1])
-    y_max = np.max(neighborhood_vertices[:, 1])
-    vertical_range = y_max - y_min
-
-    # Select vertices within 20% of the vertical range from the lowest y value
-    selected_vertices = neighborhood_vertices[neighborhood_vertices[:, 1] < y_min + 0.2 * vertical_range]
-
-    # Return the vertex in the center of the selected vertices
-    new_center = np.median(selected_vertices, axis=0)
-    for indx in range(3):
-        top_vertex[indx] = new_center[indx]
-    return top_vertex
-
-
-def _search_better_bottom_vertex(mesh: trimesh.Trimesh, bottom_vertex: np.ndarray):
-    """ Grow a 20 ring neighborhood around the bottom vertex. 
-    Find the min and max y values of those vertices.
-    Find all vertices within a distance of 1 in x and z that are also within those y bounds.
-    Calculate the median in x and z. Find the vertex that is closest to this median with the biggest y value"""
-    # Find the id of the vertex closest to the given bottom_vertex
-    bottom_vertex_id = np.argmin(np.linalg.norm(mesh.vertices - bottom_vertex, axis=1))
-    vertex_neighbors = []
-    for _ in range(20):
-        if not vertex_neighbors:
-            vertex_neighbors = mesh.vertex_neighbors[bottom_vertex_id]
-        else:
-            new_neighbors = []
-            for v in vertex_neighbors:
-                new_neighbors.extend(mesh.vertex_neighbors[v])
-            vertex_neighbors = list(set(new_neighbors))
-
-    vertex_neighbors.append(bottom_vertex_id)
-    neighborhood_vertices = mesh.vertices[vertex_neighbors]
-
-    y_min = np.min(neighborhood_vertices[:, 1])
-    y_max = np.max(neighborhood_vertices[:, 1])
-
-    candidates = neighborhood_vertices[
-        (neighborhood_vertices[:, 1] >= y_min) &
-        (neighborhood_vertices[:, 1] <= y_max) &
-        (np.abs(neighborhood_vertices[:, 0] - bottom_vertex[0]) <= .1) &
-        (np.abs(neighborhood_vertices[:, 2] - bottom_vertex[2]) <= .1)
-    ]
-
-    if len(candidates) == 0:
-        return bottom_vertex
-
-    median_xz = np.median(candidates[:, [0, 2]], axis=0)
-    best_vertex = max(
-        candidates,
-        key=lambda v: (v[1], -np.linalg.norm(v[[0, 2]] - median_xz))
-    )
-    for indx in range(3):
-        bottom_vertex[indx] = best_vertex[indx]
-    return best_vertex
-
 
 def _find_centers(input_path: Path, vertices: np.ndarray):
     apple_name, apple_number = _split_filename_into_apple_type_and_number(input_path.name)
@@ -1014,6 +936,10 @@ def uv_texture(input_path: Path, output_path: Path, seam_topology: SeamTopology)
     )
     _store_boundary_paths(seam_topology, seam_vs, seam_vs_mapped, uvs)
     _export_obj_with_uv(mesh=mesh, seam_vs=seam_vs_mapped, vmapping=vmapping, face_indices=indices, uvs=uvs, output_path=output_path)    
+
+    seam_path = output_path.with_name(output_path.stem + "_seam_topology.json")
+    n_vertices = len(mesh.vertices)
+    seam_topology.write_to_file(seam_path=seam_path, n_vertices=n_vertices)
     print(f"✓ Asset exported with manual UV seams to: {output_path}")
 
 

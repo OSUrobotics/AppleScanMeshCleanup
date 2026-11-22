@@ -12,10 +12,10 @@ calyx boundary at -85 degrees and a Cartesian grid inside that boundary.
 """
 
 import argparse
-import json
 import math
 import struct
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 import zlib
@@ -24,6 +24,8 @@ from filename_fixing import _write_material_file
 from seam_topology import SeamInfo, SeamTopology
 import numpy as np
 from scipy.spatial import Delaunay
+from MeshLabCleanup import check_topology
+from remove_calyx import _pack_with_seams
 
 
 _TEXTURE_SIZE = 1024
@@ -68,7 +70,7 @@ def _add_ring(ms: _MeshAssembly, latitude: float, n_samples: int) -> list[int]:
     first = len(ms.points)
     for i in range(n_samples):
         longitude = 2.0 * math.pi * i / n_samples
-        ms.points.append((radius * math.cos(longitude), y, -radius * math.sin(longitude)))
+        ms.points.append((radius * math.cos(longitude), y, radius * math.sin(longitude)))
     return list(range(first, first + n_samples))
 
 
@@ -91,17 +93,17 @@ def _connect_rings(
         if lower_boundary == upper_boundary:
             next_lower = lower_ring[(lower_index + 1) % lower_count]
             next_upper = upper_ring[(upper_index + 1) % upper_count]
-            ms.triangles.append((lower_vertex, next_lower, next_upper))
-            ms.triangles.append((lower_vertex, next_upper, upper_vertex))
+            ms.triangles.append((lower_vertex, next_upper, next_lower))
+            ms.triangles.append((lower_vertex, upper_vertex, next_upper))
             lower_index += 1
             upper_index += 1
         elif lower_boundary < upper_boundary:
             next_lower = lower_ring[(lower_index + 1) % lower_count]
-            ms.triangles.append((lower_vertex, next_lower, upper_vertex))
+            ms.triangles.append((lower_vertex, upper_vertex, next_lower))
             lower_index += 1
         else:
             next_upper = upper_ring[(upper_index + 1) % upper_count]
-            ms.triangles.append((lower_vertex, next_upper, upper_vertex))
+            ms.triangles.append((lower_vertex, upper_vertex, next_upper))
             upper_index += 1
 
 
@@ -137,7 +139,7 @@ def _create_apple_top(
     ms: _MeshAssembly,
     top_ring: list[int],
     n_samples: int,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Subdivide the spherical cap with rings matching the body sampling density."""
     first_face = len(ms.triangles)
     x, y, z = ms.points[top_ring[0]]
@@ -155,14 +157,14 @@ def _create_apple_top(
     pole = len(ms.points)
     ms.points.append((0.0, 0.5, 0.0))
     for i, vertex in enumerate(cap_ring):
-        ms.triangles.append((vertex, cap_ring[(i + 1) % len(cap_ring)], pole))
-    return first_face, len(ms.triangles)
+        ms.triangles.append((vertex, pole, cap_ring[(i + 1) % len(cap_ring)]))
+    return first_face, len(ms.triangles), pole
 
 
 def _create_apple_bottom(
     ms: _MeshAssembly,
     bottom_ring: list[int],
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Connect the body to the calyx ring, then fill it with a projected grid."""
     first_face = len(ms.triangles)
     boundary_edge_lengths = [
@@ -287,7 +289,7 @@ def _create_apple_bottom(
             face[1], face[2] = face[2], face[1]
         ms.triangles.append(tuple(face))
 
-    return first_face, len(ms.triangles)
+    return first_face, len(ms.triangles), south_pole
 
 
 def _circle_uv(
@@ -439,9 +441,9 @@ def _seam_boundary_records(
         return closed_ring, uvs
 
     top_side = [top_ring[0], *reversed(top_ring[1:]), top_ring[0]]
-    right_side = list(reversed(side_seam))
+    right_side = side_seam
     bottom_side = [*bottom_ring, bottom_ring[0]]
-    left_side = side_seam
+    left_side = list(reversed(side_seam))
     bottom_y = ms.points[bottom_ring[0]][1]
     top_y = ms.points[top_ring[0]][1]
 
@@ -464,13 +466,13 @@ def _seam_boundary_records(
     return records
 
 
-def _write_obj_with_uv(
+def _create_topology(
     ms: _MeshAssembly,
     top_ring: list[int],
     bottom_ring: list[int],
     side_seam: list[int],
-    top_faces: tuple[int, int],
-    bottom_faces: tuple[int, int],
+    top_faces: tuple[int, int, int],
+    bottom_faces: tuple[int, int, int],
     output_path: Path,
 ) -> None:
     top_radius = math.hypot(ms.points[top_ring[0]][0], ms.points[top_ring[0]][2])
@@ -482,25 +484,13 @@ def _write_obj_with_uv(
         raise ValueError("The bottom cap must have a calyx ring.")
     calyx_point = ms.points[ms.calyx_ring[0]]
     calyx_radius = math.hypot(calyx_point[0], calyx_point[2])
+    # Add the calyx ring to the seam topology records
     if not 0 < calyx_radius < bottom_radius or not 0 < _UV_CALYX_RADIUS < _UV_RADIUS:
         raise ValueError("The calyx radii must be positive and smaller than their bottom boundary radii.")
-    bottom_y = ms.points[bottom_ring[0]][1]
-    top_y = ms.points[top_ring[0]][1]
-    material_path = output_path.with_suffix(".mtl")
-    texture_path = output_path.with_suffix(".jpg")
     seam_path = output_path.with_name(f"{output_path.stem}_seam_topology.json")
-    lowest_y = min(point[1] for point in ms.points)
-    peak_uvs = tuple(
-        _bottom_uv(point, bottom_radius, calyx_radius)
-        for point in ms.points
-        if point[1] <= lowest_y + 1e-6
-    )
-    seam_vertices = set(top_ring) | set(bottom_ring) | set(side_seam)
-    vertex_uvs: dict[int, tuple[float, float]] = {}
-    _write_material_file(material_path, texture_path.name)
     records = _seam_boundary_records(ms, top_ring, bottom_ring, side_seam, top_radius, bottom_radius)
-    top_point = max(ms.points, key=lambda point: point[1])
-    bottom_point = min(ms.points, key=lambda point: point[1])
+    top_point = ms.points[top_faces[2]]
+    bottom_point = ms.points[bottom_faces[2]]
     topology = SeamTopology(
         ymin=bottom_point[1], ymax=top_point[1], top_point=top_point, bottom_point=bottom_point,
         top_shoulder_radius=top_radius, bottom_shoulder_radius=bottom_radius,
@@ -526,9 +516,47 @@ def _write_obj_with_uv(
         [[_bottom_uv(ms.points[vertex], bottom_radius, calyx_radius)] for vertex in ms.calyx_ring],
         bottom_point, calyx_radius,
     ))
-    with seam_path.open("w", encoding="utf-8") as seam_file:
-        json.dump(topology.to_dict(), seam_file)
+    topology.top_vertex = top_faces[2]
+    topology.bottom_vertex = bottom_faces[2]
+    topology.write_to_file(seam_path, len(ms.points))
 
+
+def _write_obj_with_uv(
+    ms: _MeshAssembly,
+    top_ring: list[int],
+    bottom_ring: list[int],
+    side_seam: list[int],
+    top_faces: tuple[int, int, int],
+    bottom_faces: tuple[int, int, int],
+    output_path: Path,
+) -> None:
+    _check_mesh_topology(ms)
+    top_radius = math.hypot(ms.points[top_ring[0]][0], ms.points[top_ring[0]][2])
+    bottom_radius = math.hypot(
+        ms.points[bottom_ring[0]][0],
+        ms.points[bottom_ring[0]][2],
+    )
+    if not ms.calyx_ring:
+        raise ValueError("The bottom cap must have a calyx ring.")
+    calyx_point = ms.points[ms.calyx_ring[0]]
+    calyx_radius = math.hypot(calyx_point[0], calyx_point[2])
+    # Add the calyx ring to the seam topology records
+    if not 0 < calyx_radius < bottom_radius or not 0 < _UV_CALYX_RADIUS < _UV_RADIUS:
+        raise ValueError("The calyx radii must be positive and smaller than their bottom boundary radii.")
+    bottom_y = ms.points[bottom_ring[0]][1]
+    top_y = ms.points[top_ring[0]][1]
+    material_path = output_path.with_suffix(".mtl")
+    texture_path = output_path.with_suffix(".jpg")
+    lowest_y = min(point[1] for point in ms.points)
+    peak_uvs = tuple(
+        _bottom_uv(point, bottom_radius, calyx_radius)
+        for point in ms.points
+        if point[1] <= lowest_y + 1e-6
+    )
+    seam_vertices = set(top_ring) | set(bottom_ring) | set(side_seam)
+    vertex_uvs: dict[int, tuple[float, float]] = {}
+    _write_material_file(material_path, texture_path.name)
+    uv_indices: dict[tuple[int, str, str], int] = {}
     with output_path.open("w", encoding="utf-8", newline="\n") as obj_file:
         obj_file.write(f"mtllib {material_path.name}\n")
         for x, y, z in ms.points:
@@ -557,9 +585,13 @@ def _write_obj_with_uv(
                 if vertex not in seam_vertices:
                     vertex_uvs.setdefault(vertex, uv)
 
-            vt_indices = [3 * face_index + corner + 1 for corner in range(3)]
-            for u, v in face_uvs:
-                obj_file.write(f"vt {u:.9g} {v:.9g}\n")
+            vt_indices = []
+            for vertex, (u, v) in zip(face, face_uvs):
+                key = (vertex, f"{u:.9g}", f"{v:.9g}")
+                if key not in uv_indices:
+                    uv_indices[key] = len(uv_indices) + 1
+                    obj_file.write(f"vt {key[1]} {key[2]}\n")
+                vt_indices.append(uv_indices[key])
             corners = " ".join(
                 f"{vertex + 1}/{vt_index}"
                 for vertex, vt_index in zip(face, vt_indices)
@@ -568,7 +600,80 @@ def _write_obj_with_uv(
     _write_texture_map(texture_path, peak_uvs, tuple(vertex_uvs.values()))
 
 
+def _compact_vertices(
+    ms: _MeshAssembly,
+    top_ring: list[int],
+    bottom_ring: list[int],
+    side_seam: list[int],
+    top_faces: tuple[int, int, int],
+    bottom_faces: tuple[int, int, int],
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    used = {vertex for face in ms.triangles for vertex in face}
+    if any(vertex < 0 or vertex >= len(ms.points) for vertex in used):
+        raise ValueError("A face references an invalid vertex.")
+    vertex_map = {old: new for new, old in enumerate(sorted(used))}
+    for vertices in (top_ring, bottom_ring, side_seam, ms.calyx_ring):
+        if any(vertex not in vertex_map for vertex in vertices):
+            raise ValueError("A seam references an unused or invalid vertex.")
+    if top_faces[2] not in vertex_map or bottom_faces[2] not in vertex_map:
+        raise ValueError("A pole references an unused or invalid vertex.")
+    ms.points = [ms.points[vertex] for vertex in sorted(used)]
+    ms.triangles = [tuple(vertex_map[vertex] for vertex in face) for face in ms.triangles]
+    for vertices in (top_ring, bottom_ring, side_seam, ms.calyx_ring):
+        vertices[:] = [vertex_map[vertex] for vertex in vertices]
+    return (
+        (top_faces[0], top_faces[1], vertex_map[top_faces[2]]),
+        (bottom_faces[0], bottom_faces[1], vertex_map[bottom_faces[2]]),
+    )
+
+
+def _check_mesh_topology(ms: _MeshAssembly) -> None:
+    used = set()
+    edges = Counter()
+    directed_edges = Counter()
+    links: dict[int, dict[int, set[int]]] = {}
+    for face in ms.triangles:
+        if len(face) != 3 or len(set(face)) != 3:
+            raise ValueError("Mesh faces must have three distinct vertices.")
+        if any(vertex < 0 or vertex >= len(ms.points) for vertex in face):
+            raise ValueError("A face references an invalid vertex.")
+        used.update(face)
+        edges.update(tuple(sorted((face[i], face[(i + 1) % 3]))) for i in range(3))
+        directed_edges.update((face[i], face[(i + 1) % 3]) for i in range(3))
+        for i, vertex in enumerate(face):
+            first, second = face[(i + 1) % 3], face[(i + 2) % 3]
+            link = links.setdefault(vertex, {})
+            link.setdefault(first, set()).add(second)
+            link.setdefault(second, set()).add(first)
+    if len(used) != len(ms.points):
+        raise ValueError("Mesh contains unused vertices.")
+    if not edges or any(count != 2 for count in edges.values()):
+        raise ValueError("Every mesh edge must have exactly two incident faces.")
+    if any(directed_edges[(a, b)] != 1 or directed_edges[(b, a)] != 1 for a, b in edges):
+        raise ValueError("Adjacent mesh faces must have consistent winding.")
+    for link in links.values():
+        visited = set()
+        pending = [next(iter(link))]
+        while pending:
+            vertex = pending.pop()
+            if vertex not in visited:
+                visited.add(vertex)
+                pending.extend(link[vertex] - visited)
+        if len(visited) != len(link):
+            raise ValueError("Mesh contains a non-manifold vertex.")
+    if len(ms.points) - len(edges) + len(ms.triangles) != 2:
+        raise ValueError("Mesh must have Euler characteristic 2.")
+    points = np.asarray(ms.points, dtype=np.float64)
+    triangles = points[np.asarray(ms.triangles)]
+    signed_volume = np.einsum(
+        "ij,ij->", triangles[:, 0], np.cross(triangles[:, 1], triangles[:, 2])
+    )
+    if signed_volume <= 0:
+        raise ValueError("Mesh faces must be oriented outward.")
+
+
 def _to_mesh(ms: _MeshAssembly) -> mm.Mesh:
+
     vertices = mm.std_vector_Vector3_float(
         [mm.Vector3f(*point) for point in ms.points]
     )
@@ -583,8 +688,14 @@ def _to_mesh(ms: _MeshAssembly) -> mm.Mesh:
 
 def _create_apple(n_samples: int, output_path: Path) -> mm.Mesh:
     ms, top_ring, bottom_ring, side_seam = _create_apple_body(n_samples)
+    side_seam.reverse()
+
     top_faces = _create_apple_top(ms, top_ring, n_samples)
     bottom_faces = _create_apple_bottom(ms, bottom_ring)
+    top_faces, bottom_faces = _compact_vertices(
+        ms, top_ring, bottom_ring, side_seam, top_faces, bottom_faces
+    )
+    _check_mesh_topology(ms)
     mesh = _to_mesh(ms)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _write_obj_with_uv(
@@ -594,8 +705,9 @@ def _create_apple(n_samples: int, output_path: Path) -> mm.Mesh:
         side_seam,
         top_faces,
         bottom_faces,
-        output_path,
+        output_path=output_path,
     )
+    _create_topology(ms, top_ring, bottom_ring, side_seam, top_faces, bottom_faces, output_path)
     return mesh
 
 
@@ -611,7 +723,8 @@ def _main(argv=None):
     output_path = Path(args.output_file)
     for n_samples, tag in ((15, "lowres"), (33, "hires"), (60, "fullres")):
         output_path_tagged = output_path.with_name(output_path.stem + f"_{tag}.obj")
-        _create_apple(n_samples=n_samples, output_path=output_path_tagged)
+        mesh = _create_apple(n_samples=n_samples, output_path=output_path_tagged)
+        check_topology(output_path_tagged, output_path_tagged, mesh=mesh)
 
 
 if __name__ == '__main__':

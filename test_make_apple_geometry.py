@@ -1,17 +1,24 @@
 import csv
+import contextlib
+import io
 import json
 import math
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import pymeshlab
+from meshlib import mrmeshpy as mm
 
 import align_meshes
 import make_apple_geometry as geometry
 import normalize_uv_projection as normalization
+from MeshLabCleanup import check_topology
 from normalize_uv_projection import _read_obj
 from legacy_seams import _read_legacy_seam_data
+from seam_topology import SeamTopology
 
 
 _ENVY_NORMALIZED = Path(
@@ -40,7 +47,7 @@ class AppleGeometryUVTests(unittest.TestCase):
         for samples in (15, 33, 60):
             with self.subTest(samples=samples):
                 assembly, _, bottom, _ = geometry._create_apple_body(samples)
-                first, last = geometry._create_apple_bottom(assembly, bottom)
+                first, last, _ = geometry._create_apple_bottom(assembly, bottom)
                 outer_radius = math.hypot(*assembly.points[bottom[0]][::2])
                 calyx_radius = math.hypot(*assembly.points[assembly.calyx_ring[0]][::2])
                 center = np.asarray(geometry._BOTTOM_UV_CENTER)
@@ -65,11 +72,13 @@ class AppleGeometryUVTests(unittest.TestCase):
 
     def test_bottom_uv_maps_calyx_ring_and_outer_boundary(self):
         assembly, top, bottom, side = geometry._create_apple_body(33)
+        side.reverse()
         top_faces = geometry._create_apple_top(assembly, top, 33)
         bottom_faces = geometry._create_apple_bottom(assembly, bottom)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "apple.obj"
             geometry._write_obj_with_uv(assembly, top, bottom, side, top_faces, bottom_faces, path)
+            geometry._create_topology(assembly, top, bottom, side, top_faces, bottom_faces, path)
             topology = json.loads(path.with_name("apple_seam_topology.json").read_text())
             lines, uvs, uv_faces, _ = _read_obj(path)
 
@@ -102,7 +111,7 @@ class AppleGeometryUVTests(unittest.TestCase):
             with self.subTest(samples=samples):
                 assembly, _, bottom, _ = geometry._create_apple_body(samples)
                 first_point = len(assembly.points)
-                first_face, last_face = geometry._create_apple_bottom(assembly, bottom)
+                first_face, last_face, _ = geometry._create_apple_bottom(assembly, bottom)
                 vertices = np.asarray(assembly.points)
                 bottom_vertices = vertices[bottom]
                 target = np.linalg.norm(
@@ -229,7 +238,7 @@ class AppleGeometryUVTests(unittest.TestCase):
                 geometry._create_apple_top(assembly, top, samples)
                 body_faces = list(assembly.triangles)
                 first_new_point = len(assembly.points)
-                first, last = geometry._create_apple_bottom(assembly, bottom)
+                first, last, _ = geometry._create_apple_bottom(assembly, bottom)
                 self.assertEqual(assembly.triangles[:first], body_faces)
                 self.assertGreater(last, first)
                 self.assertGreaterEqual(len(assembly.calyx_ring), 3)
@@ -385,7 +394,7 @@ class AppleGeometryUVTests(unittest.TestCase):
         for samples in (3, 12, 32, 64):
             with self.subTest(samples=samples):
                 assembly, top_ring, bottom_ring, _ = geometry._create_apple_body(samples)
-                first, last = geometry._create_apple_top(assembly, top_ring, samples)
+                first, last, _ = geometry._create_apple_top(assembly, top_ring, samples)
                 vertices = np.asarray(assembly.points)
                 faces = np.asarray(assembly.triangles[first:last])
                 triangles = vertices[faces]
@@ -424,11 +433,15 @@ class AppleGeometryUVTests(unittest.TestCase):
 
     def test_seam_topology_contains_body_uvs_for_each_face_corner(self):
         assembly, top_ring, bottom_ring, side_seam = geometry._create_apple_body(32)
+        side_seam.reverse()
         top_faces = geometry._create_apple_top(assembly, top_ring, 32)
         bottom_faces = geometry._create_apple_bottom(assembly, bottom_ring)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "apple.obj"
             geometry._write_obj_with_uv(
+                assembly, top_ring, bottom_ring, side_seam, top_faces, bottom_faces, path
+            )
+            geometry._create_topology(
                 assembly, top_ring, bottom_ring, side_seam, top_faces, bottom_faces, path
             )
             _, uvs, uv_faces, _ = _read_obj(path)
@@ -441,7 +454,7 @@ class AppleGeometryUVTests(unittest.TestCase):
         chart_uvs = [{}, {}]
         for chart, face_range in enumerate((top_faces, bottom_faces)):
             for face, face_uv in zip(
-                assembly.triangles[slice(*face_range)], uv_faces[slice(*face_range)]
+                assembly.triangles[slice(*face_range[:2])], uv_faces[slice(*face_range[:2])]
             ):
                 for vertex, uv_index in zip(face, face_uv):
                     chart_uvs[chart].setdefault(vertex, []).append(uvs[uv_index])
@@ -514,6 +527,140 @@ class AppleGeometryUVTests(unittest.TestCase):
         np.testing.assert_allclose(seam_uvs.sum(axis=1), 1.5, atol=1e-8)
         self.assertTrue(np.any(np.all(np.isclose(seam_uvs, [1.0, 0.5]), axis=1)))
         self.assertTrue(np.any(np.all(np.isclose(seam_uvs, [0.5, 1.0]), axis=1)))
+
+
+class AppleTopologyTests(unittest.TestCase):
+    def test_exported_mesh_and_topology(self):
+        for samples in (3, 15, 33, 60):
+            with self.subTest(samples=samples), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "apple.obj"
+                mesh = geometry._create_apple(samples, path)
+                lines, _, _, _ = _read_obj(path)
+                vertices = [line for line in lines if line.startswith("v ")]
+                faces = [
+                    [int(corner.split("/")[0]) - 1 for corner in line.split()[1:]]
+                    for line in lines if line.startswith("f ")
+                ]
+                used = {vertex for face in faces for vertex in face}
+                edges = Counter(
+                    tuple(sorted((face[i], face[(i + 1) % 3])))
+                    for face in faces for i in range(3)
+                )
+                self.assertEqual(used, set(range(len(vertices))))
+                self.assertTrue(all(count == 2 for count in edges.values()))
+                self.assertEqual(len(vertices) - len(edges) + len(faces), 2)
+                self.assertEqual(mesh.topology.numValidVerts(), len(vertices))
+                coordinates = np.asarray([[float(value) for value in line.split()[1:]] for line in vertices])
+                triangles = coordinates[np.asarray(faces)]
+                normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+                self.assertTrue(np.all(np.einsum("ij,ij->i", normals, triangles.mean(axis=1)) > 0))
+                self.assertEqual(len(mesh.topology.findHoleRepresentiveEdges()), 0)
+                self.assertEqual(len(mm.findMultipleEdges(mesh.topology)), 0)
+                duplicates = mm.std_vector_MeshBuilder_VertDuplication()
+                mm.duplicateMultiHoleVertices(mm.Mesh(mesh), 1, duplicates)
+                self.assertEqual(len(duplicates), 0)
+                topology = SeamTopology.from_dict(json.loads(
+                    path.with_name("apple_seam_topology.json").read_text()
+                ))
+                topology.check_valid(len(vertices))
+                for seam in topology.seams.values():
+                    for vertex, point in zip(seam.vertex_ids, seam.vertex_locations):
+                        np.testing.assert_allclose(
+                            [float(value) for value in vertices[vertex].split()[1:]], point, atol=1e-8
+                        )
+                self.assertEqual(topology.top_vertex, max(range(len(vertices)), key=lambda i: float(vertices[i].split()[2])))
+                self.assertEqual(topology.bottom_vertex, min(range(len(vertices)), key=lambda i: float(vertices[i].split()[2])))
+                meshes = pymeshlab.MeshSet()
+                meshes.load_new_mesh(str(path))
+                measures = meshes.get_topological_measures()
+                self.assertEqual(measures["unreferenced_vertices"], 0)
+                self.assertEqual(measures["boundary_edges"], 0)
+                self.assertEqual(measures["non_two_manifold_edges"], 0)
+                self.assertEqual(measures["non_two_manifold_vertices"], 0)
+                self.assertEqual(measures["connected_components_number"], 1)
+
+    def test_compaction_remaps_all_vertex_references(self):
+        assembly, top, bottom, side = geometry._create_apple_body(15)
+        side.reverse()
+        top_faces = geometry._create_apple_top(assembly, top, 15)
+        bottom_faces = geometry._create_apple_bottom(assembly, bottom)
+        original_points = list(assembly.points)
+        original_faces = list(assembly.triangles)
+        original_rings = [list(ring) for ring in (top, bottom, side, assembly.calyx_ring)]
+        assembly.points.insert(0, (100.0, 100.0, 100.0))
+        assembly.triangles = [tuple(vertex + 1 for vertex in face) for face in assembly.triangles]
+        for ring in (top, bottom, side, assembly.calyx_ring):
+            ring[:] = [vertex + 1 for vertex in ring]
+        remapped_top, remapped_bottom = geometry._compact_vertices(
+            assembly, top, bottom, side,
+            (top_faces[0], top_faces[1], top_faces[2] + 1),
+            (bottom_faces[0], bottom_faces[1], bottom_faces[2] + 1),
+        )
+        self.assertEqual(assembly.points, original_points)
+        self.assertEqual(assembly.triangles, original_faces)
+        self.assertEqual([top, bottom, side, assembly.calyx_ring], original_rings)
+        self.assertEqual((remapped_top, remapped_bottom), (top_faces, bottom_faces))
+        geometry._check_mesh_topology(assembly)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "apple.obj"
+            geometry._write_obj_with_uv(assembly, top, bottom, side, remapped_top, remapped_bottom, path)
+            seam_path = path.with_name("apple_seam_topology.json")
+            self.assertFalse(seam_path.exists())
+            geometry._create_topology(assembly, top, bottom, side, remapped_top, remapped_bottom, path)
+            topology = SeamTopology.from_dict(json.loads(seam_path.read_text()))
+            self.assertEqual(topology.top_vertex, top_faces[2])
+            self.assertEqual(topology.bottom_vertex, bottom_faces[2])
+            self.assertEqual(topology.seams["calyx"].vertex_ids, original_rings[3])
+
+    def test_invalid_mesh_topology_is_rejected(self):
+        assembly, top, bottom, _ = geometry._create_apple_body(15)
+        geometry._create_apple_top(assembly, top, 15)
+        geometry._create_apple_bottom(assembly, bottom)
+        assembly.points.append((100, 100, 100))
+        with self.assertRaisesRegex(ValueError, "unused vertices"):
+            geometry._check_mesh_topology(assembly)
+        assembly.points.pop()
+        face = assembly.triangles.pop()
+        with self.assertRaisesRegex(ValueError, "exactly two"):
+            geometry._check_mesh_topology(assembly)
+        assembly.triangles.extend([face, face])
+        with self.assertRaisesRegex(ValueError, "exactly two"):
+            geometry._check_mesh_topology(assembly)
+        assembly.triangles.pop()
+        a, b, c = assembly.triangles[0]
+        assembly.triangles[0] = (a, c, b)
+        with self.assertRaisesRegex(ValueError, "consistent winding"):
+            geometry._check_mesh_topology(assembly)
+        assembly.triangles[0] = (a, b, c)
+        assembly.triangles = [(a, c, b) for a, b, c in assembly.triangles]
+        with self.assertRaisesRegex(ValueError, "oriented outward"):
+            geometry._check_mesh_topology(assembly)
+
+    def test_vertex_with_disconnected_face_fans_is_rejected(self):
+        assembly = geometry._MeshAssembly(
+            points=[(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1),
+                    (-1, 0, 0), (0, -1, 0), (0, 0, -1)],
+            triangles=[
+                (0, 2, 1), (0, 1, 3), (0, 3, 2), (1, 2, 3),
+                (0, 4, 5), (0, 6, 4), (0, 5, 6), (4, 6, 5),
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "non-manifold vertex"):
+            geometry._check_mesh_topology(assembly)
+
+    def test_topology_report_uses_unsplit_mesh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "apple.obj"
+            mesh = geometry._create_apple(15, path)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                check_topology(path, path, mesh=mesh)
+            report = output.getvalue()
+            self.assertIn("Euler characteristic (V + F - E)=2", report)
+            self.assertIn("non-manifold edges=0, non-manifold vertices=0", report)
+            colored_mesh = mm.loadMesh(str(path.with_suffix(".ply")))
+            self.assertEqual(colored_mesh.topology.numValidVerts(), mesh.topology.numValidVerts())
+            self.assertEqual(len(colored_mesh.topology.findHoleRepresentiveEdges()), 0)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from scipy.sparse.linalg import lsqr
 
 from normalize_uv_projection import _match_seam_uvs, _read_obj, _read_seam_records
 from legacy_seams import _read_legacy_seam_data
+from obj_geometry import read_obj_geometry as _mesh_geometry
 
 
 _MAX_PROJECTED_EDGE_LENGTH = 0.01  # Maximum allowed projected edge length in UV space
@@ -112,29 +113,6 @@ def _seam_edges(uvs: np.ndarray, faces: np.ndarray, records):
     return labels, edges, corner_faces
 
 
-def _mesh_geometry(lines: list[str], mesh_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    vertices = []
-    faces = []
-    for line in lines:
-        parts = line.split()
-        if not parts:
-            continue
-        if parts[0] == "v":
-            vertices.append([float(value) for value in parts[1:4]])
-        elif parts[0] == "f":
-            indices = [int(corner.split("/")[0]) for corner in parts[1:]]
-            if any(index == 0 for index in indices):
-                raise ValueError(f"OBJ vertex indices cannot be zero in {mesh_path}.")
-            faces.append([index - 1 if index > 0 else len(vertices) + index for index in indices])
-    vertices = np.asarray(vertices, dtype=np.float64)
-    faces = np.asarray(faces, dtype=np.int64)
-    if vertices.ndim != 2 or vertices.shape[1] != 3 or not np.isfinite(vertices).all():
-        raise ValueError(f"Expected finite 3D vertices in {mesh_path}.")
-    if faces.ndim != 2 or faces.shape[1] != 3 or faces.min() < 0 or faces.max() >= len(vertices):
-        raise ValueError(f"Expected valid triangular vertex indices in {mesh_path}.")
-    return vertices, faces
-
-
 def _seam_patches(faces: np.ndarray, edges, excluded_faces=frozenset()):
     vertex_faces = {}
     boundary_faces = {}
@@ -178,7 +156,7 @@ def _seam_patches(faces: np.ndarray, edges, excluded_faces=frozenset()):
             destination, source = edges[index]
             selected.update(boundary_faces[tuple(sorted(source[:2]))])
         frontier_vertices = set(pins)
-        for _ in range(5):
+        for _ in range(8):
             incident = {face_id for vertex in frontier_vertices for face_id in vertex_faces[vertex]}
             new_faces = incident - selected - excluded_ids
             selected.update(new_faces)
@@ -207,7 +185,8 @@ def _project_patch(vertices, vertex_faces, uv_faces, uvs, face_ids, pins, seam, 
     edge = b - a
     cross = edge[0] * (third[1] - a[1]) - edge[1] * (third[0] - a[0])
     if abs(cross) < 1e-14:
-        raise ValueError("A target seam triangle has zero UV area.")
+        print("Degenerate UV triangle detected with vertices:", a, b, third)
+        return {}, 0.0
     orientation = -np.sign(cross) * order
 
     row_indices, column_indices, values = [], [], []
@@ -388,6 +367,8 @@ def flood_fill_texture_map(
         projected, orientation = _project_patch(
             vertices, vertex_faces, faces, uvs, face_ids, pins, seam, uv_vertices
         )
+        if projected == {}:
+            continue
         for face_id in face_ids:
             face = faces[face_id]
             target = np.array([projected[int(index)] for index in face])

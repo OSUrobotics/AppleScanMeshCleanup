@@ -14,14 +14,17 @@ Directories
    Parameterized : Derived from Voxelized by adding the cylindrical parameterization.
            - it is safe to overwrite these
    BlenderTextured : Manually Bake the texture map from the meshlabcleaned and clean up the stem texture
+   CheckTopology : Check the topology of the mesh using the seam topology.
    NormalizedTexture : Normalize UV charts and warp the rebaked texture using seams from Parameterized
    Final : Generate Hi and Low res meshees from BlenderTextured.
    """
 from MeshLabCleanup import (
+    check_topology,
     cleanup_mesh,
     downsample_mesh,
     parameterize_mesh,
     process_meshes,
+    reparameterize_and_remove_calyx,
     voxelize_mesh,
     _rename_mesh
 )
@@ -34,6 +37,8 @@ from bake_textures import (
 from align_meshes import align_meshes
 
 from normalize_uv_projection import normalize_uv_projection
+
+from remove_calyx import remove_calyx
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -48,7 +53,7 @@ MLX_SCRIPTS = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Clean up, downsample, voxelize, parameterize, bake textures, normalize UV textures, or align with canonical."
+        description="Clean up, downsample, voxelize, parameterize, parameterize fullres, bake textures, normalize UV textures, remove calyx, or align with canonical."
     )
     parser.add_argument(
         "--root-dir",
@@ -58,7 +63,7 @@ def parse_args():
     parser.add_argument(
         "--operation",
         required=True,
-        choices=(*MLX_SCRIPTS, "rename", "parameterize", "normalize_uv_projection", "bake_textures", "align_meshes", "downsample"),
+        choices=(*MLX_SCRIPTS, "rename", "parameterize", "parameterize_fullres", "normalize_uv_projection", "bake_textures", "align_meshes", "downsample", "remove_calyx", "check_topology"),
         help="Operation to run; selects the input/output directories.",
     )
     parser.add_argument(
@@ -156,9 +161,16 @@ def main():
         process_file = partial(
             parameterize_mesh,
         )
+    elif args.operation == "parameterize_fullres":
+        # The meshes labeled _voxel are parameterized with cylindrical coordinates
+        input_dir = root_dir / "FullRes"
+        output_dir = root_dir / "ParameterizedFullRes"
+        process_file = partial(
+            parameterize_mesh,
+        )
     elif args.operation == "downsample":
         # Do all three downsample operations: lowres, hires, and fullres
-        input_dir = root_dir / "BlenderRebaked"
+        input_dir = root_dir / "NormalizedTexture"
         output_dir = root_dir / "Final"
         process_file = partial(
             downsample_mesh,
@@ -170,24 +182,24 @@ def main():
         )
     elif args.operation == "downsample_lowres":
         #
-        input_dir = root_dir / "BlenderRebaked"
-        output_dir = root_dir / "Final"
+        input_dir = root_dir / "RemoveCalyx"
+        output_dir = root_dir / "LowRes"
         process_file = partial(
             downsample_mesh,
             mlx_script_paths=[MLX_SCRIPTS["downsample_lowres"]],
         )
     elif args.operation == "downsample_hires":
         #
-        input_dir = root_dir / "BlenderRebaked"
-        output_dir = root_dir / "Final"
+        input_dir = root_dir / "NormalizedTexture"
+        output_dir = root_dir / "HighRes"
         process_file = partial(
             downsample_mesh,
             mlx_script_paths=[MLX_SCRIPTS["downsample_hires"]],
         )
     elif args.operation == "downsample_fullres":
         #
-        input_dir = root_dir / "BlenderRebaked"
-        output_dir = root_dir / "Final"
+        input_dir = root_dir / "NormalizedTexture"
+        output_dir = root_dir / "FullRes"
         process_file = partial(
             downsample_mesh,
             mlx_script_paths=[MLX_SCRIPTS["downsample_fullres"]],
@@ -201,13 +213,24 @@ def main():
             normalize_uv_projection,
             seam_path=seam_dir
         )
-    elif args.operation == "align_meshes":
+    elif args.operation == "remove_calyx":
+        # The meshes with the calyx need to have it removed
         input_dir = root_dir / "NormalizedTexture"
+        output_dir = root_dir / "CalyxRemoved"
+        seam_topology_path = input_dir
+        process_file = partial(
+            remove_calyx,
+            seam_path=seam_topology_path
+        )
+    elif args.operation == "align_meshes":
+        input_dir = root_dir / "CalyxRemoved"
         output_dir = root_dir / "AlignedMeshes"
+        seam_path = root_dir / "CalyxRemoved"
 
         canonical_path = root_dir.parent / "Canonical" / f"apple_{args.canonical}.obj"
         process_file = partial(
             align_meshes,
+            seam_path=seam_path,
             canonical_path=canonical_path
         )
     elif args.operation == "rename":
@@ -219,6 +242,15 @@ def main():
             _rename_mesh,
             use_original_material_file=args.use_original_material_file,
         )
+    elif args.operation == "check_topology":
+        if not args.source_dir:
+            raise ValueError("The --source-dir must be specified for the check_topology operation.")
+        input_dir = root_dir / args.source_dir
+        output_dir = root_dir / "Check"
+        process_file = partial(
+            check_topology,
+        )
+        replace_existing = True
     elif args.operation == "bake_textures":
         if args.use_smart_uv:
             input_dir = root_dir / "BlenderStemRemoved"

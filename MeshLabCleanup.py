@@ -14,6 +14,7 @@
 
 """
 import argparse
+import csv
 import json
 import os
 from pathlib import Path
@@ -28,17 +29,97 @@ from meshlib import mrmeshnumpy as mn
 
 from MeshLibCleanup import print_mesh_topology
 
+from reconstruct_uv_by_projection import reconstruct_uv_by_projection
 from seam_topology import SeamTopology
 from uv_texture import uv_texture, _find_centers
-from filename_fixing import _write_material_file, _apple_name_base, _split_filename_into_apple_type_and_number
+from filename_fixing import _write_material_file, _apple_name_base
 from fix_texture_maps import flood_fill_texture_map
-from normalize_uv_projection import _read_obj, _read_texture
-from legacy_seams import _find_compatible_seam_file as _find_seam_file
+from normalize_uv_projection import _read_obj, _read_texture, _vertex_geometry
+from obj_geometry import read_obj_geometry
+from legacy_seams import _find_compatible_seam_file as _find_seam_file, _read_legacy_seam_data
 
-from remove_calyx import patch_stem_and_ring_calyx
+from remove_calyx import patch_stem_and_ring_calyx, remove_calyx
 
 MeshProcessor = Callable[[Path, Path], Path]
 
+
+def color_mesh_by_seams(input_path: Path, output_path: Path, *, mesh: mm.Mesh | None = None) -> None:
+    """Color the mesh based on seam topology."""
+    # Load the mesh
+    if mesh is None:
+        mesh = mm.loadMesh(str(input_path))
+
+    # Load the seam topology
+    seam_path = input_path.with_name(input_path.stem + "_seam_topology.json")
+    with seam_path.open(encoding="utf-8") as stream:
+        topology = SeamTopology.from_dict(json.load(stream))
+
+    # Color the vertices based on seams
+    vertex_colors = mm.VertColors()
+    vertex_colors.resize(mesh.points.size(), mm.Color(255, 255, 255, 255))
+    if topology.top_vertex:
+        vertex_colors[mm.VertId(topology.top_vertex)] = mm.Color(0, 255, 0, 255)  # Green for top point
+    if topology.bottom_vertex:
+        vertex_colors[mm.VertId(topology.bottom_vertex)] = mm.Color(0, 0, 255, 255)  # Blue for bottom vertex
+
+    for name, seam in topology.seams.items():
+        color = mm.Color(255, 0, 0, 255)  # Red for seam vertices
+        if name == "top":
+            color = mm.Color(0, 255, 0, 255)  # Green for top seam
+        elif name == "bottom":
+            color = mm.Color(0, 0, 255, 255)  # Blue for bottom seam
+        for vertex in seam.vertex_ids:
+            vertex_colors[mm.VertId(vertex)] = color
+
+    save_settings = mm.SaveSettings()
+    save_settings.colors = vertex_colors
+    mm.saveMesh(mesh, str(output_path), save_settings)
+
+
+def _read_mesh_no_textures(input_path: Path) -> mm.Mesh:
+    with input_path.open(encoding="utf-8") as source:
+        vertices, faces = read_obj_geometry(source, input_path, triangulate=True)
+    mesh = mn.meshFromFacesVerts(
+        faces.astype(np.int32), vertices.astype(np.float32), duplicateNonManifoldVertices=False
+    )
+    if mesh.topology.numValidFaces() != len(faces):
+        raise ValueError(f"MeshLib could not construct all OBJ faces in {input_path}.")
+    print("MeshLib valid vertex count:", mesh.topology.numValidVerts())
+    return mesh
+
+
+def make_v_mapping(source_path: Path, target_path: Path ) -> dict: 
+    """ Read in both meshes w/o texture map coordinates and use the locations to create a mapping from source vertex ids to target vertex ids based on proximity. """
+    source_mesh = _read_mesh_no_textures(source_path)
+    target_mesh = _read_mesh_no_textures(target_path)
+
+    source_vertices = np.array([source_mesh.point(v) for v in range(source_mesh.topology.numValidVerts())])
+    target_vertices = np.array([target_mesh.point(v) for v in range(target_mesh.topology.numValidVerts())])
+
+    mapping = {}
+    for i, sv in enumerate(source_vertices):
+        distances = np.linalg.norm(target_vertices - sv, axis=1)
+        mapping[i] = int(np.argmin(distances))
+    return mapping
+
+
+def check_topology(input_path: Path, output_path: Path, *, mesh: mm.Mesh | None = None) -> None:
+    """Check the topology of the mesh using the seam topology."""
+    print_mesh_topology(input_path, mesh=mesh)
+    seam_path = input_path.with_name(input_path.stem + "_seam_topology.json")
+    with seam_path.open(encoding="utf-8") as stream:
+        input_topology = SeamTopology.from_dict(json.load(stream))
+    print(f"Checking {seam_path}")
+
+    mesh = _read_mesh_no_textures(input_path)
+
+    n_vertices = mesh.topology.numValidVerts()
+
+    input_topology.check_valid(n_vertices)
+    check_path = output_path.with_name(output_path.stem + ".ply")
+    
+    color_mesh_by_seams(input_path, check_path, mesh=mesh)
+    print(f"Checked topology for {input_path}")
 
 
 def _rename_mesh(input_path: Path, output_path: Path, use_original_material_file: bool) -> None:
@@ -108,6 +189,12 @@ def _process_mesh(input_path: Path, output_path: Path, mlx_script_path: Path) ->
     ms.load_filter_script(str(mlx_script_path))
     ms.apply_filter_script()
 
+    if ms.current_mesh().has_wedge_tex_coord():
+        ms.compute_texcoord_by_function_per_wedge(
+            u0="min(1,max(0,wtu0))", v0="min(1,max(0,wtv0))",
+            u1="min(1,max(0,wtu1))", v1="min(1,max(0,wtv1))",
+            u2="min(1,max(0,wtu2))", v2="min(1,max(0,wtv2))",
+        )
     textures = ms.current_mesh().textures()
     if len(textures) > 1:
         raise ValueError(f"Expected at most one texture in {input_path}, found {len(textures)}.")
@@ -146,17 +233,23 @@ def cleanup_mesh(
     return output_path
 
 
-def _reorient_mesh(centers_path: Path, output_path: Path) -> Path:
+def _reorient_mesh(output_path: Path, seam_path: Path) -> tuple[Path, SeamTopology]:
+    with seam_path.open(encoding="utf-8") as handle:
+        seam_topology = SeamTopology.from_dict(json.load(handle))
+    centers = np.asarray([seam_topology.top_point, seam_topology.bottom_point], dtype=np.float64)
+
+    if centers.shape != (2, 3) or not np.isfinite(centers).all():
+        raise ValueError(f"Expected two finite 3D center coordinates in {seam_path}.")
+    top, bottom = centers
+
     ms = pml.MeshSet()
     ms.load_new_mesh(str(output_path))
     mesh = ms.current_mesh()
     vertices = mesh.vertex_matrix()
-    centers = _find_centers(input_path=centers_path, vertices=vertices)
-    top, bottom = (np.asarray(point, dtype=np.float64) for point in centers)
 
     axis = top - bottom
     axis_length = np.linalg.norm(axis)
-    if not np.all(np.isfinite(axis)) or axis_length == 0:
+    if not np.all(np.isfinite(axis)) or not np.isfinite(axis_length) or axis_length == 0:
         raise ValueError("Mesh endpoints must define a finite, non-zero axis.")
 
     direction = axis / axis_length
@@ -179,6 +272,11 @@ def _reorient_mesh(centers_path: Path, output_path: Path) -> Path:
     transform = np.eye(4)
     transform[:3, :3] = rotation
     transform[:3, 3] = -(rotation @ top)
+    seam_topology.transform(transform[:3, 3], rotation)
+    transformed_vertices = vertices @ rotation.T + transform[:3, 3]
+    seam_topology.ymin = float(np.min(transformed_vertices[:, 1]))
+    seam_topology.ymax = float(np.max(transformed_vertices[:, 1]))
+
     ms.apply_filter("set_matrix", transformmatrix=transform, freeze=True)
     ms.save_current_mesh(
         str(output_path),
@@ -189,7 +287,7 @@ def _reorient_mesh(centers_path: Path, output_path: Path) -> Path:
         save_wedge_texcoord=True,
         save_wedge_normal=True,
     )
-    return output_path
+    return output_path, seam_topology
 
 
 def downsample_mesh(
@@ -204,22 +302,8 @@ def downsample_mesh(
     padded_texture = input_path.with_name(input_path.stem + "_padded" + source_texture.suffix)
     if padded_texture.resolve() in {input_path.resolve(), source_material.resolve(), source_texture.resolve()}:
         raise ValueError("The padded texture must not overwrite an input file.")
-    normalized_seam = input_path.with_name(input_path.stem + "_seam_topology.json")
-    legacy_seam = input_path.with_name(input_path.stem + "_seam.csv")
-    seam_dir = input_path.parent.parent / "Parameterized"
-    if not seam_dir.is_dir():
-        seam_dir = input_path.parent.parent / "Voxelized"
-    if normalized_seam.is_file():
-        seam_path = normalized_seam
-    elif legacy_seam.is_file():
-        seam_path = legacy_seam
-    else:
-        try:
-            seam_path = _find_seam_file(input_path, seam_dir, legacy_only=seam_dir.name == "Voxelized")
-        except FileNotFoundError:
-            if seam_dir.name != "Parameterized":
-                raise
-            seam_path = _find_seam_file(input_path, input_path.parent.parent / "Voxelized", legacy_only=True)
+    
+    seam_path = input_path.with_name(input_path.stem + "_seam_topology.json")
     flood_fill_texture_map(source_texture, input_path, seam_path, padded_texture)
 
     for mlx_script_path in mlx_script_paths:
@@ -230,11 +314,7 @@ def downsample_mesh(
 
         _process_mesh(input_path, output_path, mlx_script_path)
 
-        # The centers text file is in BlenderStemRemoved
-        apple_name, apple_num = _split_filename_into_apple_type_and_number(output_path.name)
-        fname = f"{apple_name}{apple_num}.txt"
-        path_reorient = input_path.parent.parent / "BlenderStemRemoved"  / fname
-        _reorient_mesh(centers_path=path_reorient, output_path=output_path)
+        _, seam_topology = _reorient_mesh(output_path=output_path, seam_path=seam_path)
         _, _, _, material_path = _read_obj(output_path)
         texture_path = _read_texture(material_path)
         if texture_path.resolve() in {source_texture.resolve(), padded_texture.resolve()}:
@@ -254,6 +334,13 @@ def downsample_mesh(
                 img.save(texture_path)
         else:
             shutil.copyfile(padded_texture, texture_path)
+
+        # These are all invalid now
+        seam_topology.seams = {}
+        output_seam = output_path.with_name(output_path.stem + "_seam_topology.json")
+        with output_seam.open("w", encoding="utf-8", newline="") as handle:
+            json.dump(seam_topology.to_dict(), handle)
+
         print("Downsampled textured mesh topology")
         print_mesh_topology(output_path)
     return output_path
@@ -378,13 +465,12 @@ def voxelize_mesh(input_path: Path, output_path: Path) -> Path:
 
     # Write seam topology class to a JSON file
     seam_topology_path = output_path.with_name(output_path.stem + "_seam_topology.json")
-    with open(seam_topology_path, "w") as handle:
-        json.dump(seam_topology.to_dict(), handle)
+    seam_topology.write_to_file(seam_path=seam_topology_path, n_vertices=len(vertices))
 
 
 def parameterize_mesh(input_path: Path, output_path: Path) -> Path:
     print("Voxel mesh topology")
-    print_mesh_topology(input_path, b_check=True)
+    print_mesh_topology(input_path, b_check=False)
 
     seam_topology_path = input_path.with_name(input_path.stem + "_seam_topology.json")
     with open(seam_topology_path, "r") as handle:
@@ -394,7 +480,7 @@ def parameterize_mesh(input_path: Path, output_path: Path) -> Path:
     # Patch the stem connection with a ring of vertices and add a split ring around the calyx region
     # Also computes the size of the ring for the bottom part of the apple and center points
     patched_mesh = patch_stem_and_ring_calyx(
-        mesh=mesh, seam_topology=seam_topology, output_path=output_path
+        mesh=mesh, seam_topology=seam_topology, output_path=output_path, b_do_debug=False
     )
 
     # 5. Save the patched mesh
@@ -402,14 +488,66 @@ def parameterize_mesh(input_path: Path, output_path: Path) -> Path:
     save_settings = mm.SaveSettings()
     mm.saveMesh(patched_mesh, str(patch_path), save_settings)
     print("patched mesh topology")
+    n_vertices = patched_mesh.topology.numValidVerts()
+    seam_topology.write_to_file(seam_path=patch_path.with_name(patch_path.stem + "_seam_topology.json"), n_vertices=n_vertices) 
     print_mesh_topology(patch_path)
 
+    # Do the uv texture mapping and write that and the seam topology out
     uv_texture(input_path=patch_path, output_path=output_path, seam_topology=seam_topology)
+
+    mesh_check1 = mm.loadMesh(str(patch_path))
+    mesh_check2 = mm.loadMesh(str(output_path))
+
+    n_vs1 = mesh_check1.topology.numValidVerts()
+    n_vs2 = mesh_check2.topology.numValidVerts()
+    print(f"Number of vertices in the patched mesh: {n_vs1}")
+    print(f"Number of vertices in the output mesh: {n_vs2}")
+
+    verts1 = mn.getNumpyVerts(mesh_check1)
+    verts2 = mn.getNumpyVerts(mesh_check2)
+    if not np.isclose(verts1, verts2).all():
+        print("Vertex positions differ between patched mesh and output mesh.")
+        for indx in range(0, n_vs1):
+            if not np.isclose(mesh_check1.vertexMatrix()[indx], mesh_check2.vertexMatrix()[indx]).all():
+                print(f"Vertex {indx} differs: {mesh_check1.vertexMatrix()[indx]} vs {mesh_check2.vertexMatrix()[indx]}")
+
+
+def reparameterize_and_remove_calyx(input_path: Path, output_path: Path) -> Path:
+    print("Full mesh topology")
+    print_mesh_topology(input_path, b_check=False)
+
+    intermediate_path = output_path.parent / "FullResParameterize" / (output_path.stem + output_path.suffix)  
+    intermediate_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    seam_topology_path = input_path.with_name(input_path.stem + "_seam_topology.json")
+    with open(seam_topology_path, "r") as handle:
+        seam_topology = SeamTopology.from_dict(json.load(handle))
+
+    lines, _, uv_faces, _ = _read_obj(input_path)
+    vertices, faces = _vertex_geometry(lines, uv_faces, input_path)
+    mesh = mn.meshFromFacesVerts(
+        faces.astype(np.int32), vertices.astype(np.float32), duplicateNonManifoldVertices=False
+    )
+    # Patch the stem connection with a ring of vertices and add a split ring around the calyx region
+    # Also computes the size of the ring for the bottom part of the apple and center points
+    patched_mesh = patch_stem_and_ring_calyx(
+        mesh=mesh, seam_topology=seam_topology, output_path=intermediate_path, b_do_debug=True
+    )
+
+    # 5. Save the patched mesh
+    reconstruct_uv_by_projection(source_mesh=input_path,
+                                 target_mesh=patched_mesh,
+                                 seam_topology=seam_topology,
+                                 output_path=intermediate_path)
     
     # Write seam topology class to a JSON file
-    seam_topology_path = output_path.with_name(output_path.stem + "_seam_topology.json")
+    seam_topology_path = intermediate_path.with_name(intermediate_path.stem + "_seam_topology.json")
     with open(seam_topology_path, "w") as handle:
         json.dump(seam_topology.to_dict(), handle)
+
+    # Now read back in and do the remove calyx
+    remove_calyx(input_path=intermediate_path, output_path=output_path, seam_path=intermediate_path.parent)
+    return output_path
 
 
 def process_meshes(

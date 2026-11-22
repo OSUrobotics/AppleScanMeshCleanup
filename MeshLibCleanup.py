@@ -5,9 +5,10 @@ from pathlib import Path
 from meshlib import mrmeshpy as mm
 
 
-def print_mesh_topology(mesh_path: str | Path, b_check = False) -> int:
+def print_mesh_topology(mesh_path: str | Path, b_check = False, *, mesh: mm.Mesh | None = None) -> int:
     """Print vertex, face, edge counts and the Euler characteristic."""
-    mesh = mm.loadMesh(str(mesh_path))
+    if mesh is None:
+        mesh = mm.loadMesh(str(mesh_path))
     topology = mesh.topology
     vertices = topology.numValidVerts()
     faces = topology.numValidFaces()

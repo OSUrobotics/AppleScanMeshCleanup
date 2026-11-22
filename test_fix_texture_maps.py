@@ -298,13 +298,17 @@ class FillTextureTests(unittest.TestCase):
             Image.new("RGB", (16, 16), (12, 34, 56)).save(output)
         with (patch("MeshLabCleanup._find_seam_file", return_value=self.seams),
               patch("MeshLabCleanup._process_mesh") as process,
-              patch("MeshLabCleanup._reorient_mesh"),
+              patch("MeshLabCleanup._reorient_mesh") as reorient,
               patch("MeshLabCleanup._read_obj", side_effect=read_obj),
               patch("MeshLabCleanup._read_texture", side_effect=read_texture),
               patch("MeshLabCleanup.flood_fill_texture_map", side_effect=fill_texture) as fill,
               patch("MeshLabCleanup.print_mesh_topology")):
             downsample_mesh(source, destination, scripts)
         self.assertEqual(process.call_count, 3)
+        self.assertEqual(
+            [call.kwargs["seam_path"] for call in reorient.call_args_list],
+            [self.seams] * 3,
+        )
         fill.assert_called_once_with(self.texture, source, self.seams, padded)
         with Image.open(output_textures[0]) as lowres:
             self.assertEqual(lowres.size, (4, 4))

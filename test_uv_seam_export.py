@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest.mock import patch
 
@@ -164,6 +165,84 @@ class UVSeamExportTests(unittest.TestCase):
         np.testing.assert_array_equal(top, [0, 0, 0])
         np.testing.assert_array_equal(bottom, [0, -2, 0])
         self.assertIs(oriented, mesh)
+
+    def test_load_obj_preserves_unused_vertices_and_negative_indices_with_normals(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "mesh.obj"
+            path.write_text(
+                "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 9 9 9\n"
+                "vn 0 0 1\nvn 0 0 -1\n"
+                "f -4//1 -3//1 -2//1 # first face\n"
+                "f 1//2 3//2 2//2\n",
+                encoding="utf-8",
+            )
+            mesh = _load_mesh(path)
+        np.testing.assert_array_equal(mesh.vertices, [[0, 0, 0], [1, 0, 0], [0, 1, 0], [9, 9, 9]])
+        np.testing.assert_array_equal(mesh.faces, [[0, 1, 2], [0, 2, 1]])
+
+    def test_textured_obj_round_trip_preserves_geometry_and_seam_indices(self):
+        vertices = [[0, 2, 0], [0, -2, 0]]
+        for y in (1, -1):
+            vertices.extend([[1, y, 0], [0, y, 1], [-1, y, 0], [0, y, -1]])
+        vertices.append([9, 9, 9])
+        faces = []
+        for i in range(4):
+            a, b = 2 + i, 2 + (i + 1) % 4
+            c, d = 6 + i, 6 + (i + 1) % 4
+            faces.extend([[0, b, a], [1, c, d], [a, b, c], [b, d, c]])
+        top, bottom = [2, 3, 4, 5, 2], [6, 7, 8, 9, 6]
+        topology = SeamTopology(
+            -2, 2, (0, 2, 0), (0, -2, 0), {},
+            top_shoulder_radius=2.5, bottom_shoulder_radius=3.5,
+        )
+        for name, ids in (("stem", [0]), ("calyx", [1])):
+            topology.add_seam(name, SeamInfo(
+                name, ids, [vertices[index] for index in ids], [], (0, 0, 0), 1
+            ))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            input_path = Path(temporary) / "input.obj"
+            output_path = Path(temporary) / "output.obj"
+            lines = ["v " + " ".join(map(str, vertex)) for vertex in vertices]
+            lines.extend(["vt 0 0", "vt 1 1"])
+            lines.extend(
+                "f " + " ".join(f"{vertex + 1}/{1 + (face_index % 2)}" for vertex in face)
+                for face_index, face in enumerate(faces)
+            )
+            input_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            with (
+                patch("uv_texture._define_seam", side_effect=[
+                    (top, list(zip(top[:-1], top[1:])), 2.5),
+                    (bottom, list(zip(bottom[:-1], bottom[1:])), 3.5),
+                ]),
+                patch("uv_texture._side_seam", return_value=([2, 6], [(2, 6)])),
+                patch("uv_texture._write_seam_mesh"),
+                patch.object(topology, "check_valid"),
+            ):
+                uv_texture(input_path, output_path, topology)
+
+            obj_lines = output_path.read_text(encoding="utf-8").splitlines()
+            obj_vertices = [list(map(float, line.split()[1:])) for line in obj_lines if line.startswith("v ")]
+            obj_uvs = [list(map(float, line.split()[1:])) for line in obj_lines if line.startswith("vt ")]
+            obj_faces = []
+            by_vertex = {}
+            for line in obj_lines:
+                if line.startswith("f "):
+                    corners = [tuple(int(value) - 1 for value in corner.split("/")) for corner in line.split()[1:]]
+                    obj_faces.append(tuple(vertex for vertex, _ in corners))
+                    for vertex, uv in corners:
+                        by_vertex.setdefault(vertex, set()).add(uv)
+            np.testing.assert_array_equal(obj_vertices, vertices)
+            self.assertEqual(Counter(obj_faces), Counter(map(tuple, faces)))
+            saved = json.loads(output_path.with_name("output_seam_topology.json").read_text())
+            for seam in saved["seams"].values():
+                self.assertEqual(len(seam["vertex_ids"]), len(seam["vertex_locations"]))
+                self.assertEqual(len(seam["vertex_ids"]), len(seam["uv_coords"]))
+                for vertex_id, location, copies in zip(seam["vertex_ids"], seam["vertex_locations"], seam["uv_coords"]):
+                    np.testing.assert_array_equal(location, vertices[vertex_id])
+                    self.assertEqual(len(copies), len(by_vertex[vertex_id]))
+                    for uv in copies:
+                        self.assertTrue(any(np.allclose(uv, obj_uvs[index]) for index in by_vertex[vertex_id]))
 
     def test_seam_mesh_marks_two_rings_around_each_center_green(self):
         mesh = trimesh.Trimesh(
