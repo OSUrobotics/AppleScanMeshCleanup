@@ -182,7 +182,7 @@ def main():
         )
     elif args.operation == "downsample_lowres":
         #
-        input_dir = root_dir / "RemoveCalyx"
+        input_dir = root_dir / "CalyxRemoved"
         output_dir = root_dir / "LowRes"
         process_file = partial(
             downsample_mesh,

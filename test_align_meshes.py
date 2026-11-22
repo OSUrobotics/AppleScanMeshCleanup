@@ -491,6 +491,170 @@ class AlignMeshesTests(unittest.TestCase):
 
 
 class CalyxAlignmentTests(unittest.TestCase):
+    def test_scaled_rotated_mesh_matches_calyx_in_3d(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            canonical = root / "canonical.obj"
+            scan = root / "Apple_001_FullRes.obj"
+            _create_apple(12, canonical)
+            _create_apple(16, scan)
+            scan_seams = scan.with_name("Apple_001_FullRes_seam_topology.json")
+            topology = SeamTopology.from_dict(json.loads(scan_seams.read_text()))
+            rotation = alignment.Rotation.from_euler("xy", [35, 25], degrees=True)
+            translation = np.array([3., 7., -4.])
+
+            def transform(points):
+                return rotation.apply(np.asarray(points) * 40) + translation
+
+            lines = scan.read_text().splitlines()
+            for index, line in enumerate(lines):
+                if line.startswith("v "):
+                    lines[index] = "v " + " ".join(map(str, transform([float(v) for v in line.split()[1:]])))
+            scan.write_text("\n".join(lines) + "\n")
+            topology.top_point = transform(topology.top_point).tolist()
+            topology.bottom_point = transform(topology.bottom_point).tolist()
+            for seam in topology.seams.values():
+                seam.vertex_locations = transform(seam.vertex_locations).tolist()
+                if seam.center is not None:
+                    seam.center = transform(seam.center).tolist()
+                if seam.radius is not None:
+                    seam.radius *= 40
+            scan_seams.write_text(json.dumps(topology.to_dict()))
+
+            output = root / "aligned" / "result.obj"
+            alignment.align_meshes(scan, output, root, canonical)
+            _, points, _, _, _, _ = alignment._mesh(scan)
+            _, fitted, _, _, _, _ = alignment._mesh(output)
+            canonical_topology = SeamTopology.from_dict(
+                json.loads(canonical.with_name("canonical_seam_topology.json").read_text())
+            )
+            _, template, _, _, _, _ = alignment._mesh(canonical)
+            canonical_poles = alignment.cKDTree(template).query(alignment._endpoints(canonical_topology))[1]
+            scan_poles = alignment.cKDTree(points).query(alignment._endpoints(topology))[1]
+            np.testing.assert_allclose(fitted[canonical_poles], points[scan_poles], atol=1e-6)
+            ring = points[topology.seams["calyx"].vertex_ids]
+            edges = np.roll(ring, -1, axis=0) - ring
+            for vertex in canonical_topology.seams["calyx"].vertex_ids:
+                fractions = np.clip(np.sum((fitted[vertex] - ring) * edges, axis=1)
+                                    / np.sum(edges * edges, axis=1), 0, 1)
+                self.assertLess(float(np.linalg.norm(
+                    ring + fractions[:, None] * edges - fitted[vertex], axis=1
+                ).min()), 1e-6)
+            self.assertGreater(np.linalg.norm(np.ptp(fitted, axis=0)), 30)
+
+    def test_only_calyx_and_poles_are_matched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            canonical = root / "canonical.obj"
+            scan = root / "Apple_001_FullRes.obj"
+            _create_apple(12, canonical)
+            shutil.copyfile(canonical, scan)
+            canonical_topology = json.loads(canonical.with_name("canonical_seam_topology.json").read_text())
+            scan_topology = dict(canonical_topology)
+            scan_topology["seams"] = {"calyx": canonical_topology["seams"]["calyx"]}
+            scan_topology["boundary_paths"] = []
+            scan.with_name("Apple_001_FullRes_seam_topology.json").write_text(json.dumps(scan_topology))
+            _, points, faces, uv, uv_faces, _ = alignment._mesh(scan)
+            mappings = alignment._vertex_uvs(points, faces, uv, uv_faces)
+            poles = [
+                min((np.linalg.norm(coord - center), vertex)
+                    for vertex, entries in enumerate(mappings)
+                    for candidate, coord in entries if candidate == chart)[1]
+                for chart, center in ((0, np.array([.9, .1])), (1, np.array([.1, .9])))
+            ]
+            calyx = set(scan_topology["seams"]["calyx"]["vertex_ids"])
+            original_locate = alignment._SurfaceLocator.locate
+
+            def locate(locator, point, chart, uv_face):
+                if len(locator.indices) == 3:
+                    return uv_face, np.full(3, 1 / 3)
+                return original_locate(locator, point, chart, uv_face)
+
+            output = root / "aligned" / "result.obj"
+            with (patch.object(alignment._SurfaceLocator, "locate", new=locate),
+                  patch.object(alignment, "_refine_fit", wraps=alignment._refine_fit) as refine,
+                  patch.object(alignment, "_resample_texture") as texture,
+                  patch.object(alignment, "flood_fill_texture_map")):
+                alignment.align_meshes(scan, output, root, canonical)
+                for _, matrix in texture.call_args.args[-2]:
+                    np.testing.assert_array_equal(matrix, np.eye(2))
+
+            self.assertEqual(set(refine.call_args.args[-1]), calyx | set(poles))
+            _, fitted, fitted_faces, _, _, _ = alignment._mesh(output)
+            np.testing.assert_allclose(fitted[poles], points[poles], atol=1e-8)
+            np.testing.assert_allclose(fitted[sorted(calyx)], points[sorted(calyx)], atol=1e-8)
+            with output.with_name("result_correspondence.csv").open(newline="") as stream:
+                rows = list(csv.reader(stream))[1:]
+            for name in ("top", "bottom", "side"):
+                for vertex in set(canonical_topology["seams"][name]["vertex_ids"]) - calyx - set(poles):
+                    np.testing.assert_allclose(np.asarray(rows[vertex][2:], dtype=float), np.full(3, 1 / 3))
+            for vertex in calyx:
+                row = rows[vertex]
+                weights = np.asarray(row[2:], dtype=float)
+                self.assertTrue(set(fitted_faces[int(row[1])][weights > 1e-9]) <= calyx)
+            for vertex in poles:
+                self.assertEqual(np.count_nonzero(np.asarray(rows[vertex][2:], dtype=float)), 1)
+            ignored_seams = json.loads(json.dumps(canonical_topology))
+            for name in ("top", "bottom", "side"):
+                ignored_seams["seams"][name]["vertex_ids"][0] = len(points)
+            scan.with_name("Apple_001_FullRes_seam_topology.json").write_text(json.dumps(ignored_seams))
+            with (patch.object(alignment._SurfaceLocator, "locate", new=locate),
+                  patch.object(alignment, "_resample_texture"),
+                  patch.object(alignment, "flood_fill_texture_map")):
+                alignment.align_meshes(scan, output, root, canonical)
+            _, fitted_with_seams, _, _, _, _ = alignment._mesh(output)
+            np.testing.assert_array_equal(fitted_with_seams, fitted)
+            with output.with_name("result_correspondence.csv").open(newline="") as stream:
+                self.assertEqual(list(csv.reader(stream))[1:], rows)
+            alignment.align_meshes(scan, output, root, canonical)
+            _, fitted_real, _, _, _, _ = alignment._mesh(output)
+            np.testing.assert_allclose(fitted_real[poles], points[poles], atol=1e-8)
+            np.testing.assert_allclose(fitted_real[sorted(calyx)], points[sorted(calyx)], atol=1e-8)
+            self.assertTrue(output.with_suffix(".jpg").is_file())
+            expected_correspondence = output.with_name("result_correspondence.csv").read_text()
+
+            lines, _, _, scan_uv, scan_uv_faces, _ = alignment._mesh(scan)
+            center = np.array([.1, .9])
+            rotation = np.array([[0, -1], [1, 0]])
+            bottom_uvs = set()
+            for uv_face in scan_uv_faces:
+                if alignment._chart(scan_uv[uv_face].mean(axis=0)) == 1:
+                    bottom_uvs.update(uv_face)
+            for index in bottom_uvs:
+                scan_uv[index] = center + rotation @ (scan_uv[index] - center)
+            index = 0
+            for row, line in enumerate(lines):
+                if line.startswith("vt "):
+                    lines[row] = "vt " + " ".join(map(str, scan_uv[index]))
+                    index += 1
+            scan.write_text("\n".join(lines) + "\n")
+            with (patch.object(alignment, "_resample_texture"),
+                  patch.object(alignment, "flood_fill_texture_map")):
+                alignment.align_meshes(scan, output, root, canonical)
+            _, fitted_rotated_uv, _, _, _, _ = alignment._mesh(output)
+            np.testing.assert_array_equal(fitted_rotated_uv, fitted_real)
+            self.assertEqual(output.with_name("result_correspondence.csv").read_text(), expected_correspondence)
+
+            lines, _, _, canonical_uv, canonical_uv_faces, _ = alignment._mesh(canonical)
+            bottom_uvs = set()
+            for uv_face in canonical_uv_faces:
+                if alignment._chart(canonical_uv[uv_face].mean(axis=0)) == 1:
+                    bottom_uvs.update(uv_face)
+            for index in bottom_uvs:
+                canonical_uv[index] = center + rotation @ (canonical_uv[index] - center)
+            index = 0
+            for row, line in enumerate(lines):
+                if line.startswith("vt "):
+                    lines[row] = "vt " + " ".join(map(str, canonical_uv[index]))
+                    index += 1
+            canonical.write_text("\n".join(lines) + "\n")
+            with (patch.object(alignment, "_resample_texture"),
+                  patch.object(alignment, "flood_fill_texture_map")):
+                alignment.align_meshes(scan, output, root, canonical)
+            _, fitted_rotated_uv, _, _, _, _ = alignment._mesh(output)
+            np.testing.assert_array_equal(fitted_rotated_uv, fitted_real)
+            self.assertEqual(output.with_name("result_correspondence.csv").read_text(), expected_correspondence)
+
     def test_removed_calyx_seams_are_matched_from_companion_topology(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -547,45 +711,29 @@ class CalyxAlignmentTests(unittest.TestCase):
             alignment.align_meshes(patched, output, patched.parent, canonical)
             _, fitted, fitted_faces, fitted_uv, fitted_uv_faces, _ = alignment._mesh(output)
             np.testing.assert_array_equal(fitted_uv[fitted_uv_faces], template_uv[template_uv_faces])
-            scan_uvs = alignment._vertex_uvs(points, faces, uv, uv_faces)
-            canonical_uvs = alignment._vertex_uvs(template, template_faces, template_uv, template_uv_faces)
-            scan_seams = alignment._oriented_seams(alignment._seam_ids(topology_path, len(points)), points, faces)
             canonical_path = canonical.with_name("canonical_seam_topology.json")
-            template_seams = alignment._oriented_seams(
-                alignment._seam_ids(canonical_path, len(template)), template, template_faces
-            )
-            transforms = alignment._seam_uv_transforms(
-                template_seams, scan_seams, template, points, canonical_uvs, scan_uvs
-            )
+            canonical_topology = SeamTopology.from_dict(json.loads(canonical_path.read_text()))
+            canonical_axis = np.diff(alignment._endpoints(canonical_topology), axis=0)[0]
+            canonical_axis /= np.linalg.norm(canonical_axis)
+            scan_axis = np.diff(alignment._endpoints(SeamTopology.from_dict(data)), axis=0)[0]
+            scan_axis /= np.linalg.norm(scan_axis)
             source_ring = alignment._oriented_calyx(
-                alignment._calyx_ids(canonical_path, len(template)), template_faces, canonical_uvs, 1
+                alignment._calyx_ids(canonical_topology, len(template)), template_faces, template, canonical_axis
             )
             target_ring = alignment._oriented_calyx(
-                data["seams"]["calyx"]["vertex_ids"], faces, scan_uvs, np.linalg.det(transforms[1][1])
+                data["seams"]["calyx"]["vertex_ids"], faces, points, scan_axis
             )
-            offset = alignment._calyx_offset(source_ring, target_ring, canonical_uvs, scan_uvs,
-                                              points, transforms[1])
-            center, matrix = transforms[1]
-            reflection = np.diag([1., -1.])
-            reflected_uvs = [
-                [(chart, center + reflection @ (coord - center) if chart == 1 else coord)
-                 for chart, coord in mappings]
-                for mappings in scan_uvs
-            ]
-            reflected_transform = center, reflection @ matrix
-            reflected_ring = alignment._oriented_calyx(
-                data["seams"]["calyx"]["vertex_ids"], faces, reflected_uvs,
-                np.linalg.det(reflected_transform[1])
+            self.assertEqual(
+                alignment._oriented_calyx(list(reversed(target_ring)), faces, points, scan_axis),
+                target_ring,
             )
-            self.assertEqual(reflected_ring, target_ring)
-            self.assertAlmostEqual(alignment._calyx_offset(
-                source_ring, reflected_ring, canonical_uvs, reflected_uvs, points, reflected_transform
-            ), offset)
-            for vertex, first, second, weight in alignment._seam_correspondence(
-                source_ring, target_ring, template, points, True, offset
-            ):
-                np.testing.assert_allclose(fitted[vertex], (1 - weight) * points[first] + weight * points[second],
-                                           atol=1e-6)
+            ring_points = points[target_ring]
+            edge_vectors = np.roll(ring_points, -1, axis=0) - ring_points
+            for vertex in source_ring:
+                fractions = np.clip(np.sum((fitted[vertex] - ring_points) * edge_vectors, axis=1)
+                                    / np.sum(edge_vectors * edge_vectors, axis=1), 0, 1)
+                distance = np.linalg.norm(ring_points + fractions[:, None] * edge_vectors - fitted[vertex], axis=1)
+                self.assertLess(float(distance.min()), 1e-6)
             with output.with_name("result_correspondence.csv").open(newline="") as stream:
                 rows = list(csv.reader(stream))[1:]
             for vertex in target_ring:
@@ -611,9 +759,9 @@ class CalyxAlignmentTests(unittest.TestCase):
 
     def test_calyx_order_rejects_non_ring(self):
         faces = np.array([[0, 1, 2], [0, 2, 3]])
-        mappings = [[(1, uv)] for uv in np.array([[0., 0], [1, 0], [1, 1], [0, 1]])]
+        points = np.array([[0., 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]])
         with self.assertRaisesRegex(ValueError, "simple mesh-edge ring"):
-            alignment._oriented_calyx([0, 1, 3], faces, mappings, 1)
+            alignment._oriented_calyx([0, 1, 3], faces, points, np.array([0., 1, 0]))
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import lsqr
 
-from normalize_uv_projection import _match_seam_uvs, _read_obj, _read_seam_records
+from normalize_uv_projection import _match_seam_uvs, _read_obj
 from legacy_seams import _read_legacy_seam_data
 from obj_geometry import read_obj_geometry as _mesh_geometry
 
@@ -289,12 +289,15 @@ def _fill_seam_pixels(result: np.ndarray, coordinates: np.ndarray, edges) -> int
     seam_image = Image.new("1", (width, height), 0)
     draw = ImageDraw.Draw(seam_image)
     for destination, _ in edges:
-        draw.line([tuple(coordinates[index]) for index in destination[:2]], fill=1)
+        draw.line([tuple(coordinates[index]) for index in destination[:2]], fill=3)
     seam = np.asarray(seam_image, dtype=bool)
-    missing = np.all(result[:, :, :3] == 255, axis=2)
+    result[seam, 1] = 255
+    missing = np.isclose(np.sum(result[:, :, 0:2], axis=2), 0)
     if result.shape[2] == 4:
         missing |= result[:, :, 3] == 0
-    y, x = np.nonzero(seam & missing)
+    to_fill = seam & missing
+    print(f"Pixels to fill: {np.count_nonzero(seam)} {np.count_nonzero(to_fill)}")
+    y, x = np.nonzero(to_fill)
     while len(y):
         counts = np.zeros(len(y), dtype=np.int16)
         total = np.zeros((len(y), result.shape[2]), dtype=np.float64)
@@ -316,6 +319,24 @@ def _fill_seam_pixels(result: np.ndarray, coordinates: np.ndarray, edges) -> int
         y, x = y[~fill], x[~fill]
     return len(y)
 
+
+def _remainder_fill_red(result: np.ndarray):
+    """ Any unfilled pixels are filled in with the mean of the surrounding pixels. """
+    height, width = result.shape[:2]
+    for indx in range(0, 2):
+        empty = np.isclose(np.sum(result[:, :, 0:2], axis=2), 0)
+        print(f"Iteration {indx}, empty pixels: {np.count_nonzero(empty)}")
+        ys, xs = np.nonzero(empty)
+        for x, y in zip(xs, ys):
+            if x < 5 or x > width - 5 or y < 5 or y > height - 5:
+                continue
+            patch = result[y-5:y+5, x-5:x+5]
+            empty_patch = empty[y-5:y+5, x-5:x+5]
+            if not np.any(~empty_patch):
+                continue
+            patch_color = np.mean(patch[~empty_patch], axis=0)
+            result[y, x, 0:3] = patch_color
+    
 
 def flood_fill_texture_map(
     input_path: Path, mesh_path: Path, seam_path: Path, output_path: Path
@@ -349,7 +370,7 @@ def flood_fill_texture_map(
     height, width = pixels.shape[:2]
     if width < 2 or height < 2:
         raise ValueError("The texture image must be at least 2 by 2 pixels.")
-    missing = np.all(pixels[:, :, :3] == 255, axis=2)
+    missing = np.isclose(np.sum(pixels[:, :, 0:2], axis=2), 0)
     if has_alpha:
         missing |= pixels[:, :, 3] == 0
 
@@ -387,9 +408,14 @@ def flood_fill_texture_map(
     if long_faces:
         warnings.warn(f"Skipped {long_faces} reprojected seam faces with UV edges longer than "
                       f"{_MAX_PROJECTED_EDGE_LENGTH}.", RuntimeWarning, stacklevel=2)
-    unfilled_seam = _fill_seam_pixels(result, coordinates, edges)
-    if unfilled_seam:
-        warnings.warn(f"Could not fill {unfilled_seam} seam pixels without valid neighbors.",
+    #unfilled_seam = _fill_seam_pixels(result, coordinates, edges)
+    #if unfilled_seam:
+    #    warnings.warn(f"Could not fill {unfilled_seam} seam pixels without valid neighbors.",
+    #                  RuntimeWarning, stacklevel=2)
+
+    remainder_fill = _remainder_fill_red(result)
+    if remainder_fill:
+        warnings.warn(f"Could not fill {remainder_fill} remaining pixels without valid neighbors.",
                       RuntimeWarning, stacklevel=2)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

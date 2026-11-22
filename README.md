@@ -44,8 +44,8 @@ The code will not over-write an existing file unless replace_existing is set.
 
 ## Normalization process
 
-Alignment reads each input mesh's matching topology JSON from the supplied seam
-directory; its vertex IDs and endpoints must match the input mesh.
+Alignment reads each input mesh's topology JSON from the supplied seam
+directory; its calyx vertex IDs and endpoints must match the input mesh.
 The canonical topology JSON is in the same
 folder as the canonical OBJ; legacy seam CSV files are also accepted, but
 cannot supply calyx seams and produce a warning.
@@ -67,18 +67,21 @@ resampler warns and uses the transformed face-corner UV to locate the affected
 corner on the canonical chart; it warns if a stretched triangle remains.
 Degenerate mapped triangles are skipped with a warning, so distorted or
 incomplete correspondences can leave gaps or overlaps in the resampled texture.
-The fit matches the calyx rings by their bottom-chart orientation and relative
-distance along each ring, pins canonical calyx vertices to the scan ring, and
-maps scan calyx vertices to canonical ring edges. Ring sampling may differ
-between meshes. It divides
+The geometry fit uses 3D coordinates only. It initially aligns and scales the
+pole axes, assuming the meshes already share their rotation around that axis.
+It matches the calyx rings by their 3D orientation and relative distance along
+each ring, pins canonical calyx vertices to the scan ring, and maps scan calyx
+vertices to canonical ring edges. Ring sampling may differ between meshes.
+The top, bottom, and side seams are not matched. It divides
 each mesh halfway between its extrema along its top-to-bottom pole axis, and
 projects vertices onto the corresponding scan half. Scan triangles crossing
 the midpoint are clipped for projection; the canonical mesh remains connected
 across the boundary. The pole vertices remain pinned to the scan vertices
 nearest the endpoints through four neighbor-averaging and reprojection
-iterations. Other UV seam and pole
-correspondences are still used for texture transfer. This does not guarantee
-an intersection-free mesh or exact vertex-to-vertex matches.
+iterations. Other vertices use 3D surface projection for correspondence.
+UV coordinates are used only afterward for texture transfer; the charts should
+have the same orientation. The fit does not guarantee an intersection-free
+mesh or exact vertex-to-vertex matches.
 
 ## Mesh sizes
 - The original meshes (from RevoScan) are typically on the order of a million faces.

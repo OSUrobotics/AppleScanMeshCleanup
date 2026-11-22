@@ -1056,7 +1056,7 @@ def remove_calyx(input_path: Path, output_path: Path, seam_path: Path | None = N
     if used_materials != {material_name}:
         raise ValueError("All OBJ faces must use the single diffuse material.")
 
-    calyx_sub_path = output_path / "Calyx"
+    calyx_sub_path = output_path.parent / "Calyx"
     calyx_path = calyx_sub_path.with_name(output_path.stem + "_calyx.obj")
     output_seams = calyx_sub_path.with_name(output_path.stem + "_seam_topology.json")
     body_texture = calyx_sub_path.with_suffix(texture_path.suffix)

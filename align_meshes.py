@@ -2,7 +2,7 @@
 Input:
     - mesh: The input mesh to be aligned.
     - canonical_mesh: The reference canonical mesh.
-    - seam files defining the top, bottom, side, and calyx seams of both meshes
+    - seam topology files defining the calyx seams of both meshes
     - the input seam topology contains the two polar endpoint locations on the input mesh
 
 Output:
@@ -39,6 +39,7 @@ from PIL import Image
 from scipy.sparse import coo_matrix, diags
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation
 
 from filename_fixing import _apple_name_base
 from normalize_uv_projection import _read_obj, _read_seam_data, _read_texture, _warp_texture
@@ -423,8 +424,8 @@ def _seam_correspondence(source_ids, target_ids, source_points, target_points, c
     return result
 
 
-def _oriented_calyx(ids, faces, mappings, direction):
-    """Order an unordered mesh-edge ring using its bottom-chart orientation."""
+def _oriented_calyx(ids, faces, points, axis):
+    """Order a mesh-edge ring consistently around the pole axis."""
     neighbors = {vertex: set() for vertex in ids}
     for face in faces:
         for first, second in zip(face, np.roll(face, -1)):
@@ -448,97 +449,33 @@ def _oriented_calyx(ids, faces, mappings, direction):
             previous, current = current, next(vertex for vertex in neighbors[current] if vertex != previous)
         if len(ring) != len(ids):
             raise ValueError("The calyx seam contains multiple rings.")
-    coords = []
-    for vertex in ring:
-        coord = next((uv for chart, uv in mappings[vertex] if chart == 1), None)
-        if coord is None:
-            raise ValueError(f"Calyx seam vertex {vertex} is missing from the bottom UV chart.")
-        coords.append(coord)
-    coords = np.asarray(coords)
-    area = np.sum(coords[:, 0] * np.roll(coords[:, 1], -1)
-                  - coords[:, 1] * np.roll(coords[:, 0], -1))
-    if abs(area) < 1e-12:
-        raise ValueError("The calyx seam has zero bottom-chart UV area.")
-    if area * direction < 0:
+    coords = points[ring] - points[ring].mean(axis=0)
+    area = np.cross(coords, np.roll(coords, -1, axis=0)).sum(axis=0)
+    signed_area = float(area @ axis)
+    if np.linalg.norm(area) <= 1e-12 or abs(signed_area) <= 1e-8 * np.linalg.norm(area):
+        raise ValueError("Cannot determine calyx seam orientation around the pole axis.")
+    if signed_area < 0:
         ring = [ring[0], *reversed(ring[1:])]
     return ring
 
 
-def _calyx_offset(source, target, source_uvs, target_uvs, target_points, transform):
-    center, matrix = transform
-    source_uv = next(uv for chart, uv in source_uvs[source[0]] if chart == 1)
-    anchor = center + matrix @ (source_uv - center)
-    coords = np.array([next(uv for chart, uv in target_uvs[v] if chart == 1) for v in target])
+def _calyx_offset(source, target, initial_points, target_points):
+    anchor = initial_points[source[0]]
+    coords = target_points[target]
     edges = np.roll(coords, -1, axis=0) - coords
     lengths_sq = np.sum(edges * edges, axis=1)
     if np.any(lengths_sq <= 1e-20):
-        raise ValueError("The calyx seam contains coincident UV vertices.")
+        raise ValueError("The calyx seam contains coincident consecutive vertices.")
     fractions = np.clip(np.sum((anchor - coords) * edges, axis=1) / lengths_sq, 0, 1)
     edge = int(np.argmin(np.sum((coords + fractions[:, None] * edges - anchor) ** 2, axis=1)))
-    positions = target_points[target]
-    lengths = np.linalg.norm(np.roll(positions, -1, axis=0) - positions, axis=1)
-    if np.any(lengths <= 0):
-        raise ValueError("The calyx seam contains coincident consecutive vertices.")
+    lengths = np.sqrt(lengths_sq)
     return float((np.sum(lengths[:edge]) + fractions[edge] * lengths[edge]) / np.sum(lengths))
-
-
-def _seam_uv_transforms(template_seams, scan_seams, template, points, canonical_uvs, scan_uvs):
-    """Orient the chart lookup to the same anchored seam directions as the fit."""
-    def coordinate(mappings, chart):
-        return next((coord for candidate, coord in mappings if candidate == chart), None)
-
-    transforms = []
-    for chart, center in enumerate((np.array([0.9, 0.1]), np.array([0.1, 0.9]))):
-        def frame(seam, mappings):
-            coords = [coordinate(mappings[vertex], chart) for vertex in seam]
-            if any(coord is None for coord in coords):
-                raise ValueError(f"Seam vertex is missing from UV chart {chart}.")
-            radial = np.asarray(coords) - center
-            area = np.sum(radial[:, 0] * np.roll(radial[:, 1], -1)
-                          - radial[:, 1] * np.roll(radial[:, 0], -1))
-            if abs(area) < 1e-12 or np.linalg.norm(radial[0]) < 1e-12:
-                raise ValueError(f"Cannot determine UV orientation of chart {chart}.")
-            return math.atan2(radial[0, 1], radial[0, 0]), np.sign(area)
-
-        source_angle, source_sign = frame(template_seams[chart], canonical_uvs)
-        target_angle, target_sign = frame(scan_seams[chart], scan_uvs)
-        reflection = source_sign * target_sign
-        angle = target_angle - reflection * source_angle
-        rotation = np.array([[math.cos(angle), -math.sin(angle)],
-                             [math.sin(angle), math.cos(angle)]])
-        transforms.append((center, rotation @ np.diag([1, reflection])))
-
-    samples = []
-    for index in (0, 1):
-        source, dest = template_seams[index], scan_seams[index]
-        for vertex, first, second, weight in _seam_correspondence(source, dest, template, points, True):
-            if vertex == source[0] or first == dest[0] or second == dest[0]:
-                continue
-            source_uv = coordinate(canonical_uvs[vertex], 2)
-            first_uv = coordinate(scan_uvs[first], 2)
-            second_uv = coordinate(scan_uvs[second], 2)
-            if source_uv is not None and first_uv is not None and second_uv is not None:
-                samples.append((source_uv, (1 - weight) * first_uv + weight * second_uv))
-    if not samples:
-        raise ValueError("Cannot determine body UV orientation from the seam vertices.")
-    source_uv, target_uv = np.array(samples).transpose(1, 0, 2)
-    center = np.array([0.5, 0.5])
-    candidates = []
-    for quarter in range(4):
-        angle = quarter * math.pi / 2
-        rotation = np.array([[round(math.cos(angle)), -round(math.sin(angle))],
-                             [round(math.sin(angle)), round(math.cos(angle))]])
-        for reflection in (1, -1):
-            matrix = rotation @ np.diag([1, reflection])
-            error = np.mean(np.sum(((source_uv - center) @ matrix.T + center - target_uv) ** 2, axis=1))
-            candidates.append((error, matrix))
-    transforms.append((center, min(candidates, key=lambda candidate: candidate[0])[1]))
-    return transforms
 
 
 def _resample_texture(
     texture_path, output_texture, scan_faces, scan_uv, scan_uv_faces,
     template_faces, template_uv, template_uv_faces, correspondence, uv_transforms,
+    chart_correspondences=None,
 ):
     """Warp scan triangles into canonical UV charts using vertex correspondences."""
     vertex_faces = [[] for _ in range(int(template_faces.max()) + 1)]
@@ -565,9 +502,15 @@ def _resample_texture(
                     choices.intersection_update(vertex_faces[shared_vertex])
                 choices = sorted(index for index in choices if charts[index] == chart)
                 if not choices:
-                    raise ValueError(
-                        f"Scan vertex {vertex} has no corresponding canonical face on chart {chart}."
-                    )
+                    alternate = (chart_correspondences or {}).get((int(vertex), chart))
+                    if alternate is None:
+                        raise ValueError(
+                            f"Scan vertex {vertex} has no corresponding canonical face on chart {chart}."
+                        )
+                    canonical_face, weights = alternate
+                    weights = np.asarray(weights)
+                    vertices = template_faces[canonical_face]
+                    choices = [canonical_face]
                 expected = center + transform.T @ (scan_uv[uv_index] - center)
                 candidates = []
                 for candidate in choices:
@@ -655,17 +598,12 @@ def align_meshes(
     with canonical_seams_path.open(encoding="utf-8") as stream:
         canonical_topology = SeamTopology.from_dict(json.load(stream))
 
+    # Read in like this so it doesn't duplicate vertices when aligning meshes
     _, points, faces, uv, uv_faces, input_material = _mesh(input_path)
-    input_topology.check_valid(len(points))
     lines, template, template_faces, template_uv, template_uv_faces, material_path = _mesh(canonical_path)
-    canonical_topology.check_valid(len(template))
     
-    scan_seams = _seam_ids(input_topology, len(points))
     scan_calyx = _calyx_ids(input_topology, len(points))
     template_calyx = _calyx_ids(canonical_topology, len(template))
-    template_seams = _seam_ids(canonical_topology, len(template))
-    scan_seams = _oriented_seams(scan_seams, points, faces)
-    template_seams = _oriented_seams(template_seams, template, template_faces)
     endpoints = _endpoints(input_topology)
     texture_path = _read_texture(material_path)
     scan_texture_path = _read_texture(input_material)
@@ -682,54 +620,33 @@ def align_meshes(
     ):
         raise ValueError("Output must be an OBJ and must not overwrite an input file.")
 
-    scan_locator = _UVLocator(uv, uv_faces)
-    canonical_locator = _UVLocator(template_uv, template_uv_faces)
-    canonical_uvs = _vertex_uvs(template, template_faces, template_uv, template_uv_faces)
-    scan_uvs = _vertex_uvs(points, faces, uv, uv_faces)
-    _validate_normalized_seams(scan_seams, scan_uvs, input_path)
-    uv_transforms = _seam_uv_transforms(
-        template_seams, scan_seams, template, points, canonical_uvs, scan_uvs
-    )
+    endpoint_ids = cKDTree(points).query(endpoints)[1]
+    top_pole, bottom_pole = map(int, cKDTree(template).query(_endpoints(canonical_topology))[1])
+    canonical_axis = template[bottom_pole] - template[top_pole]
+    canonical_axis_length = np.linalg.norm(canonical_axis)
+    if canonical_axis_length <= 1e-12:
+        raise ValueError("The canonical pole vertices must be distinct.")
+    canonical_axis /= canonical_axis_length
+    scan_axis = points[endpoint_ids[1]] - points[endpoint_ids[0]]
+    scan_axis_length = np.linalg.norm(scan_axis)
+    if scan_axis_length <= 1e-12:
+        raise ValueError("The input pole vertices must be distinct.")
+    scan_axis /= scan_axis_length
+    rotation, _ = Rotation.align_vectors([scan_axis], [canonical_axis])
+    initial = (rotation.apply(template - template[top_pole]) * (scan_axis_length / canonical_axis_length)
+               + points[endpoint_ids[0]])
     calyx_pair = None
     if scan_calyx is not None and template_calyx is not None:
-        template_calyx = _oriented_calyx(template_calyx, template_faces, canonical_uvs, 1)
-        scan_calyx = _oriented_calyx(
-            scan_calyx, faces, scan_uvs, np.linalg.det(uv_transforms[1][1])
-        )
-        offset = _calyx_offset(template_calyx, scan_calyx, canonical_uvs, scan_uvs,
-                               points, uv_transforms[1])
+        template_calyx = _oriented_calyx(template_calyx, template_faces, template, canonical_axis)
+        scan_calyx = _oriented_calyx(scan_calyx, faces, points, scan_axis)
+        offset = _calyx_offset(template_calyx, scan_calyx, initial, points)
         calyx_pair = template_calyx, scan_calyx, offset
     else:
         warnings.warn("Calyx seams are unavailable in legacy CSV data; calyx matching is skipped.",
                       stacklevel=2)
-    target = np.empty_like(template)
-    for index, mappings in enumerate(canonical_uvs):
-        chart, coord = mappings[0]
-        center, transform = uv_transforms[chart]
-        face, weights = scan_locator.locate(center + transform @ (coord - center), chart)
-        target[index] = weights @ points[faces[face]]
-
-    seam_pairs = []
-    for seam_index in range(6):
-        source = template_seams[seam_index]
-        dest = scan_seams[seam_index]
-        closed = seam_index in (0, 1, 2, 4)
-        seam_pairs.append((source, dest, closed))
-
-    scan_tree = cKDTree(points)
-    endpoint_ids = scan_tree.query(endpoints)[1]
+    target = initial.copy()
     if scan_calyx is not None and int(endpoint_ids[1]) in scan_calyx:
         raise ValueError("The bottom endpoint resolves to a calyx seam vertex, not the patch center.")
-    def chart_pole(chart, center):
-        candidates = [
-            (float(np.linalg.norm(coord - center)), index)
-            for index, mappings in enumerate(canonical_uvs)
-            for candidate_chart, coord in mappings if candidate_chart == chart
-        ]
-        return min(candidates)[1]
-
-    top_pole = chart_pole(0, np.array([0.9, 0.1]))
-    bottom_pole = chart_pole(1, np.array([0.1, 0.9]))
     constraints = {
         top_pole: points[endpoint_ids[0]],
         bottom_pole: points[endpoint_ids[1]],
@@ -743,16 +660,9 @@ def align_meshes(
                 raise ValueError("A canonical pole cannot also lie on the calyx seam.")
             constraints[vertex] = (1 - weight) * points[first] + weight * points[second]
 
-    canonical_axis = template[bottom_pole] - template[top_pole]
-    canonical_axis_length = np.linalg.norm(canonical_axis)
-    if canonical_axis_length <= 1e-12:
-        raise ValueError("The canonical pole vertices must be distinct.")
-    canonical_axis /= canonical_axis_length
     canonical_heights = template @ canonical_axis
     midpoint = (canonical_heights.min() + canonical_heights.max()) / 2
     halves = (canonical_heights >= midpoint).astype(int)
-    scan_axis = endpoints[1] - endpoints[0]
-    scan_axis /= np.linalg.norm(scan_axis)
     surface_points, surface_faces, half_locator = _half_surface(points, faces, scan_axis)
     for vertex in range(len(template)):
         if vertex not in constraints:
@@ -802,17 +712,6 @@ def align_meshes(
             vertex_faces.setdefault(int(face[i]), face_index)
             edge_faces.setdefault(tuple(sorted((int(face[i]), int(face[(i + 1) % 3])))), face_index)
     seam_mapping = {}
-    for source, dest, closed in seam_pairs:
-        for vertex, first, second, weight in _seam_correspondence(dest, source, points, template, closed):
-            edge = tuple(sorted((first, second)))
-            if edge not in edge_faces:
-                raise ValueError(f"Canonical seam edge {edge} is not present in the mesh.")
-            face_index = edge_faces[edge]
-            weights = np.zeros(3)
-            face = template_faces[face_index]
-            weights[np.flatnonzero(face == first)[0]] = 1 - weight
-            weights[np.flatnonzero(face == second)[0]] = weight
-            seam_mapping.setdefault(vertex, (face_index, weights))
     if calyx_pair is not None:
         source, dest, offset = calyx_pair
         for vertex, first, second, weight in _seam_correspondence(
@@ -826,8 +725,6 @@ def align_meshes(
             face = template_faces[face_index]
             weights[np.flatnonzero(face == first)[0]] = 1 - weight
             weights[np.flatnonzero(face == second)[0]] = weight
-            if vertex in seam_mapping:
-                raise ValueError("The calyx seam overlaps another UV seam.")
             seam_mapping[vertex] = face_index, weights
     for template_vertex, scan_vertex in (
         (top_pole, int(endpoint_ids[0])),
@@ -838,22 +735,34 @@ def align_meshes(
         weights[np.flatnonzero(template_faces[face_index] == template_vertex)[0]] = 1
         seam_mapping[scan_vertex] = face_index, weights
 
-    surface_locator = _SurfaceLocator(fitted, template_faces, canonical_locator.charts)
+    surface_locator = _SurfaceLocator(fitted, template_faces, np.zeros(len(template_faces), dtype=int))
     correspondence = []
-    for vertex, mappings in enumerate(scan_uvs):
+    for vertex, point in enumerate(points):
         if vertex in seam_mapping:
             face, weights = seam_mapping[vertex]
         else:
-            chart, coord = mappings[0]
-            center, transform = uv_transforms[chart]
-            uv_face, _ = canonical_locator.locate(center + transform.T @ (coord - center), chart)
-            face, weights = surface_locator.locate(points[vertex], chart, uv_face)
+            face, weights = surface_locator.locate(point, 0, int(surface_locator.indices[0][0]))
         correspondence.append((vertex, face, *weights))
+
+    scan_uvs = _vertex_uvs(points, faces, uv, uv_faces)
+    uv_transforms = [(np.array(center), np.eye(2)) for center in
+                     ((0.9, 0.1), (0.1, 0.9), (0.5, 0.5))]
+    charts = np.array([_chart(template_uv[face].mean(axis=0)) for face in template_uv_faces])
+    chart_locator = _SurfaceLocator(fitted, template_faces, charts)
+    chart_correspondences = {}
+    for vertex, mappings in enumerate(scan_uvs):
+        for chart, _ in mappings:
+            if not len(chart_locator.indices[chart]):
+                raise ValueError(f"Canonical mesh has no faces for UV chart {chart}.")
+            chart_correspondences[vertex, chart] = chart_locator.locate(
+                points[vertex], chart, int(chart_locator.indices[chart][0])
+            )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _resample_texture(
         scan_texture_path, output_texture, faces, uv, uv_faces,
         template_faces, template_uv, template_uv_faces, correspondence, uv_transforms,
+        chart_correspondences,
     )
     with output_material.open("w", encoding="utf-8", newline="\n") as stream:
         for line in material_path.read_text(encoding="utf-8").splitlines():

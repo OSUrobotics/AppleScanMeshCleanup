@@ -97,13 +97,7 @@ def _read_texture(material_path: Path) -> Path:
     return textures[0]
 
 
-def _read_seam_data(
-    seam_path: Path,
-) -> tuple[list[tuple[list[int], np.ndarray]], np.ndarray]:
-    if seam_path.suffix.lower() != ".json":
-        raise ValueError(f"Expected a seam topology JSON file: {seam_path}.")
-    with seam_path.open(encoding="utf-8") as seam_file:
-        topology = SeamTopology.from_dict(json.load(seam_file))
+def _read_seam_data(topology: SeamTopology) -> tuple[list[tuple[list[int], np.ndarray]], np.ndarray]:
     topology.set_boundary_paths(
         (path["vertex_ids"], path["uv_coords"]) for path in topology.boundary_paths
     )
@@ -111,21 +105,12 @@ def _read_seam_data(
         (path["vertex_ids"], np.asarray(path["uv_coords"], dtype=np.float64))
         for path in topology.boundary_paths
     ]
-    try:
-        centers = np.asarray([topology.top_point, topology.bottom_point], dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Expected two finite 3D center coordinates in {seam_path}.") from exc
-    if centers.shape != (2, 3) or not np.isfinite(centers).all():
-        raise ValueError(f"Expected two finite 3D center coordinates in {seam_path}.")
+    centers = np.asarray([topology.top_point, topology.bottom_point], dtype=np.float64)
     return records, centers
 
 
-def _read_seam_records(seam_path: Path) -> list[tuple[list[int], np.ndarray]]:
-    return _read_seam_data(seam_path)[0]
-
-
-def _read_seams(seam_path: Path) -> list[np.ndarray]:
-    return [uv for _, uv in _read_seam_records(seam_path)]
+def _read_seams(topology: SeamTopology) -> list[np.ndarray]:
+    return [uv for _, uv in _read_seam_data(topology)[0]]
 
 
 def _match_seam_uvs(original_uvs: np.ndarray, seams: list[np.ndarray]) -> list[np.ndarray]:
@@ -465,16 +450,17 @@ def normalize_uv_projection(input_path: Path, output_path: Path, seam_path: Path
         raise ValueError("The output OBJ must differ from the input OBJ.")
     if output_path.suffix.lower() != ".obj":
         raise ValueError("The normalized mesh output must be an OBJ file.")
-    seam_path = _find_seam_file(input_path, seam_dir)
+    seam_file = seam_path / (input_path.stem + "_seam_topology.json")
+    with seam_file.open(encoding="utf-8") as stream:
+        topology = SeamTopology.from_dict(json.load(stream))
+
     lines, original_uvs, faces, material_path = _read_obj(input_path)
     texture_path = _read_texture(material_path)
     if np.any(original_uvs < -1e-8) or np.any(original_uvs > 1.0 + 1e-8):
         raise ValueError("The input UVs must lie within the texture image; tiled UVs are not supported.")
-    with seam_path.open(encoding="utf-8") as stream:
-        topology = SeamTopology.from_dict(json.load(stream))
     if "calyx" not in topology.seams:
         raise ValueError(f"Seam topology {seam_path} must contain a calyx ring.")
-    records, centers = _read_seam_data(seam_path)
+    records, centers = _read_seam_data(topology)
     seams = [uv for _, uv in records]
     center_uv_indices = _center_uv_indices(lines, faces, centers, input_path)
     calyx_uvs = _calyx_uv_candidates(lines, faces, original_uvs, topology.seams["calyx"], input_path)
@@ -483,7 +469,7 @@ def normalize_uv_projection(input_path: Path, output_path: Path, seam_path: Path
     output_texture = output_path.with_suffix(".jpg")
     output_material = output_path.with_suffix(".mtl")
     output_seams = output_path.with_name(output_path.stem + "_seam_topology.json")
-    sources = {input_path.resolve(), seam_path.resolve(), material_path.resolve(), texture_path.resolve()}
+    sources = {input_path.resolve(), seam_file.resolve(), material_path.resolve(), texture_path.resolve()}
     if any(path.resolve() in sources for path in (output_path, output_material, output_texture, output_seams)):
         raise ValueError("Output files must not overwrite the input mesh, seam, material, or texture.")
     coordinates = []

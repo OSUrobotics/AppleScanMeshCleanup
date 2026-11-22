@@ -179,7 +179,7 @@
                 "--root-dir",
                 "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
                 "--source-dir",
-                "Parameterized",
+                "CalyxRemoved",
                 "--operation",
                 "check_topology"
             ]
