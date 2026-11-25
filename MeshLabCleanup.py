@@ -35,7 +35,8 @@ from uv_texture import uv_texture, _find_centers
 from filename_fixing import write_material_file, _apple_name_base
 from obj_geometry import read_obj, read_mesh_no_textures, write_obj
 
-from remove_calyx import patch_stem_and_ring_calyx, remove_calyx
+from patch_stem_calyx_ring import patch_stem_and_ring_calyx
+from remove_calyx import remove_calyx
 
 MeshProcessor = Callable[[Path, Path], Path]
 
