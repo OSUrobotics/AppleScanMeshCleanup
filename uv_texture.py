@@ -28,12 +28,21 @@ import csv
 import numpy as np
 import pymeshlab
 import trimesh
-from filename_fixing import _write_material_file, _split_filename_into_apple_type_and_number
-from obj_geometry import read_obj_geometry
+from filename_fixing import _split_filename_into_apple_type_and_number, write_material_file
+from obj_geometry import read_obj 
 from seam_topology import SeamInfo, SeamTopology
 
 
-def _write_blank_texture(n_vs: int, seam_vs: list[list[list[int]]], uvs: np.ndarray, texture_path: Path):
+_CAP_RADIUS = 0.1
+_UV_PADDING = 3.0 / 1024.0
+_CAP_CENTERS = np.array([
+    [0.9 - _UV_PADDING, 0.1 + _UV_PADDING],
+    [0.1 + _UV_PADDING, 0.9 - _UV_PADDING],
+])
+
+
+
+def write_texture_uvs(seam_vs: list[list[list[int]]], uvs: np.ndarray, texture_path: Path):
     """Write a white 1024x1024 RGB PNG with the top seam marked in green, the bottom in blue, and the side seams in black.
       The first set of vs in the top seam are the edge of the middle mesh
       The first set of vs in the bottom seam are the left edge of the middle mesh
@@ -45,31 +54,35 @@ def _write_blank_texture(n_vs: int, seam_vs: list[list[list[int]]], uvs: np.ndar
     pixels = np.clip(uvs * image_size, 0, image_size - 1).astype(np.uint)
     image_data[image_size - 1 - pixels[:, 1], pixels[:, 0]] = (128, 128, 128)
 
-    def color_pixels(uv_locs: np.ndarray, color: tuple[int, int, int]) -> None:
-        pixels = np.clip(uv_locs * image_size, 0, image_size - 1).astype(np.uint)
+    def color_pixels(uv_locs: np.ndarray, color: tuple[int, int, int], pad=0) -> None:
+        pixels = np.clip(uv_locs * image_size, pad, image_size - pad - 1).astype(np.int32)
         if pixels.ndim == 1:
-            image_data[image_size - 1 - pixels[1], pixels[0]] = color
+            for i in range(-pad, pad + 1):
+                for j in range(-pad, pad + 1):
+                    image_data[image_size - 1 - (pixels[1] + i), pixels[0] + j] = color
         else:
-            image_data[image_size - 1 - pixels[:, 1], pixels[:, 0]] = color
+            for i in range(-pad, pad + 1):
+                for j in range(-pad, pad + 1):
+                    image_data[image_size - 1 - (pixels[:, 1] + i), pixels[:, 0] + j] = color
 
-    def color_seam(seam_vertices: list[list[int]], uvs: np.ndarray, color: tuple[int, int, int]) -> None:
+    def color_seam(seam_vertices: list[list[int]], uvs: np.ndarray, color: tuple[int, int, int], pad=0) -> None:
         seam_vs_side1 = []
         seam_vs_side2 = []
         for vs in seam_vertices:
             seam_vs_side1.append(vs[0])
             seam_vs_side2.append(vs[1])
             
-        uv_locs = uvs[seam_vs_side1]
-        color_pixels(uv_locs, color)
+        uv_locs_side1 = uvs[seam_vs_side1]
+        color_pixels(uv_locs_side1, color, pad=pad)
             
-        uv_locs = uvs[seam_vs_side2]
-        color_pixels(uv_locs, (color[0] // 2, color[1] // 2, color[2] // 2))
+        uv_locs_side2 = uvs[seam_vs_side2]
+        color_pixels(uv_locs_side2, (color[0] // 2, color[1] // 2, color[2] // 2), pad=pad)
 
-    if len(seam_vs) != 3:
+    if len(seam_vs) < 3:
         raise ValueError("Expected top, bottom, and side seam vertex lists.")
-    color_seam(seam_vs[0], uvs, (0, 255, 0))
-    color_seam(seam_vs[1], uvs, (0, 0, 255))
-    color_seam(seam_vs[2], uvs, (255, 0, 0))
+    color_seam(seam_vs[0], uvs, (0, 255, 0), pad=1)
+    color_seam(seam_vs[1], uvs, (0, 0, 255), pad=1)
+    color_seam(seam_vs[2], uvs, (255, 0, 0), pad=1)
 
     # Corners
     print(f"Corner vs: {seam_vs[2][0]}, {seam_vs[2][-1]}")
@@ -80,10 +93,10 @@ def _write_blank_texture(n_vs: int, seam_vs: list[list[list[int]]], uvs: np.ndar
         for corner in corners:
             color_pixels(uvs[corner, :], col)
     """
-    corner_v1 = seam_vs[2][0][1]
-    corner_v2 = seam_vs[2][-1][1]
-    color_pixels(uvs[corner_v1, :], (255, 255, 0))
-    color_pixels(uvs[corner_v2, :], (0, 255, 255))
+    corner_v1 = seam_vs[2][0]
+    corner_v2 = seam_vs[2][-1]
+    color_pixels(uvs[corner_v1, :], (255, 255, 0), pad=2)
+    color_pixels(uvs[corner_v2, :], (0, 255, 255), pad=2)
 
     scanlines = np.empty((image_size, image_size * 3 + 1), dtype=np.uint8)
     scanlines[:, 0] = 0
@@ -133,9 +146,10 @@ def _export_obj_with_uv(
     material_path = output_path.with_suffix(".mtl")
     texture_path = output_path.with_suffix(".jpg")
     if seam_vs is not None:
-        _write_blank_texture(n_vs=len(mesh.vertices), seam_vs=seam_vs, uvs=uvs, texture_path=texture_path)
-    _write_material_file(material_path, texture_path.name)
+        write_texture_uvs(seam_vs=seam_vs, uvs=uvs, texture_path=texture_path)
+    write_material_file(material_path, texture_path.name)
 
+    print(f"UV Texture num vs: {len(mesh.vertices)}, num uvs: {len(uvs)}")
     with output_path.open("w", encoding="utf-8", newline="\n") as obj_file:
         obj_file.write(f"mtllib {material_path.name}\n")
         for x, y, z in mesh.vertices:
@@ -151,12 +165,7 @@ def _export_obj_with_uv(
 
 
 def _load_mesh(input_path: Path):
-    if input_path.suffix.lower() == ".obj":
-        with input_path.open(encoding="utf-8") as source:
-            vertices, faces = read_obj_geometry(source, input_path)
-        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    else:
-        mesh = trimesh.load(str(input_path), process=False)
+    mesh = trimesh.load(str(input_path), process=False)
     print(f"Loaded mesh with {len(mesh.vertices)} vertices.")
     return mesh
 
@@ -313,14 +322,6 @@ def _define_seam(mesh: trimesh.Trimesh,
     return seam_vertices, seam_edges, radius
 
 
-_CAP_RADIUS = 0.1
-_UV_PADDING = 3.0 / 1024.0
-_CAP_CENTERS = np.array([
-    [0.9 - _UV_PADDING, 0.1 + _UV_PADDING],
-    [0.1 + _UV_PADDING, 0.9 - _UV_PADDING],
-])
-
-
 def _check_diamond(diamond_uvs: np.ndarray, faces: np.ndarray) -> np.ndarray:
     """Contract the body along the cap-to-cap diagonal when its triangles overlap a cap."""
     triangles = diamond_uvs[faces]
@@ -374,6 +375,9 @@ def _label_seam_faces(mesh: trimesh.Trimesh,
     faces_left_seam = set()
     faces_right_seam = set()
     faces_vert_seam = set()
+    face_index_left_seam = set()
+    face_index_right_seam = set()
+    count = 0
     for face_id, face in enumerate(mesh.faces):
         if not face_id in faces_component:
             continue
@@ -391,10 +395,13 @@ def _label_seam_faces(mesh: trimesh.Trimesh,
                     indx_in_side_seam_prev = side_seam_vs[v_prev_indx]
                     if indx_in_side_seam == indx_in_side_seam_prev + 1:
                         faces_left_seam.add(face_id)
+                        face_index_left_seam.add(count)
                         b_found_e = True
                     elif indx_in_side_seam == indx_in_side_seam_prev - 1:
                         faces_right_seam.add(face_id)
+                        face_index_right_seam.add(count)
                         b_found_e = True
+        count += 1
         if b_found_v and not b_found_e:
             faces_vert_seam.add(face_id)
 
@@ -425,7 +432,7 @@ def _label_seam_faces(mesh: trimesh.Trimesh,
         elif side == "Right":
             faces_right_seam.add(face_id)
 
-    return faces_left_seam, faces_right_seam
+    return faces_left_seam, faces_right_seam, face_index_left_seam, face_index_right_seam
 
 
 def _pack_cap_uvs(local_uvs: np.ndarray, center: np.ndarray, chart_id: int) -> np.ndarray:
@@ -506,22 +513,28 @@ def _parameterize_cut_mesh(
 
     if not components:
         raise ValueError("Cannot parameterize a mesh with no faces.")
-        
+
+    face_lists = {}
+
     chart_data = []
     for component_faces in components:
         component_vertex_ids = set(map(int, mesh.faces[component_faces].ravel()))
         is_middle_component = endpoint_ids.issubset(component_vertex_ids)
-        is_top_component = side_seam_vertices[0] in component_vertex_ids
-        is_bot_component = side_seam_vertices[-1] in component_vertex_ids
+        is_top_component = side_seam_vertices[0] in component_vertex_ids and not is_middle_component
+        is_bot_component = side_seam_vertices[-1] in component_vertex_ids and not is_middle_component
         if not is_middle_component and not is_top_component and not is_bot_component:
             raise ValueError(f"End vertices not in component")
-        
+
         source_faces = mesh.faces[component_faces]
         source_vertices = np.unique(source_faces)
         local_index = {int(vertex_id): index for index, vertex_id in enumerate(source_vertices)}
         local_corners = None
         if is_middle_component:
-            faces_left_seam, faces_right_seam = _label_seam_faces(mesh=mesh, side_seam_vs=side_seam_vs, faces_component=component_faces, face_neighbors=face_neighbors)
+            faces_left_seam, faces_right_seam, left_side_index, right_side_index = _label_seam_faces(mesh=mesh, side_seam_vs=side_seam_vs, faces_component=component_faces, face_neighbors=face_neighbors)
+            # This is incredibly ugly, but we know the middle component faces will be numbered from 0, so just
+            # figure out what the index of the face is in the faces component
+            face_lists["left_side_seam"] = left_side_index
+            face_lists["right_side_seam"] = right_side_index
             duplicated_local_indices = {}
             for vertex_id in side_seam_vertices:
                 if vertex_id not in local_index:
@@ -623,6 +636,9 @@ def _parameterize_cut_mesh(
     # Putting the pixels at the corners slightly inside
     pad = _UV_PADDING
     chart_id = 1
+
+    # Make a holder for the list of lists for the faces. Fill it with empty lists for each chart.
+    n_fs = 0
     for (_, local_corners, source_vertices, local_faces, local_uvs, is_middle, is_top, is_bottom) in chart_data:
         if is_middle:
             if local_corners is None:
@@ -673,12 +689,19 @@ def _parameterize_cut_mesh(
                 packed_uvs = 0.5 + centered_uvs * ((0.5 - pad) / max_extent)
             packed_uvs = _check_diamond(packed_uvs, local_faces)
             print(f"Largest cutout corner UVs: {packed_uvs[local_corners].tolist()}")
+            face_lists["middle"] = set(range(n_fs, n_fs + len(local_faces)))
+            n_fs += len(local_faces)
         else:
             if is_bottom:
                 packed_uvs = _pack_cap_uvs(local_uvs, _CAP_CENTERS[1], chart_id)
+                face_lists["bottom"] = set(range(n_fs, n_fs + len(local_faces)))
+                n_fs += len(local_faces)
                 chart_id += 1
             elif is_top:
                 packed_uvs = _pack_cap_uvs(local_uvs, _CAP_CENTERS[0], chart_id)
+                face_lists["top"] = set(range(n_fs, n_fs + len(local_faces)))
+                n_fs += len(local_faces)
+                chart_id += 1
             else:
                 raise ValueError(f"Was not top, bottom, or middle")
 
@@ -691,10 +714,14 @@ def _parameterize_cut_mesh(
         output_faces.extend((local_faces + vertex_offset).tolist())
         vertex_offset += len(source_vertices)
 
+    print(f"Total top: {len(face_lists['top'])}, bottom: {len(face_lists['bottom'])}, middle: {len(face_lists['middle'])}")
+    print(f"Total faces: {len(face_lists['top']) + len(face_lists['bottom']) + len(face_lists['middle'])}")
+    print(f"Total faces in mesh: {len(output_faces)}")
     return (
         np.asarray(output_mapping, dtype=np.int64),
         np.asarray(output_faces, dtype=np.int64),
         np.asarray(output_uvs, dtype=np.float64),
+        face_lists 
     )
 
 
@@ -789,53 +816,14 @@ def _write_seam_mesh(
     seam_mesh.export(str(seam_output_path), file_type="ply")
 
 
-def _store_boundary_paths(seam_topology: SeamTopology, seams: list[list[int]],
-                          seams_uv: list[list[list[int]]], uvs: np.ndarray) -> None:
-    records = []
-    for seam_index, uv_index, reverse in (
-        (0, -1, False), (1, -1, False), (0, 0, False),
-        (2, 0, False), (1, 0, True), (2, 1, True),
-    ):
-        ids = seams[seam_index]
-        mapped = seams_uv[seam_index]
-        if reverse:
-            ids = list(reversed(ids))
-            mapped = list(reversed(mapped))
-        records.append((ids, [uvs[indices[uv_index]] for indices in mapped]))
-    seam_topology.set_boundary_paths(records)
-    
 def _update_seam_topology(
     seam_topology: SeamTopology,
     mesh: trimesh.Trimesh,
     seam_vertices: list[list[int]],
     centers: list[np.ndarray],
-    radii: tuple[float, float],
-    map_vs_back: dict[int, list[int]],
-    uvs: np.ndarray,
+    radii: tuple[float, float]
 ) -> None:
-    def vertex_uvs(vertex_ids: list[int]) -> list:
-        result = []
-        for vertex_id in vertex_ids:
-            if vertex_id not in map_vs_back:
-                raise ValueError(f"Seam vertex {vertex_id} has no UV coordinates.")
-            result.append(uvs[map_vs_back[vertex_id]].tolist())
-        return result
-
-    updated_uvs = {}
-    for name in ("calyx", "stem"):
-        if name not in seam_topology.seams:
-            continue
-        seam = seam_topology.seams[name]
-        vertex_ids = seam.vertex_ids
-        if any(vertex_id < 0 or vertex_id >= len(mesh.vertices) for vertex_id in vertex_ids):
-            raise ValueError(f"{name} seam vertex indices are outside the UV mesh.")
-        stored_locations = np.asarray(seam.vertex_locations, dtype=np.float64)
-        if stored_locations.shape != (len(vertex_ids), 3) or not np.allclose(
-            mesh.vertices[vertex_ids], stored_locations, rtol=1e-5, atol=1e-5
-        ):
-            raise ValueError(f"{name} seam vertices do not match the UV mesh.")
-        updated_uvs[name] = vertex_uvs(vertex_ids)
-
+    
     new_seams = {}
     for name, vertex_ids, center, radius in zip(
         ("top", "bottom", "side"),
@@ -843,19 +831,14 @@ def _update_seam_topology(
         (centers[0], centers[1], None),
         (radii[0], radii[1], None),
     ):
-        new_seams[name] = SeamInfo(
+        new_seam = SeamInfo(
             name=name,
             vertex_ids=[int(vertex_id) for vertex_id in vertex_ids],
             vertex_locations=mesh.vertices[vertex_ids].tolist(),
-            uv_coords=vertex_uvs(vertex_ids),
             center=tuple(float(value) for value in center) if center is not None else None,
             radius=float(radius) if radius is not None else None,
         )
-
-    for name, coords in updated_uvs.items():
-        seam_topology.seams[name].uv_coords = coords
-    for name, seam in new_seams.items():
-        seam_topology.add_seam(name, seam)
+        seam_topology.add_seam(name, new_seam)
 
 
 def uv_texture(input_path: Path, output_path: Path, seam_topology: SeamTopology):
@@ -911,7 +894,10 @@ def uv_texture(input_path: Path, output_path: Path, seam_topology: SeamTopology)
 
     seam_edges = top_seam_es + bottom_seam_es + side_seam_es
     print("Parameterizing the mesh with the requested seam boundaries...")
-    vmapping, indices, uvs = _parameterize_cut_mesh(mesh, seam_edges, side_seam_vertices=side_seam_vs)
+    vmapping, indices, uvs, face_lists = _parameterize_cut_mesh(mesh, seam_edges, side_seam_vertices=side_seam_vs)
+
+    for name, faces in face_lists.items():
+        seam_topology.face_lists[name] = faces
 
     # Export the mesh with the uv coordinates, create an image with the seams/vertices marked, and export the seams
     # This is the reverse of vmapping - it says which original vertices correspond to each mapped vertex.
@@ -932,9 +918,8 @@ def uv_texture(input_path: Path, output_path: Path, seam_topology: SeamTopology)
 
     _update_seam_topology(
         seam_topology, mesh, [top_seam_vs[:-1], bottom_seam_vs[:-1], side_seam_vs],
-        centers, (top_radius, bottom_radius), map_vs_back, uvs,
+        centers, (top_radius, bottom_radius)
     )
-    _store_boundary_paths(seam_topology, seam_vs, seam_vs_mapped, uvs)
     _export_obj_with_uv(mesh=mesh, seam_vs=seam_vs_mapped, vmapping=vmapping, face_indices=indices, uvs=uvs, output_path=output_path)    
 
     seam_path = output_path.with_name(output_path.stem + "_seam_topology.json")

@@ -32,11 +32,9 @@ from MeshLibCleanup import print_mesh_topology
 from reconstruct_uv_by_projection import reconstruct_uv_by_projection
 from seam_topology import SeamTopology
 from uv_texture import uv_texture, _find_centers
-from filename_fixing import _write_material_file, _apple_name_base
+from filename_fixing import write_material_file, _apple_name_base
 from fix_texture_maps import flood_fill_texture_map
-from normalize_uv_projection import _read_obj, _read_texture, _vertex_geometry
-from obj_geometry import read_obj_geometry
-from legacy_seams import _find_compatible_seam_file as _find_seam_file, _read_legacy_seam_data
+from obj_geometry import read_obj, read_mesh_no_textures
 
 from remove_calyx import patch_stem_and_ring_calyx, remove_calyx
 
@@ -76,22 +74,10 @@ def color_mesh_by_seams(input_path: Path, output_path: Path, *, mesh: mm.Mesh | 
     mm.saveMesh(mesh, str(output_path), save_settings)
 
 
-def _read_mesh_no_textures(input_path: Path) -> mm.Mesh:
-    with input_path.open(encoding="utf-8") as source:
-        vertices, faces = read_obj_geometry(source, input_path, triangulate=True)
-    mesh = mn.meshFromFacesVerts(
-        faces.astype(np.int32), vertices.astype(np.float32), duplicateNonManifoldVertices=False
-    )
-    if mesh.topology.numValidFaces() != len(faces):
-        raise ValueError(f"MeshLib could not construct all OBJ faces in {input_path}.")
-    print("MeshLib valid vertex count:", mesh.topology.numValidVerts())
-    return mesh
-
-
 def make_v_mapping(source_path: Path, target_path: Path ) -> dict: 
     """ Read in both meshes w/o texture map coordinates and use the locations to create a mapping from source vertex ids to target vertex ids based on proximity. """
-    source_mesh = _read_mesh_no_textures(source_path)
-    target_mesh = _read_mesh_no_textures(target_path)
+    source_mesh = read_mesh_no_textures(source_path)
+    target_mesh = read_mesh_no_textures(target_path)
 
     source_vertices = np.array([source_mesh.point(v) for v in range(source_mesh.topology.numValidVerts())])
     target_vertices = np.array([target_mesh.point(v) for v in range(target_mesh.topology.numValidVerts())])
@@ -111,7 +97,7 @@ def check_topology(input_path: Path, output_path: Path, *, mesh: mm.Mesh | None 
         input_topology = SeamTopology.from_dict(json.load(stream))
     print(f"Checking {seam_path}")
 
-    mesh = _read_mesh_no_textures(input_path)
+    mesh = read_mesh_no_textures(input_path)
 
     n_vertices = mesh.topology.numValidVerts()
 
@@ -494,6 +480,8 @@ def parameterize_mesh(input_path: Path, output_path: Path) -> Path:
 
     # Do the uv texture mapping and write that and the seam topology out
     uv_texture(input_path=patch_path, output_path=output_path, seam_topology=seam_topology)
+    print_mesh_topology(patch_path)
+    print_mesh_topology(output_path)    
 
     mesh_check1 = mm.loadMesh(str(patch_path))
     mesh_check2 = mm.loadMesh(str(output_path))
@@ -502,14 +490,6 @@ def parameterize_mesh(input_path: Path, output_path: Path) -> Path:
     n_vs2 = mesh_check2.topology.numValidVerts()
     print(f"Number of vertices in the patched mesh: {n_vs1}")
     print(f"Number of vertices in the output mesh: {n_vs2}")
-
-    verts1 = mn.getNumpyVerts(mesh_check1)
-    verts2 = mn.getNumpyVerts(mesh_check2)
-    if not np.isclose(verts1, verts2).all():
-        print("Vertex positions differ between patched mesh and output mesh.")
-        for indx in range(0, n_vs1):
-            if not np.isclose(mesh_check1.vertexMatrix()[indx], mesh_check2.vertexMatrix()[indx]).all():
-                print(f"Vertex {indx} differs: {mesh_check1.vertexMatrix()[indx]} vs {mesh_check2.vertexMatrix()[indx]}")
 
 
 def reparameterize_and_remove_calyx(input_path: Path, output_path: Path) -> Path:
@@ -618,11 +598,11 @@ def process_meshes(
                         continue
                 else:
                     continue
-        try:
-            processed_path = process_file(input_path, output_path)
-            processed_files.append(str(processed_path))
-        except Exception as exc:
-            print(f"Failed to process {input_path.name} to {output_path.name}: {exc}")
+        #try:
+        processed_path = process_file(input_path, output_path)
+        processed_files.append(str(processed_path))
+        #except Exception as exc:
+        #    print(f"Failed to process {input_path.name} to {output_path.name}: {exc}")
 
     return processed_files
 

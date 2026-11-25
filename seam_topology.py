@@ -19,12 +19,11 @@ class SeamInfo:
     Supports reading and writing to a .json file.
     Supports renumbering the vertices if the vertex indices change in the mesh.
     """
-    def __init__(self, name: str, vertex_ids: list, vertex_locations: list, uv_coords: list,
+    def __init__(self, name: str, vertex_ids: list, vertex_locations: list,
                  center: tuple | None, radius: float | None):
         self.name = name
         self.vertex_ids = vertex_ids
         self.vertex_locations = vertex_locations
-        self.uv_coords = uv_coords
         self.center = center
         self.radius = radius
 
@@ -45,13 +44,13 @@ class SeamInfo:
     def renumber_vertices(self, vertex_map: dict) -> None:
         """Renumber the vertex ids based on a provided mapping from old to new ids."""
         self.vertex_ids = [vertex_map.get(vid, vid) for vid in self.vertex_ids]
+        #self.vertex_ids = [vertex_map.get(vid, vid) for vid in self.vertex_ids]
 
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "vertex_ids": self.vertex_ids,
             "vertex_locations": self.vertex_locations,
-            "uv_coords": self.uv_coords,
             "center": self.center,
             "radius": self.radius,
         }
@@ -62,7 +61,6 @@ class SeamInfo:
             name=data["name"],
             vertex_ids=data["vertex_ids"],
             vertex_locations=data["vertex_locations"],
-            uv_coords=data["uv_coords"],
             center=data["center"],
             radius=data["radius"],
         )
@@ -75,7 +73,8 @@ class SeamTopology:
     """
     def __init__(self, ymin: float, ymax: float, top_point: tuple, bottom_point: tuple, seams: dict | None = None,
                  top_shoulder_radius: float | None = None, bottom_shoulder_radius: float | None = None,
-                 boundary_paths: list[dict] | None = None, top_vertex: int = -1, bottom_vertex: int = -1):
+                 boundary_paths: list[dict] | None = None, top_vertex: int = -1, bottom_vertex: int = -1,
+                 face_lists: dict | None = None):
         self.ymin = ymin
         self.ymax = ymax
         self.top_point = top_point
@@ -86,6 +85,7 @@ class SeamTopology:
         self.boundary_paths = [] if boundary_paths is None else boundary_paths
         self.top_vertex = top_vertex
         self.bottom_vertex = bottom_vertex
+        self.face_lists = {} if face_lists is None else face_lists
 
     def to_dict(self) -> dict:
         return {
@@ -99,11 +99,13 @@ class SeamTopology:
             "boundary_paths": self.boundary_paths,
             "top_vertex": self.top_vertex,
             "bottom_vertex": self.bottom_vertex,
+            "face_lists": {name: list(faces) for name, faces in self.face_lists.items()},
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "SeamTopology":
         seams = {name: SeamInfo.from_dict(seam) for name, seam in data["seams"].items()}
+        face_lists = {name: set(faces) for name, faces in data.get("face_lists", {}).items()} 
         return cls(
             ymin=data["ymin"],
             ymax=data["ymax"],
@@ -115,6 +117,7 @@ class SeamTopology:
             boundary_paths=data.get("boundary_paths"),
             top_vertex=data.get("top_vertex", -1),
             bottom_vertex=data.get("bottom_vertex", -1),
+            face_lists=face_lists,
         )
 
     def set_boundary_paths(self, records) -> None:
@@ -146,6 +149,8 @@ class SeamTopology:
             self.top_vertex = vertex_map.get(self.top_vertex, self.top_vertex)
         if self.bottom_vertex != -1:
             self.bottom_vertex = vertex_map.get(self.bottom_vertex, self.bottom_vertex)
+        for name, faces in self.face_lists.items():
+            self.face_lists[name] = {vertex_map.get(vid, vid) for vid in faces}
 
     def transform(self, translation, rotation) -> None:
         """Apply rotation then translation to 3D points; mesh Y bounds must be recomputed by the caller."""

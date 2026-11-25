@@ -42,8 +42,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 from filename_fixing import _apple_name_base
-from normalize_uv_projection import _read_obj, _read_seam_data, _read_texture, _warp_texture
-from legacy_seams import _read_legacy_seam_data
+from obj_geometry import create_adjacency_structure, read_obj, read_texture
 from fix_texture_maps import flood_fill_texture_map
 from seam_topology import SeamTopology
 

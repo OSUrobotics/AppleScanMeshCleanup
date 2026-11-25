@@ -18,32 +18,8 @@ from scipy.sparse.linalg import spsolve
 import numpy as np
 from scipy.sparse import csr_matrix
 from seam_topology import SeamInfo, SeamTopology
-from normalize_uv_projection import _calyx_uv_candidates, _read_obj, _read_texture, _vertex_geometry
 from uv_texture import _find_centers
-
-
-def _get_vertex_star(topo, v):
-  if not topo.hasVert(v):
-    return []
-
-  # Get the first outgoing half-edge from vertex v
-  start_edge = topo.edgeWithOrg(v)
-  if not start_edge.valid():
-    return []  # Isolated vertex with no connected faces
-
-  neighbors = []
-  curr_edge = start_edge
-
-  # Circulate through all outgoing half-edges around v
-  while True:
-    dest_vert = topo.dest(curr_edge)
-    neighbors.append(dest_vert.get())
-    # In MeshLib, next() rotates to the next outgoing edge around the same origin vertex
-    curr_edge = topo.next(curr_edge)
-    if curr_edge == start_edge:
-      break
-
-  return neighbors
+from obj_geometry import get_vertex_star
 
 
 def _is_y_extremum(
@@ -101,7 +77,7 @@ def _high_curvature_vertices(
     vs_in_half = np.flatnonzero(np.abs(vertices[:, 1] - center[1]) <= height)
     for vi in vs_in_half:
         vert_idx = mm.VertId(vi)
-        for nbr_idx in _get_vertex_star(mesh.topology, vert_idx):
+        for nbr_idx in get_vertex_star(mesh.topology, vert_idx):
             vert_adj[vi].add(int(nbr_idx))
 
     print(f"Mesh y bounds: center={center[1]}, height={height}")
@@ -303,32 +279,17 @@ def _mapped_vertex_id(vertex_map: mm.VertMap, vertex_id: int) -> int:
     return mapped_id
 
 
-def _pack_with_seams(mesh: mm.Mesh, seam_topology: SeamTopology) -> mm.VertMap:
+def _pack_with_seams(mesh: mm.Mesh) -> mm.VertMap:
+
     face_map = mm.FaceMap()
     vertex_map = mm.VertMap()
     mesh.pack(face_map, vertex_map)
     mesh.invalidateCaches()
-
-    seam_topology.renumber_seams(vertex_map=vertex_map)
     return vertex_map
-
-
-def _store_ring(mesh: mm.Mesh, seam_topology: SeamTopology, name: str,
-                ring_vs: list[int], center: np.ndarray, radius: float) -> None:
-    vertices = mn.getNumpyVerts(mesh)
-    seam_topology.add_seam(name, SeamInfo(
-        name=name,
-        vertex_ids=list(ring_vs),
-        vertex_locations=vertices[ring_vs].tolist(),
-        uv_coords=[],
-        center=tuple(float(value) for value in center),
-        radius=float(radius),
-    ))
 
 
 def _split_boundary_edges(mesh: mm.Mesh,
                           seam_topology: SeamTopology,
-                          center: np.ndarray,
                           vertices: np.ndarray, 
                           crossing_edges: np.ndarray, 
                           crossing_ts: np.ndarray) -> tuple[int, ...]:
@@ -362,15 +323,15 @@ def _split_boundary_edges(mesh: mm.Mesh,
         unique_undirected_edges[edge_id.get()] = (e, new_vert_loc)
 
     # Calculate the new locations and their theta values
+    print(f"Splitting edges")
     for undir_id, (edge, new_vert_loc) in unique_undirected_edges.items():
         """Split the edge and the adjacent faces at the specified parametric position."""
         new_edge_id = mesh.splitEdge(mm.EdgeId(undir_id), new_vert_loc)
         new_vert = mesh.topology.dest(new_edge_id)
         new_vertex_ids.append(new_vert.get())
         mesh.points[mm.VertId(new_vert.get())] = new_vert_loc
-        print(f"Split edge {undir_id} at new vertex {new_vert.get()}, loc{new_vert_loc}")
 
-    vertex_map = _pack_with_seams(mesh, seam_topology)
+    vertex_map = _pack_with_seams(mesh)
     new_vertex_ids = [_mapped_vertex_id(vertex_map, v) for v in new_vertex_ids]
 
     return new_vertex_ids
@@ -391,7 +352,7 @@ def _color_mesh_by_vertex_type(mesh: mm.Mesh, verts_to_color: list[tuple[list[in
 def _add_calyx_ring(mesh: mm.Mesh, seam_topology: SeamTopology, center: np.ndarray,
                     height: float, output_path: Path,
                     b_do_debug: bool = False
-                    ) -> tuple[tuple[tuple[int, ...], tuple[float, ...]], float, float]:
+                    ) -> tuple[np.ndarray, float]:
     """Add a calyx ring to the mesh based on the bottom center and high curvature vertices."""
     verts = mn.getNumpyVerts(mesh)
 
@@ -455,19 +416,19 @@ def _add_calyx_ring(mesh: mm.Mesh, seam_topology: SeamTopology, center: np.ndarr
     ring_vs = _split_boundary_edges(
         mesh=mesh,
         seam_topology=seam_topology,
-        center=center,
         vertices=verts, 
         crossing_edges=crossing_edges, 
         crossing_ts=crossing_ts
         )
-    _store_ring(mesh, seam_topology, "calyx", list(ring_vs), center, outer_calyx)
+    verts = mn.getNumpyVerts(mesh)
+    ring_locs = verts[list(ring_vs)]
 
     if b_do_debug:
         ring_split_path = output_path.with_name(output_path.stem + "_ring_split" + ".ply")
         vs_color = [(ring_vs, mm.Color(255, 0, 0, 255))]
         _color_mesh_by_vertex_type(mesh, vs_color, ring_split_path)
 
-    return ring_vs, outer_calyx, shoulder_radius
+    return ring_locs, shoulder_radius
 
 
 def _sort_ring_vertices(topo, boundary_vs: list[int]) -> list[int]:
@@ -478,7 +439,7 @@ def _sort_ring_vertices(topo, boundary_vs: list[int]) -> list[int]:
     sorted_vs = [boundary_vs[0]]
     while len(sorted_vs) < len(boundary_vs):
         last_v = sorted_vs[-1]
-        adj_vs = _get_vertex_star(topo=topo, v=mm.VertId(last_v))
+        adj_vs = get_vertex_star(topo=topo, v=mm.VertId(last_v))
         b_found = False
         for adj_v in adj_vs:
             if adj_v in boundary_vs and adj_v not in sorted_vs:
@@ -497,10 +458,11 @@ def _sort_ring_vertices(topo, boundary_vs: list[int]) -> list[int]:
         raise ValueError("Boundary loop is incomplete.")
     return sorted_vs
 
+
 def _patch_stem(mesh: mm.Mesh, seam_topology: SeamTopology, center: np.ndarray,
                 height: float, output_path: Path,
                 b_do_debug: bool = False,
-                ) -> tuple[list[int], np.ndarray, float, float]:
+                ) -> tuple[np.ndarray, float]:
     """ Find a small 2mm ring around the lowest point in the top, cut it out and replace with a flatish patch with a center point"""
     verts = mn.getNumpyVerts(mesh)
 
@@ -546,7 +508,6 @@ def _patch_stem(mesh: mm.Mesh, seam_topology: SeamTopology, center: np.ndarray,
     ring_vs = _split_boundary_edges(
         mesh=mesh,
         seam_topology=seam_topology,
-        center=center,
         vertices=verts, 
         crossing_edges=crossing_edges, 
         crossing_ts=crossing_ts
@@ -568,10 +529,11 @@ def _patch_stem(mesh: mm.Mesh, seam_topology: SeamTopology, center: np.ndarray,
             verts_to_delete.set(v, True)
     faces_to_delete: mm.FaceBitSet = mm.getIncidentFaces(topology=mesh.topology, verts=verts_to_delete)
     mesh.deleteFaces(fs=faces_to_delete)
-    vertex_map = _pack_with_seams(mesh, seam_topology)
+    vertex_map = _pack_with_seams(mesh)
 
     verts = mn.getNumpyVerts(mesh)
     ring_vs = [_mapped_vertex_id(vertex_map, v) for v in ring_vs]
+    ring_locs = verts[ring_vs, :]
 
     if b_do_debug:
         mesh_with_hole_path = output_path.with_name(output_path.stem + "_stem_hole" + ".ply")
@@ -607,18 +569,17 @@ def _patch_stem(mesh: mm.Mesh, seam_topology: SeamTopology, center: np.ndarray,
     n_faces_after = mesh.topology.numValidFaces()
     if n_faces_after - n_faces_befpre != len(new_faces):
         raise ValueError("Failed to add all new faces to the mesh.")
-    vertex_map = _pack_with_seams(mesh, seam_topology)
+    vertex_map = _pack_with_seams(mesh)
     ring_vs = [_mapped_vertex_id(vertex_map, v) for v in ring_vs]
     center_vert = mm.VertId(_mapped_vertex_id(vertex_map, center_vert.get()))
     mesh.invalidateCaches()
-    _store_ring(mesh, seam_topology, "stem", ring_vs, center_pt_loc, stem_radius)
 
     if b_do_debug:
         vs_color = [(ring_vs, mm.Color(0, 255, 0, 255)), ([center_vert.get()], mm.Color(255, 0, 0, 255))]
         patch_path = output_path.with_name(output_path.stem + "_top_patch" + ".ply")
         _color_mesh_by_vertex_type(mesh, vs_color, patch_path)
 
-    return ring_vs, center, shoulder_radius, max_y_dist
+    return ring_locs, shoulder_radius
 
 
 def patch_stem_and_ring_calyx(
@@ -627,15 +588,49 @@ def patch_stem_and_ring_calyx(
     height = 0.15 * (seam_topology.ymax - seam_topology.ymin)
     top_center = np.asarray(seam_topology.top_point)
     bottom_center = np.asarray(seam_topology.bottom_point)
-    calyx_ring_vs, calyx_radius, bottom_shoulder_radius = _add_calyx_ring(
+
+    calyx_v_locs, bottom_shoulder_radius = _add_calyx_ring(
         mesh=mesh, seam_topology=seam_topology, center=bottom_center, height=height, output_path=output_path, b_do_debug=b_do_debug
     )
 
-    stem_ring_vs, top_center_loc, top_shoulder_radius, max_y_dist_top = _patch_stem(
+    stem_v_locs, top_shoulder_radius = _patch_stem(
         mesh=mesh, seam_topology=seam_topology, center=top_center, height=height, output_path=output_path, b_do_debug=b_do_debug
     )
     seam_topology.top_shoulder_radius = float(top_shoulder_radius)
     seam_topology.bottom_shoulder_radius = float(bottom_shoulder_radius)
+
+    verts = mn.getNumpyVerts(mesh)
+    # Find the closest vertex index
+    calyx_v_id = []
+    calyx_v_loc = []
+    for loc in calyx_v_locs:
+        dists = np.linalg.norm(verts - loc, axis=1)
+        closest_idx = np.argmin(dists)
+        calyx_v_id.append(int(closest_idx))
+        calyx_v_loc.append([float(loc[0]), float(loc[1]), float(loc[2])])
+    calyx_seam = SeamInfo(name="calyx", 
+                          vertex_ids=calyx_v_id, 
+                          vertex_locations=calyx_v_loc, 
+                          center=seam_topology.bottom_point, 
+                          radius=float(bottom_shoulder_radius))
+
+    seam_topology.seams["calyx"] = calyx_seam
+
+    # Now do the same for the stem
+    stem_v_id = []
+    stem_v_loc = []
+    for loc in stem_v_locs:
+        dists = np.linalg.norm(verts - loc, axis=1)
+        closest_idx = np.argmin(dists)
+        stem_v_id.append(int(closest_idx))
+        stem_v_loc.append([float(loc[0]), float(loc[1]), float(loc[2])])
+    stem_seam = SeamInfo(name="stem", 
+                         vertex_ids=stem_v_id, 
+                         vertex_locations=stem_v_loc, 
+                         center=[float(top_center[0]), float(top_center[1]), float(top_center[2])], 
+                         radius=float(top_shoulder_radius))
+
+    seam_topology.seams["stem"] = stem_seam
     return mesh
 
 
@@ -1019,7 +1014,7 @@ def remove_calyx(input_path: Path, output_path: Path, seam_path: Path | None = N
     )
     # This input mesh and topology should have the stem ring and the calys ring
     # Do this so it doesn't duplicate vertices
-    lines, uvs, uv_faces, material_path = _read_obj(input_path)
+    lines, uvs, uv_faces, material_path = read_obj(input_path)
     vertices, faces = _vertex_geometry(lines, uv_faces, input_path)
     texture_path = _read_texture(material_path)
     if np.any(uvs < 0) or np.any(uvs > 1):
@@ -1028,25 +1023,14 @@ def remove_calyx(input_path: Path, output_path: Path, seam_path: Path | None = N
     seam_file = seam_path / (input_path.stem + "_seam_topology.json")
     with seam_file.open(encoding="utf-8") as stream:
         topology = SeamTopology.from_dict(json.load(stream))
+
     if "calyx" not in topology.seams:
         raise ValueError("Seam topology must contain a calyx ring.")
-    seam = topology.seams["calyx"]
-    _calyx_uv_candidates(lines, uv_faces, uvs, seam, input_path)
-    ring, inside, center_vertex = _calyx_faces(vertices, faces, seam, topology.bottom_point)
-    seam_entries = {vertex: (location, uv) for vertex, location, uv in
-                    zip(seam.vertex_ids, seam.vertex_locations, seam.uv_coords)}
-    seam.vertex_ids = ring
-    seam.vertex_locations = [seam_entries[vertex][0] for vertex in ring]
-    seam.uv_coords = [seam_entries[vertex][1] for vertex in ring]
-    patch_vertices, patch_uvs, patch_faces, center_vid = _grid_patch(
-        vertices, faces, uv_faces, uvs, ring, inside, center_vertex, seam.center
-    )
-    topology.bottom_vertex = center_vid
     
-    saved_uvs = dict(zip(seam.vertex_ids, seam.uv_coords))
-    for vertex, uv in zip(ring, patch_uvs):
-        if not np.any(np.linalg.norm(np.asarray(saved_uvs[vertex]) - uv, axis=1) <= 2e-6):
-            raise ValueError(f"Saved calyx UV for vertex {vertex} does not match the calyx side of the OBJ.")
+    calyx_seam = topology.seams["calyx"]
+    _calyx_uv_candidates(lines, uv_faces, uvs, calyx_seam, input_path)
+    ring, inside, center_vertex = _calyx_faces(vertices, faces, calyx_seam, topology.bottom_point)
+
     material_lines = material_path.read_text(encoding="utf-8").splitlines()
     material_names = [shlex.split(line, comments=True)[1] for line in material_lines
                       if shlex.split(line, comments=True)[:1] == ["newmtl"]]
@@ -1066,6 +1050,11 @@ def remove_calyx(input_path: Path, output_path: Path, seam_path: Path | None = N
     sources = {p.resolve() for p in (input_path, seam_path, material_path, texture_path)}
     if len({p.resolve() for p in outputs}) != len(outputs) or any(p.resolve() in sources for p in outputs):
         raise ValueError("Output files must be distinct and must not overwrite input files.")
+    patch_vertices, patch_uvs, patch_faces, center_vid = _grid_patch(
+        vertices, faces, uv_faces, uvs, ring, inside, center_vertex, seam.center
+    )
+    topology.bottom_vertex = center_vid
+    
 
     calyx_uv_faces = uv_faces[inside]
     selected_uvs = uvs[np.unique(calyx_uv_faces)]
@@ -1130,9 +1119,17 @@ def main() -> None:
     input_path, output_path = args.input_path, args.output_path
     if args.root_dir is not None:
         input_path, output_path = args.root_dir / input_path, args.root_dir / output_path
-    seam_path = args.seam_path
-    if seam_path is not None and args.root_dir is not None:
-        seam_path = args.root_dir / seam_path
+
+    seam_topology_path = input_path.with_name(input_path.stem + "_seam_topology.json")
+    with open(seam_topology_path, "r") as handle:
+        seam_topology = SeamTopology.from_dict(json.load(handle))
+
+    mesh=mm.loadMesh(str(input_path))
+    # Patch the stem connection with a ring of vertices and add a split ring around the calyx region
+    # Also computes the size of the ring for the bottom part of the apple and center points
+    patched_mesh = patch_stem_and_ring_calyx(
+        mesh=mesh, seam_topology=seam_topology, output_path=output_path, b_do_debug=False
+    )
     print(f"Wrote {remove_calyx(input_path, output_path, seam_path)}")
 
 

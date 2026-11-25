@@ -12,9 +12,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import lsqr
 
-from normalize_uv_projection import _match_seam_uvs, _read_obj
-from legacy_seams import _read_legacy_seam_data
-from obj_geometry import read_obj_geometry as _mesh_geometry
+from obj_geometry import read_obj
 
 
 _MAX_PROJECTED_EDGE_LENGTH = 0.01  # Maximum allowed projected edge length in UV space
@@ -373,6 +371,8 @@ def flood_fill_texture_map(
     missing = np.isclose(np.sum(pixels[:, :, 0:2], axis=2), 0)
     if has_alpha:
         missing |= pixels[:, :, 3] == 0
+
+    remainder_fill = _remainder_fill_red(result)
 
     coordinates = uvs * [width - 1, height - 1]
     coordinates[:, 1] = height - 1 - coordinates[:, 1]

@@ -24,13 +24,17 @@ from os import path
 import json
 from pathlib import Path
 
+from scipy.sparse import csc_array
+from scipy.sparse.linalg import spsolve
+
+
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 import numpy as np
 from seam_topology import SeamTopology
 from uv_texture import _geodesic
-from MeshLabCleanup import _read_mesh_no_textures
-from remove_calyx import _get_vertex_star
+from obj_geometry import create_adjacency_structure, read_mesh_no_textures
+from projection_routines import place_in_circle, place_in_square
 
 
 def _define_quadrant(mesh: mm.Mesh, edge_adjacency, seam_vertices: list[int], center_vertex: int):
@@ -57,153 +61,10 @@ def _define_quadrant(mesh: mm.Mesh, edge_adjacency, seam_vertices: list[int], ce
     return cap_vertices
 
 
-def _place_in_circle(mesh: mm.Mesh, edge_adjacency, boundary_vs: list[int], inside_vs: list[int], center: int):
-    """ Set up a least squares problem to place the inside vertices in a circle defined by the boundary vertices and the center. 
-    Use the edge lengths as weights in the least squares problem to maintain the relative distances between vertices. 
-    Place the boundary vertices on the circle based on their original edge lengths.
-    Place the center vertex at the origin."""
-
-    map_vs = {center: 0}
-    map_back_vs = {0: center}
-    for i, v in enumerate(boundary_vs):
-        map_vs[v] = i + 1
-        map_back_vs[i + 1] = v
-    for i, v in enumerate(inside_vs):
-        map_vs[v] = i + 1 + len(boundary_vs)
-        map_back_vs[i + 1 + len(boundary_vs)] = v
-
-    # The A matrix and b vector for the least squares problem will be set up here. 
-    n_constraints = len(boundary_vs) + len(inside_vs) + 1  # +1 for the center vertex
-    a_mat = np.zeros((n_constraints, n_constraints))
-    b_vec = np.zeros((n_constraints, 2))
-
-    # For now, we just place the boundary vertices on the circle and the center at the origin.
-    # Compute the total perimeter length of the boundary
-    verts = mn.getNumpyVerts(mesh)
-
-    total_length = 0.0
-    edge_lengths = []
-    for i in range(len(boundary_vs)):
-        v1 = boundary_vs[i]
-        v2 = boundary_vs[(i + 1) % len(boundary_vs)]
-        edge_length = np.linalg.norm(verts[v1] - verts[v2])
-        total_length += edge_length
-        edge_lengths.append(edge_length)
-
-    # Place the center vertex at the origin
-    a_mat[0, 0] = 1.0
-    b_vec[0] = np.array([0.0, 0.0])
-
-    # Place the boundary vertices on the circle based on their original edge lengths
-    import math
-    angle = 0.0
-    for i in range(len(boundary_vs)):
-        a_mat[i + 1, i + 1] = 1.0
-        b_vec[i + 1] = np.array([math.cos(angle), math.sin(angle)])
-        angle += 2 * math.pi * edge_lengths[i] / total_length
-
-    # Now place the inside the vertices as 1/n * their neighbors
-    for i, v in enumerate(inside_vs):
-        a_mat[i + 1 + len(boundary_vs), i + 1 + len(boundary_vs)] = 1.0
-        neighbors = [n for n, _ in edge_adjacency[v]]
-        n_neighbors = len(neighbors)
-        perc = 1.0 / n_neighbors
-        for neighbor in neighbors:
-            map_v = map_vs.get(neighbor, None)
-            if map_v is not None:
-                a_mat[i + 1 + len(boundary_vs), map_v] = -perc
-
-    x = np.linalg.solve(a_mat, b_vec)
-    return x, map_back_vs
-
-
-def _place_in_square(mesh: mm.Mesh, edge_adjacency, boundary_seam_vs: list[list[int]], inside_vs: list[int], map_vs: dict):
-    # The A matrix and b vector for the least squares problem will be set up here. 
-    
-    # Make a flat list of all the boundary vs
-    boundary_vs = [v for sublist in boundary_seam_vs for v in sublist]
-    map_vs = {}
-    map_back_vs = {}
-    count = 0
-    for v in boundary_vs:
-        map_vs[v] = count
-        map_back_vs[count] = v
-        count += 1
-    for v in inside_vs:
-        if v not in map_vs:
-            map_vs[v] = len(map_vs)
-            map_back_vs[len(map_vs) - 1] = v
-
-    n_constraints = len(boundary_vs) + len(inside_vs)
-    a_mat = np.zeros((n_constraints, n_constraints))
-    b_vec = np.zeros((n_constraints, 2))
-
-    # Each seam gets placed on a consecutive side of the square by edge length
-    sides_x = [1.0, -1.0, -1.0, 1.0]
-    sides_y = [1.0, 1.0, -1.0, -1.0]
-
-    # Place the seams on the four sides of the square
-    for indx, seam in enumerate(boundary_seam_vs):
-        side_x_start = sides_x[indx]
-        side_y_start = sides_y[indx]
-        side_x_end = sides_x[(indx + 1) % 4]
-        side_y_end = sides_y[(indx + 1) % 4]
-        # Sum up the edge lengths along the seam to determine placement on the side of the square
-        edge_lengths = []
-        for i in range(len(seam) - 1):
-            v1 = seam[i]
-            v2 = seam[i + 1]
-            edge_lengths.append(np.linalg.norm(mesh.vertices[v1] - mesh.vertices[v2]))
-        total_length = sum(edge_lengths)
-        t = 0.0
-        for vi, v in enumerate(seam):
-            row = map_vs[v]
-            a_mat[row, row] = 1.0
-            b_vec[row] = np.array([side_x_start + (side_x_end - side_x_start) * t,
-                                   side_y_start + (side_y_end - side_y_start) * t])
-            t += (edge_lengths[vi - 1] / total_length if vi > 0 else 0.0)
-
-    # Now place the inside the vertices as 1/n * their neighbors
-    for i, v in enumerate(inside_vs):
-        row = map_vs[v]
-        a_mat[row, row] = 1.0
-        neighbors = [n for n, _ in edge_adjacency[v]]
-        n_neighbors = len(neighbors)
-        perc = 1.0 / n_neighbors
-        for neighbor in neighbors:
-            map_v = map_vs.get(neighbor, None)
-            if map_v is not None:
-                a_mat[row, map_v] = -perc
-
-    x = np.linalg.solve(a_mat, b_vec)
-    return x, map_back_vs
-
-
-def _create_adjacency_structure(mesh: mm.Mesh) -> list[list[tuple[int, float]]]:
-    """ Create an edge adjacency structure as a list of neighbors for each vertex. """
-    adjacency = [[] for _ in range(mesh.topology.numValidVerts())]
-
-    verts = mn.getNumpyVerts(mesh)
-
-    for v in range(0, mesh.topology.numValidVerts()):
-        v_neighs = _get_vertex_star(mesh.topology, mm.VertId(v))
-        for u in v_neighs:
-            if u < v:
-                continue
-
-            np.linalg.norm(verts[u] - verts[v])
-            length = np.linalg.norm(verts[u] - verts[v])
-            weight = float(length)
-
-            adjacency[u].append((v, weight))
-            adjacency[v].append((u, weight))
-    return adjacency
-
-
 def _define_second_side_seam(mesh: mm.Mesh, seam_vertices: list[int], start_vertex: int, end_vertex: int):
     """ Using the graph adjacency do a breadth first search starting from the start vertex to define the second side seam patch. 
     The search should continue until it reaches the end vertex or a seam vertex, but should not cross a seam vertex. Return the list of vertices that belong to the second side seam patch. """
-    edge_adjacency = _create_adjacency_structure(mesh)
+    edge_adjacency = create_adjacency_structure(mesh)
     seam_vertices = set(seam_vertices)
     if start_vertex in seam_vertices:
         seam_vertices.remove(start_vertex)
@@ -253,12 +114,12 @@ def _project_patches(mesh: mm.Mesh, seam_topology: SeamTopology):
     second_side_patch = _define_quadrant(mesh, edge_adjacency, second_side_seam_vs, max_z_vertex)
 
     # Now project the top and bottom caps to circles and the side patches to squares
-    top_circle = _place_in_circle(mesh=mesh, edge_adjacency=edge_adjacency, boundary_vs=top_seam_vs, inside_vs=top_cap, center=seam_topology.top_vertex)
-    bottom_circle = _place_in_circle(mesh=mesh, edge_adjacency=edge_adjacency, boundary_vs=bottom_seam_vs, inside_vs=bottom_cap, center=seam_topology.bottom_vertex)
+    top_circle = place_in_circle(mesh=mesh, edge_adjacency=edge_adjacency, boundary_vs=top_seam_vs, inside_vs=top_cap, center=seam_topology.top_vertex)
+    bottom_circle = place_in_circle(mesh=mesh, edge_adjacency=edge_adjacency, boundary_vs=bottom_seam_vs, inside_vs=bottom_cap, center=seam_topology.bottom_vertex)
     first_square = [side_seam_vs, bottom_seam_vs[0:split_bottom_seam], list(reversed(second_side_seam_vs)), list(reversed(top_seam_vs[split_top_seam:]))]
-    square1 = _place_in_square(mesh=mesh, edge_adjacency=edge_adjacency, boundary_vs=first_square, inside_vs=side_patch)
+    square1 = place_in_square(mesh=mesh, edge_adjacency=edge_adjacency, boundary_vs=first_square, inside_vs=side_patch)
     second_square = [second_side_seam_vs, list(reversed(bottom_seam_vs[split_bottom_seam:])), list(reversed(side_seam_vs)), top_seam_vs[0:split_top_seam]]
-    square2 = _place_in_square(mesh=mesh, edge_adjacency=edge_adjacency, boundary_vs=second_square, inside_vs=second_side_patch, center=max_z_vertex)
+    square2 = place_in_square(mesh=mesh, edge_adjacency=edge_adjacency, boundary_vs=second_square, inside_vs=second_side_patch, center=max_z_vertex)
 
     return top_circle, bottom_circle, square1, square2
 
@@ -286,8 +147,8 @@ def _place_vertices(mesh: mm.Mesh,
 
 def align_meshes(input_path: Path, canonical_path: Path, output_path: Path):
     """ Read in the meshes (no uv coordinates) and the seam topologies then patch each"""
-    mesh = _read_mesh_no_textures(input_path)
-    canonical_mesh = _read_mesh_no_textures(canonical_path)
+    mesh = read_mesh_no_textures(input_path)
+    canonical_mesh = read_mesh_no_textures(canonical_path)
     # Read the seam topologies for both meshes
     seam_path = input_path.with_name(input_path.stem + "_seam_topology.json")
     with seam_path.open(encoding="utf-8") as stream:

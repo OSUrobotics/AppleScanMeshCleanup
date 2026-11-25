@@ -36,3 +36,5 @@ def print_mesh_topology(mesh_path: str | Path, b_check = False, *, mesh: mm.Mesh
         if non_manifold_vertices > 0:
             print(f"Warning: Non-manifold vertices found in {Path(mesh_path).name}")
     return euler_characteristic
+
+

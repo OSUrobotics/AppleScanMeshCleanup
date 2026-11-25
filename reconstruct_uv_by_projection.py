@@ -11,7 +11,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
 from align_meshes import _SurfaceLocator, _mesh
-from normalize_uv_projection import _read_texture
+from obj_geometry import read_texture
 from seam_topology import SeamInfo, SeamTopology
 
 

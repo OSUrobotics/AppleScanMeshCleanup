@@ -247,9 +247,9 @@
                 "--root-dir",
                 "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
                 "--input-path",
-                "BlenderRebaked/Envy_001_FullRes.obj",
+                "Voxelized/Envy_001_FullRes.obj",
                 "--output-path",
-                "CalyxRemoved/Envy_001_FullRes_NoCalyx.obj",
+                "Parameterized/Envy_001_FullRes_patch.obj",
                 "--seam-path",
                 "Parameterized/Envy_001_FullRes_seam_topology.json"
             ]

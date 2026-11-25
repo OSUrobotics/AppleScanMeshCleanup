@@ -13,9 +13,11 @@ The output OBJ has a companion <output stem>_seam_topology.json with normalized 
 import argparse
 import json
 import math
-import shlex
 import warnings
 from pathlib import Path
+
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import numpy as np
 from PIL import Image
@@ -25,8 +27,14 @@ from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
-from filename_fixing import _split_filename_into_apple_type_and_number
+from filename_fixing import write_material_file
 from seam_topology import SeamInfo, SeamTopology
+from obj_geometry import read_obj, read_texture, read_mesh_no_textures, write_obj, create_adjacency_structure, bfs_graph, compute_edge_locs_line, compute_edge_locs_circle
+from uv_texture import write_texture_uvs, _CAP_RADIUS, _CAP_CENTERS, _UV_PADDING
+from projection_routines import place_in_circle, place_in_square, label_vs_and_fs
+
+from scipy.sparse import csc_array
+from scipy.sparse.linalg import spsolve
 
 
 _SEAM_TOLERANCE = 2e-6
@@ -35,179 +43,6 @@ _TEXTURE_PADDING_PIXELS = 4
 _DIAMOND_CORNERS = np.array(
     [[0.5, 0.0], [1.0, 0.5], [0.5, 1.0], [0.0, 0.5]]
 )
-
-
-def _read_obj(input_path: Path):
-    lines = input_path.read_text(encoding="utf-8").splitlines()
-    uvs = []
-    faces = []
-    mtllibs = []
-    for line in lines:
-        parts = line.split()
-        if not parts:
-            continue
-        if parts[0] == "vt":
-            if len(parts) < 3:
-                raise ValueError(f"Invalid texture coordinate in {input_path}: {line}")
-            uvs.append([float(parts[1]), float(parts[2])])
-        elif parts[0] == "f":
-            if len(parts) != 4:
-                raise ValueError(f"Expected triangular OBJ faces in {input_path}.")
-            face = []
-            for corner in parts[1:]:
-                fields = corner.split("/")
-                if len(fields) < 2 or not fields[1]:
-                    raise ValueError(f"Face is missing texture coordinates: {line}")
-                index = int(fields[1])
-                if index == 0:
-                    raise ValueError("OBJ texture indices cannot be zero.")
-                face.append(index - 1 if index > 0 else len(uvs) + index)
-            faces.append(face)
-        elif parts[0] == "mtllib":
-            mtllibs.extend(shlex.split(line)[1:])
-
-    coordinates = np.asarray(uvs, dtype=np.float64)
-    triangles = np.asarray(faces, dtype=np.int64)
-    if coordinates.ndim != 2 or coordinates.shape[1] != 2 or not np.isfinite(coordinates).all():
-        raise ValueError(f"Expected finite UV coordinates in {input_path}.")
-    if triangles.ndim != 2 or triangles.shape[1] != 3:
-        raise ValueError(f"Expected triangular faces with UV coordinates in {input_path}.")
-    if triangles.min() < 0 or triangles.max() >= len(coordinates):
-        raise ValueError(f"Face UV index is out of range in {input_path}.")
-    if len(mtllibs) != 1:
-        raise ValueError(f"Expected exactly one OBJ material library in {input_path}.")
-    return lines, coordinates, triangles, input_path.parent / mtllibs[0]
-
-
-def _read_texture(material_path: Path) -> Path:
-    textures = []
-    materials = 0
-    for line in material_path.read_text(encoding="utf-8").splitlines():
-        parts = shlex.split(line, comments=True)
-        if parts and parts[0] == "newmtl":
-            materials += 1
-        if parts and (parts[0].startswith("map_") or parts[0] in ("bump", "disp", "decal")) and parts[0] != "map_Kd":
-            raise ValueError(f"Unsupported material texture {parts[0]} in {material_path}.")
-        if parts and parts[0] == "map_Kd":
-            if len(parts) != 2:
-                raise ValueError(f"Unsupported map_Kd options in {material_path}: {line}")
-            textures.append(material_path.parent / parts[1])
-    if materials != 1 or len(textures) != 1:
-        raise ValueError(f"Expected one material with one diffuse texture in {material_path}.")
-    return textures[0]
-
-
-def _read_seam_data(topology: SeamTopology) -> tuple[list[tuple[list[int], np.ndarray]], np.ndarray]:
-    topology.set_boundary_paths(
-        (path["vertex_ids"], path["uv_coords"]) for path in topology.boundary_paths
-    )
-    records = [
-        (path["vertex_ids"], np.asarray(path["uv_coords"], dtype=np.float64))
-        for path in topology.boundary_paths
-    ]
-    centers = np.asarray([topology.top_point, topology.bottom_point], dtype=np.float64)
-    return records, centers
-
-
-def _read_seams(topology: SeamTopology) -> list[np.ndarray]:
-    return [uv for _, uv in _read_seam_data(topology)[0]]
-
-
-def _match_seam_uvs(original_uvs: np.ndarray, seams: list[np.ndarray]) -> list[np.ndarray]:
-    seam_indices = []
-    uv_tree = cKDTree(original_uvs)
-    for index, seam in enumerate(seams):
-        distances, matches = uv_tree.query(seam)
-        if np.max(distances) > _SEAM_TOLERANCE:
-            raise ValueError(
-                f"Seam {index + 1} does not match the OBJ UVs "
-                f"(maximum error {np.max(distances):.6g}); use the matching seam topology."
-            )
-        seam_indices.append(matches)
-    return seam_indices
-
-
-def _vertex_geometry(
-    lines: list[str], faces: np.ndarray, input_path: Path
-) -> tuple[np.ndarray, np.ndarray]:
-    vertices = []
-    vertex_faces = []
-    for line in lines:
-        parts = line.split()
-        if not parts:
-            continue
-        if parts[0] == "v":
-            vertices.append([float(value) for value in parts[1:4]])
-        elif parts[0] == "f":
-            indices = [int(corner.split("/")[0]) for corner in parts[1:]]
-            if 0 in indices:
-                raise ValueError(f"OBJ vertex indices cannot be zero in {input_path}.")
-            vertex_faces.append([index - 1 if index > 0 else len(vertices) + index for index in indices])
-    coordinates = np.asarray(vertices, dtype=np.float64)
-    triangles = np.asarray(vertex_faces, dtype=np.int64)
-    if coordinates.ndim != 2 or coordinates.shape[1] != 3 or not np.isfinite(coordinates).all():
-        raise ValueError(f"Expected finite 3D vertices in {input_path}.")
-    if triangles.shape != faces.shape or triangles.min() < 0 or triangles.max() >= len(coordinates):
-        raise ValueError(f"Face vertex index is out of range in {input_path}.")
-    return coordinates, triangles
-
-
-def _center_uv_indices(
-    lines: list[str], faces: np.ndarray, centers: np.ndarray, input_path: Path
-) -> list[np.ndarray]:
-    coordinates, triangles = _vertex_geometry(lines, faces, input_path)
-    closest = cKDTree(coordinates).query(centers)[1]
-    return [np.unique(faces[triangles == index]) for index in closest]
-
-
-def _calyx_uv_candidates(
-    lines: list[str], faces: np.ndarray, uvs: np.ndarray, calyx: SeamInfo, input_path: Path
-) -> list[np.ndarray]:
-    coordinates, triangles = _vertex_geometry(lines, faces, input_path)
-    ids = calyx.vertex_ids
-    if len(ids) < 3 or len(set(ids)) != len(ids) or len(calyx.uv_coords) != len(ids):
-        raise ValueError("The calyx seam must contain at least three distinct vertices with UV coordinates.")
-    candidates = []
-    for vertex_id, copies in zip(ids, calyx.uv_coords):
-        if not isinstance(vertex_id, int) or vertex_id < 0 or vertex_id >= len(coordinates):
-            raise ValueError(f"Invalid calyx vertex index {vertex_id} in {input_path}.")
-        saved = np.asarray(copies, dtype=np.float64)
-        if saved.ndim != 2 or saved.shape[1] != 2 or len(saved) == 0 or not np.isfinite(saved).all():
-            raise ValueError(f"Invalid calyx UV coordinates for vertex {vertex_id}.")
-        indices = np.unique(faces[triangles == vertex_id])
-        distances = np.linalg.norm(uvs[indices, None, :] - saved[None, :, :], axis=2)
-        matches = indices[np.any(distances <= _SEAM_TOLERANCE, axis=1)]
-        if len(matches) == 0:
-            raise ValueError(f"Calyx UV coordinates for vertex {vertex_id} do not match {input_path}.")
-        candidates.append(matches)
-    return candidates
-
-
-def _ordered_boundary(edges: np.ndarray) -> list[int]:
-    neighbors: dict[int, list[int]] = {}
-    for a, b in edges:
-        neighbors.setdefault(int(a), []).append(int(b))
-        neighbors.setdefault(int(b), []).append(int(a))
-    if not neighbors or any(len(adjacent) != 2 for adjacent in neighbors.values()):
-        raise ValueError("Each UV chart must have one simple closed boundary.")
-    first = next(iter(neighbors))
-    boundary = [first]
-    visited = {first}
-    previous = -1
-    current = first
-    while True:
-        adjacent = neighbors[current]
-        following = adjacent[0] if adjacent[0] != previous else adjacent[1]
-        if following == first:
-            break
-        if following in visited:
-            raise ValueError("The UV chart boundary intersects itself.")
-        boundary.append(following)
-        visited.add(following)
-        previous, current = current, following
-    if len(boundary) != len(neighbors):
-        raise ValueError("A UV chart has multiple boundary loops.")
-    return boundary
 
 
 def _parameterize(
@@ -370,6 +205,7 @@ def _warp_texture(
 ) -> None:
     with Image.open(texture_path) as input_image:
         source = np.asarray(input_image.convert("RGB"))
+
     height, width = source.shape[:2]
     output = np.zeros_like(source)
     covered = np.zeros((height, width), dtype=bool)
@@ -421,26 +257,118 @@ def _warp_texture(
     Image.fromarray(output).save(output_texture)
 
 
-def _find_seam_file(input_path: Path, seam_dir: Path) -> Path:
-    if not seam_dir.is_dir():
-        raise NotADirectoryError(f"Seam directory not found or not a directory: {seam_dir}")
-    apple = _split_filename_into_apple_type_and_number(input_path.name)
-    matches = []
-    for candidate in seam_dir.glob("*_seam_topology.json"):
-        if not candidate.is_file():
-            continue
-        try:
-            candidate_apple = _split_filename_into_apple_type_and_number(candidate.name)
-        except ValueError:
-            continue
-        if candidate_apple == apple:
-            matches.append(candidate)
-    if len(matches) > 1:
-        names = ", ".join(sorted(path.name for path in matches))
-        raise ValueError(f"Multiple seam topology JSON files match {input_path.name} in {seam_dir}: {names}")
-    if matches:
-        return matches[0]
-    raise FileNotFoundError(f"No seam topology JSON found for {input_path.name} in {seam_dir}.")
+def place_uvs_in_new_locs(mesh: mm.Mesh, 
+                          seam_topology: SeamTopology, 
+                          vertex_uv: np.ndarray, 
+                          vert_uv_ids: np.ndarray,
+                          face_vert_ids: np.ndarray,
+                          face_uv_ids: np.ndarray,
+                          labels: dict):
+    """ This takes the top and bottom regions and places them with a circle boundary, with each vertex
+     at the center of its neighbors and (optionally), the center vertex at the origin
+      The middle bit is mapped to a diamond-shaped region. """
+    
+    # Define the new seam by connecting the top and bottom seams at the mid point
+    top_seam_vs = seam_topology.seams["top"].vertex_ids
+    bottom_seam_vs = seam_topology.seams["bottom"].vertex_ids
+    side_seam_vs = seam_topology.seams["side"].vertex_ids
+    # All of the seam vertices in a set
+    all_seam_vs = set(top_seam_vs) | set(bottom_seam_vs) | set(side_seam_vs)
+
+    # Label vertices and faces into calyx, top, and middle regions based on the original UVs and faces
+    # Note that vertices will show up in multiple regions if they are shared across faces
+    bottom_vs, bottom_fs, top_vs, top_fs, middle_vs, middle_fs, edge_adj = labels
+
+    # Find the bottom vertex that is closest to the bottom point seam
+    bottom_pt = seam_topology.bottom_point
+    # Find the bottom vertex that is closest to the bottom point
+    verts = mn.getNumpyVerts(mesh)
+    bottom_dists = np.linalg.norm(verts - bottom_pt, axis=1)
+    bottom_vid = np.argmin(bottom_dists)
+    if bottom_vid not in bottom_vs:
+        raise ValueError("Closest bottom vertex is not in the bottom vertex set.")
+
+    new_top_locs, map_top, _ = place_in_circle(mesh=mesh, edge_adjacency=edge_adj, boundary_vs=top_seam_vs, inside_vs=top_vs, center=seam_topology.top_vertex, radius=_CAP_RADIUS - 0.01)
+    new_bottom_locs, map_bottom, _ = place_in_circle(mesh=mesh, edge_adjacency=edge_adj, boundary_vs=bottom_seam_vs, inside_vs=bottom_vs, center=bottom_vid, radius=_CAP_RADIUS - 0.01)
+    new_bottom_locs[:, :] += _CAP_CENTERS[1]
+    new_top_locs[:, :] += _CAP_CENTERS[0]
+
+    diamond_corners = np.array(
+        [[0.5, _UV_PADDING], [1.0 - _UV_PADDING, 0.5], [0.5, 1.0 - _UV_PADDING], [_UV_PADDING, 0.5]],
+        dtype=np.float64,
+            )
+
+    new_diamond_locs, map_diamond, _, vs_left, vs_right = place_in_square(mesh=mesh, 
+                                                                           edge_adjacency=edge_adj, 
+                                                                           face_vertex_indices=face_vert_ids,
+                                                                           seam_topology=seam_topology, 
+                                                                           inside_vs=middle_vs,
+                                                                           corners=diamond_corners)   
+
+    # Now put the new uv locations back into new_vertex_uv
+    new_vertex_uv = np.copy(vertex_uv)
+
+    # Which uv vertices belong to the
+    seams = [[], [], []]    
+    for v in seam_topology.seams["top"].vertex_ids:
+        seams[0].append(vert_uv_ids[v])
+    for v in seam_topology.seams["bottom"].vertex_ids:
+        seams[1].append(vert_uv_ids[v])
+    for v in seam_topology.seams["side"].vertex_ids:
+        seams[2].append(vert_uv_ids[v])
+    seam_vt_ids = []
+    for seam in seams:
+        seam_side_a = [s[0] for s in seam[1:-1]]
+        seam_side_b = [s[1] for s in seam[1:-1]]
+        seam_vt_ids.append(seam_side_a)
+        seam_vt_ids.append(seam_side_b)
+    for indx in range(len(seam_vt_ids)):
+        for indx2 in range(indx+1, len(seam_vt_ids)):
+            if set(seam_vt_ids[indx]).intersection(set(seam_vt_ids[indx2])):
+                raise ValueError(f"Overlap found between seam segments {indx} and {indx2}.")
+
+    v_set = set()
+    # For the top and bottom, jsut find the corresponding vertex texture id and put it there
+    for fs, map_v, locs in zip((top_fs, bottom_fs), (map_top, map_bottom), (new_top_locs, new_bottom_locs)):
+        for face in fs:
+            # Get the face vertex vt ids
+            for vt_id, vid in zip(face_uv_ids[face], face_vert_ids[face]):
+                new_vertex_uv[vt_id] = locs[map_v[vid]]  
+                v_set.add(vt_id)
+    
+    # The middle is a bit trickier because the seam vertices and corners are split across multiple faces
+    left_faces = seam_topology.face_lists["left_side_seam"]
+    right_faces = seam_topology.face_lists["right_side_seam"]
+    for face in middle_fs:
+        face_uv_id = face_uv_ids[face]
+        face_id = face_vert_ids[face]
+        for vid, vt_id in zip(face_id, face_uv_id):
+            map_v = map_diamond.get(vid, None)
+            if map_v is None:
+                raise ValueError(f"Vertex {vid} not found in map_diamond.")
+            if len(map_v) == 1:
+                new_vertex_uv[vt_id] = new_diamond_locs[map_v[0]]
+                v_set.add(vt_id)
+            elif len(map_v) == 2:
+                # It's either in the left or the right side
+                print(f"loc 1 for vertex {vid} is {new_diamond_locs[map_v[0]]}")
+                print(f"loc 2 for vertex {vid} is {new_diamond_locs[map_v[1]]}")
+                if face in left_faces:
+                    new_vertex_uv[vt_id] = new_diamond_locs[map_v[0]]
+                    v_set.add(vt_id)
+                    continue
+                if face in right_faces:
+                    new_vertex_uv[vt_id] = new_diamond_locs[map_v[1]]
+                    v_set.add(vt_id)
+                    continue
+                raise ValueError(f"Vertex {vid} with multiple mappings is not on either side of the seam.")
+            else:
+                raise ValueError(f"Vertex {vid} has unexpected number of mappings in map_diamond: {len(map_v)}")    
+
+    if len(v_set) != len(new_vertex_uv):
+        print ("Warning: Some UVs were not assigned new locations.")
+        # raise ValueError("Some UVs were not assigned new locations.")
+    return new_vertex_uv, seams
 
 
 def normalize_uv_projection(input_path: Path, output_path: Path, seam_path: Path) -> Path:
@@ -453,72 +381,58 @@ def normalize_uv_projection(input_path: Path, output_path: Path, seam_path: Path
     seam_file = seam_path / (input_path.stem + "_seam_topology.json")
     with seam_file.open(encoding="utf-8") as stream:
         topology = SeamTopology.from_dict(json.load(stream))
-
-    lines, original_uvs, faces, material_path = _read_obj(input_path)
-    texture_path = _read_texture(material_path)
-    if np.any(original_uvs < -1e-8) or np.any(original_uvs > 1.0 + 1e-8):
-        raise ValueError("The input UVs must lie within the texture image; tiled UVs are not supported.")
     if "calyx" not in topology.seams:
         raise ValueError(f"Seam topology {seam_path} must contain a calyx ring.")
-    records, centers = _read_seam_data(topology)
-    seams = [uv for _, uv in records]
-    center_uv_indices = _center_uv_indices(lines, faces, centers, input_path)
-    calyx_uvs = _calyx_uv_candidates(lines, faces, original_uvs, topology.seams["calyx"], input_path)
-    normalized_uvs = _parameterize(original_uvs, faces, seams, center_uv_indices, calyx_uvs)
-    seam_indices = _match_seam_uvs(original_uvs, seams)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_texture = output_path.with_suffix(".jpg")
     output_material = output_path.with_suffix(".mtl")
-    output_seams = output_path.with_name(output_path.stem + "_seam_topology.json")
-    sources = {input_path.resolve(), seam_file.resolve(), material_path.resolve(), texture_path.resolve()}
-    if any(path.resolve() in sources for path in (output_path, output_material, output_texture, output_seams)):
-        raise ValueError("Output files must not overwrite the input mesh, seam, material, or texture.")
-    coordinates = []
-    targets = []
-    for name, seam in topology.seams.items():
-        for index, copies in enumerate(seam.uv_coords):
-            if copies:
-                if name == "calyx":
-                    saved = np.asarray(copies, dtype=np.float64)
-                    candidate_indices = calyx_uvs[index]
-                    distances = np.linalg.norm(
-                        original_uvs[candidate_indices, None, :] - saved[None, :, :], axis=2
-                    )
-                    closest = np.argmin(distances, axis=0)
-                    if np.any(distances[closest, np.arange(len(saved))] > _SEAM_TOLERANCE):
-                        raise ValueError(f"Calyx UV coordinates for vertex {seam.vertex_ids[index]} do not match {input_path}.")
-                    seam.uv_coords[index] = normalized_uvs[candidate_indices[closest]].tolist()
-                    continue
-                start = len(coordinates)
-                coordinates.extend(copies)
-                targets.append((seam, index, start, len(coordinates)))
-    if coordinates:
-        matched = _match_seam_uvs(original_uvs, [np.asarray(coordinates, dtype=np.float64)])[0]
-        for seam, index, start, end in targets:
-            seam.uv_coords[index] = normalized_uvs[matched[start:end]].tolist()
-    topology.set_boundary_paths(
-        (ids, normalized_uvs[indices]) for (ids, _), indices in zip(records, seam_indices)
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    _warp_texture(texture_path, output_texture, original_uvs, normalized_uvs, faces)
+    output_seams = output_path.with_name(output_path.stem + "_seam_topology.json")  
+
+    mesh = read_mesh_no_textures(input_path)
+
+    # Read in the obj geometry separated into vertex locations, UVs, normals, and faces
+    vertex_loc, vertex_uv, vert_uv_ids, vertex_normals, face_triangles, face_uv_triangles, mtllibs = read_obj(input_path)
+    material_path = input_path.with_suffix(".mtl")
+    texture_path = read_texture(material_path)
+
+    # Label vertices and faces into calyx, top, and middle regions based on the original UVs and faces
+    # Note that vertices will show up in multiple regions if they are shared across faces
+    labels = label_vs_and_fs(mesh=mesh, 
+                             seam_topology=topology)
+
+    # The new locations for the uv coordinates, with boundaries mapped to the two circles and the diamonds
+    new_uv_locs, seams = place_uvs_in_new_locs(mesh=mesh,
+                                                seam_topology=topology,
+                                                vertex_uv=vertex_uv,
+                                                vert_uv_ids=vert_uv_ids,
+                                                face_vert_ids=face_triangles,
+                                                face_uv_ids=face_uv_triangles,
+                                                labels=labels)
+
+    write_texture_uvs(seam_vs=seams, uvs=new_uv_locs, texture_path=output_texture)
+    # Now copy the texture over by warping the faces to the new UV locations
+    # For each of the original faces in each of the regions, get the new UV coordinates from the mapped locations
+
+    # Do the actual texture copy
+    _warp_texture(texture_path=texture_path, 
+                  output_texture=output_texture, 
+                  original_uvs=vertex_uv, 
+                  normalized_uvs=new_uv_locs, 
+                  faces=face_uv_triangles)
+
+    # This is just a straight copy - nothing should have changed
     with output_seams.open("w", encoding="utf-8") as stream:
         json.dump(topology.to_dict(), stream)
-    material_lines = material_path.read_text(encoding="utf-8").splitlines()
-    with output_material.open("w", encoding="utf-8", newline="\n") as material_file:
-        for line in material_lines:
-            material_file.write(f"map_Kd {output_texture.name}\n" if line.strip().startswith("map_Kd ") else line + "\n")
-    uv_index = 0
-    with output_path.open("w", encoding="utf-8", newline="\n") as obj_file:
-        for line in lines:
-            parts = line.split()
-            if parts and parts[0] == "vt":
-                u, v = normalized_uvs[uv_index]
-                extra = f" {' '.join(parts[3:])}" if len(parts) > 3 else ""
-                obj_file.write(f"vt {u:.9g} {v:.9g}{extra}\n")
-                uv_index += 1
-            elif parts and parts[0] == "mtllib":
-                obj_file.write(f"mtllib {output_material.name}\n")
-            else:
-                obj_file.write(line + "\n")
+
+    write_material_file(output_material, output_texture.name)
+    write_obj(output_path=output_path, 
+              vertex_locs=vertex_loc, 
+              uv_verts=new_uv_locs, 
+              vertex_normals=vertex_normals, 
+              triangles=face_triangles, 
+              uv_triangles=face_uv_triangles, 
+              texture_name=output_texture.name, 
+              material_name=output_material.name)
     return output_path
 
 
