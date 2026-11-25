@@ -1,7 +1,12 @@
-"""Fill white or transparent texture pixels with colors from across UV seams."""
+"""Extend normalized texture charts with pixels from the opposite side of their seams."""
 
 import argparse
+from collections import Counter, defaultdict
+import heapq
+import json
 import os
+import shlex
+import shutil
 import tempfile
 import warnings
 from pathlib import Path
@@ -9,434 +14,567 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
-from scipy.sparse.linalg import lsqr
+from scipy.sparse.linalg import spsolve
 
-from obj_geometry import read_obj
-
-
-_MAX_PROJECTED_EDGE_LENGTH = 0.01  # Maximum allowed projected edge length in UV space
-
-
-def _seam_edges(uvs: np.ndarray, faces: np.ndarray, records):
-    indices = _match_seam_uvs(uvs, [points for _, points in records])
-    face_edges = {}
-    for face in faces:
-        for a, b, third in ((face[0], face[1], face[2]), (face[1], face[2], face[0]),
-                            (face[2], face[0], face[1])):
-            face_edges.setdefault(tuple(sorted((int(a), int(b)))), []).append(int(third))
-    boundary_neighbors = {}
-    for (a, b), thirds in face_edges.items():
-        if len(thirds) == 1:
-            boundary_neighbors.setdefault(a, set()).add(b)
-            boundary_neighbors.setdefault(b, set()).add(a)
-
-    all_edges = np.concatenate((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
-    graph = coo_matrix(
-        (np.ones(2 * len(all_edges)), (np.r_[all_edges[:, 0], all_edges[:, 1]],
-                                       np.r_[all_edges[:, 1], all_edges[:, 0]])),
-        shape=(len(uvs), len(uvs)),
-    ).tocsr()
-    _, labels = connected_components(graph, directed=False)
-
-    alternatives = {}
-    for (ids, _), group_indices in zip(records, indices):
-        for vertex_id, uv_index in zip(ids, group_indices):
-            alternatives.setdefault((vertex_id, int(labels[uv_index])), set()).add(int(uv_index))
-
-    def find_edge(id_a, id_b, a, b):
-        if len(face_edges.get(tuple(sorted((a, b))), [])) == 1:
-            return a, b
-        chart = int(labels[a])
-        choices = [
-            (u, v)
-            for u in alternatives.get((id_a, chart), {a})
-            for v in alternatives.get((id_b, chart), {b})
-            if len(face_edges.get(tuple(sorted((u, v))), [])) == 1
-        ]
-        if len(choices) != 1:
-            raise ValueError(f"Seam edge {id_a}-{id_b} is not a unique OBJ UV boundary edge.")
-        return choices[0]
-
-    paired = {}
-    for group, ((ids, _), uv_indices) in enumerate(zip(records, indices)):
-        if len(ids) < 2:
-            raise ValueError(f"Seam group {group + 1} needs at least two vertices.")
-        segments = [(ids[i], ids[i + 1], int(uv_indices[i]), int(uv_indices[i + 1]))
-                    for i in range(len(ids) - 1)]
-        if group in (0, 1, 2, 4) and ids[0] != ids[-1]:
-            first, last = int(uv_indices[0]), int(uv_indices[-1])
-            if len(ids) > 2 and last in boundary_neighbors.get(first, set()):
-                segments.append((ids[-1], ids[0], last, first))
-            else:
-                # The voxelized seam exporter omits the ring's first vertex.
-                known = set(map(int, uv_indices))
-                candidates = [
-                    boundary_neighbors.get(endpoint, set()) - known for endpoint in (first, last)
-                ]
-                if any(len(candidate) != 1 for candidate in candidates):
-                    raise ValueError(f"Cannot reconstruct the missing vertex of seam group {group + 1}.")
-                missing_id = -1 if group in (0, 2) else -2
-                segments.extend([
-                    (missing_id, ids[0], next(iter(candidates[0])), first),
-                    (ids[-1], missing_id, last, next(iter(candidates[1]))),
-                ])
-        for id_a, id_b, a, b in segments:
-            if id_a == id_b:
-                continue
-            a, b = find_edge(id_a, id_b, a, b)
-            thirds = face_edges.get(tuple(sorted((a, b))), [])
-            if id_a > id_b:
-                a, b = b, a
-            paired.setdefault(tuple(sorted((id_a, id_b))), []).append(
-                ((a, b, thirds[0], int(labels[a])), group)
-            )
-
-    edges = []
-    for key, entries in paired.items():
-        if len(entries) != 2:
-            raise ValueError(f"Seam edge {key} has {len(entries)} sides; expected two.")
-        sides, groups = zip(*entries)
-        if set(groups) not in ({0, 2}, {1, 4}, {3, 5}):
-            raise ValueError(f"Seam edge {key} belongs to incompatible seam groups {groups}.")
-        edges.extend(((sides[0], sides[1]), (sides[1], sides[0])))
-    ring_faces, side_faces = set(), set()
-    for entries in paired.values():
-        for side, group in entries:
-            face = tuple(sorted(side[:3]))
-            (side_faces if group in (3, 5) else ring_faces).add(face)
-    corner_faces = ring_faces & side_faces
-    if not edges:
-        raise ValueError("The seam data contains no paired edges.")
-    return labels, edges, corner_faces
+from obj_geometry import (
+    bfs_graph, compute_edge_locs_circle, compute_edge_locs_line, read_obj, read_texture,
+)
+from seam_topology import SeamTopology
+from normalize_uv_projection import _warp_texture_face
+from uv_texture import _CAP_RADIUS, _CAP_CENTERS, _UV_PADDING
 
 
-def _seam_patches(faces: np.ndarray, edges, excluded_faces=frozenset()):
-    vertex_faces = {}
-    boundary_faces = {}
-    for face_id, face in enumerate(faces):
-        for vertex in face:
-            vertex_faces.setdefault(int(vertex), set()).add(face_id)
-        for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
-            boundary_faces.setdefault(tuple(sorted((int(a), int(b)))), []).append(face_id)
+_RINGS = 10
+_MAX_TOP_SEAM_UV_EDGE = 0.02
 
-    excluded_ids = {face_id for face_id, face in enumerate(faces)
-                    if tuple(sorted(map(int, face))) in excluded_faces}
-    pending = {
-        index for index, (_, source) in enumerate(edges)
-        if tuple(sorted(source[:3])) not in excluded_faces
+
+def _mesh_adjacency(vertices, face_triangles):
+    vertex_faces = [[] for _ in vertices]
+    neighbors = [set() for _ in vertices]
+    for face_id, face in enumerate(face_triangles):
+        for i, vertex in enumerate(face):
+            vertex = int(vertex)
+            vertex_faces[vertex].append(face_id)
+            neighbors[vertex].update((int(face[(i + 1) % 3]), int(face[(i + 2) % 3])))
+    adjacency = [
+        [(neighbor, float(np.linalg.norm(vertices[vertex] - vertices[neighbor])))
+         for neighbor in adjacent]
+        for vertex, adjacent in enumerate(neighbors)
+    ]
+    return vertex_faces, adjacency
+
+
+def _seam_corner_faces(vertex_faces, seam_ids):
+    side_faces = {face for vertex in seam_ids["side"] for face in vertex_faces[vertex]}
+    cap_faces = {
+        face for name in ("top", "bottom") for vertex in seam_ids[name] for face in vertex_faces[vertex]
     }
-    seam_neighbors = {}
-    for index, (destination, source) in enumerate(edges):
-        for target_uv, source_uv in zip(destination[:2], source[:2]):
-            seam_neighbors.setdefault((destination[3], source[3], target_uv, source_uv), []).append(index)
-    while pending:
-        first = min(pending)
-        pending.remove(first)
-        group = [first]
-        initial_target, initial_source = edges[first]
-        pins = dict(zip(initial_source[:2], initial_target[:2]))
-        for index in group:
-            destination, source = edges[index]
-            for target_uv, source_uv in zip(destination[:2], source[:2]):
-                key = (destination[3], source[3], target_uv, source_uv)
-                for neighbor in seam_neighbors[key]:
-                    if neighbor in pending:
-                        target, origin = edges[neighbor]
-                        if any(source_id in pins and pins[source_id] != target_id
-                               for target_id, source_id in zip(target[:2], origin[:2])):
-                            continue
-                        pins.update(zip(origin[:2], target[:2]))
-                        pending.remove(neighbor)
-                        group.append(neighbor)
-        selected = set()
-        for index in group:
-            destination, source = edges[index]
-            selected.update(boundary_faces[tuple(sorted(source[:2]))])
-        frontier_vertices = set(pins)
-        for _ in range(8):
-            incident = {face_id for vertex in frontier_vertices for face_id in vertex_faces[vertex]}
-            new_faces = incident - selected - excluded_ids
-            selected.update(new_faces)
-            frontier_vertices = {int(vertex) for face_id in new_faces for vertex in faces[face_id]}
-        yield sorted(selected), pins, edges[group[0]]
+    return side_faces & cap_faces
 
 
-def _project_patch(vertices, vertex_faces, uv_faces, uvs, face_ids, pins, seam, uv_vertices):
-    patch_uvs = sorted({int(index) for face_id in face_ids for index in uv_faces[face_id]})
-    local_index = {uv: index for index, uv in enumerate(patch_uvs)}
-    positions = {}
-    for face_id in face_ids:
-        for uv, vertex in zip(uv_faces[face_id], vertex_faces[face_id]):
-            if int(uv) in positions and positions[int(uv)] != int(vertex):
-                raise ValueError("A UV coordinate is shared by different mesh vertices.")
-            positions[int(uv)] = int(vertex)
-    destination, source = seam
-    for source_uv, target_uv in pins.items():
-        if uv_vertices.get(target_uv) != {positions[source_uv]}:
-            raise ValueError("Paired seam UVs do not refer to the same mesh vertices.")
-    source_face_id = next(face_id for face_id in face_ids if
-                          source[0] in uv_faces[face_id] and source[1] in uv_faces[face_id])
-    source_face = list(uv_faces[source_face_id])
-    order = 1 if (source_face.index(source[1]) - source_face.index(source[0])) % 3 == 1 else -1
-    a, b, third = uvs[list(destination[:3])]
-    edge = b - a
-    cross = edge[0] * (third[1] - a[1]) - edge[1] * (third[0] - a[0])
-    if abs(cross) < 1e-14:
-        print("Degenerate UV triangle detected with vertices:", a, b, third)
-        return {}, 0.0
-    orientation = -np.sign(cross) * order
-
-    row_indices, column_indices, values = [], [], []
-    reference = []
-    for row, face_id in enumerate(face_ids):
-        xyz = vertices[vertex_faces[face_id]]
-        first_edge, second_edge = xyz[1] - xyz[0], xyz[2] - xyz[0]
-        length = float(np.linalg.norm(first_edge))
-        area = float(np.linalg.norm(np.cross(first_edge, second_edge)))
-        if length <= 1e-12 or area <= 1e-12:
-            raise ValueError(f"Cannot reproject degenerate mesh face {face_id}.")
-        x = float(first_edge @ second_edge) / length
-        y = area / length
-        reference.append(np.array([[0, 0], [length, 0], [x, orientation * y]]))
-        for edge_index, (a, b) in enumerate(((0, 1), (1, 2), (2, 0))):
-            row_indices.extend([3 * row + edge_index] * 2)
-            column_indices.extend([local_index[int(uv_faces[face_id, a])],
-                                   local_index[int(uv_faces[face_id, b])]])
-            values.extend([-1, 1])
-    matrix = coo_matrix((values, (row_indices, column_indices)),
-                        shape=(3 * len(face_ids), len(patch_uvs))).tocsr()
-    pinned_indices = np.array([local_index[uv] for uv in pins], dtype=int)
-    pinned_values = np.array([uvs[target] for target in pins.values()])
-    free = np.setdiff1d(np.arange(len(patch_uvs)), pinned_indices)
-    solution = np.zeros((len(patch_uvs), 2))
-    solution[pinned_indices] = pinned_values
-    initial_face = face_ids.index(source_face_id)
-    ref = reference[initial_face]
-    source_a, source_b = source_face.index(source[0]), source_face.index(source[1])
-    ref_edge = ref[source_b] - ref[source_a]
-    target_edge = uvs[destination[1]] - uvs[destination[0]]
-    scale = np.linalg.norm(target_edge) / np.linalg.norm(ref_edge)
-    if scale <= 1e-12:
-        raise ValueError("A target seam edge has zero UV length.")
-    angle = np.arctan2(target_edge[1], target_edge[0]) - np.arctan2(ref_edge[1], ref_edge[0])
-    rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
-    reference = [triangle * scale for triangle in reference]
-    rotations = [rotation.copy() for _ in face_ids]
-    # Alternate rigid triangle fits with a least-squares solve for unpinned vertices.
-    for _ in range(20):
-        desired = np.concatenate([
-            (triangle[[1, 2, 0]] - triangle) @ rotation.T
-            for triangle, rotation in zip(reference, rotations)
-        ])
-        if len(free):
-            rhs = desired - matrix[:, pinned_indices] @ pinned_values
-            for component in (0, 1):
-                solved = lsqr(matrix[:, free], rhs[:, component], atol=1e-9, btol=1e-9,
-                              iter_lim=max(1000, 4 * len(free)))
-                if solved[1] not in (0, 1, 2):
-                    raise ValueError(f"Seam neighborhood projection did not converge (LSQR status {solved[1]}).")
-                solution[free, component] = solved[0]
-        for index, (face_id, triangle) in enumerate(zip(face_ids, reference)):
-            projected = solution[[local_index[int(uv)] for uv in uv_faces[face_id]]]
-            source_edges = triangle[[1, 2, 0]] - triangle
-            target_edges = projected[[1, 2, 0]] - projected
-            u, _, vt = np.linalg.svd(target_edges.T @ source_edges)
-            rotation = u @ vt
-            if np.linalg.det(rotation) < 0:
-                u[:, -1] *= -1
-                rotation = u @ vt
-            rotations[index] = rotation
-    return {uv: solution[index] for uv, index in local_index.items()}, orientation
-
-
-def _copy_projected_face(result, source, missing, occupied, target, original):
-    height, width = missing.shape
-    scale = np.array([width - 1, height - 1])
-    target = target * scale
-    original = original * scale
-    target[:, 1] = height - 1 - target[:, 1]
-    original[:, 1] = height - 1 - original[:, 1]
-    a, b = target[1] - target[0], target[2] - target[0]
-    determinant = a[0] * b[1] - a[1] * b[0]
-    if abs(determinant) < 1e-12:
-        raise ValueError("A reprojected seam neighborhood contains a degenerate UV triangle.")
-    minimum = np.maximum(np.floor(target.min(axis=0)).astype(int), 0)
-    maximum = np.minimum(np.ceil(target.max(axis=0)).astype(int), [width - 1, height - 1])
-    if np.any(minimum > maximum):
-        return
-    x, y = np.meshgrid(np.arange(minimum[0], maximum[0] + 1),
-                       np.arange(minimum[1], maximum[1] + 1))
-    dx, dy = x - target[0, 0], y - target[0, 1]
-    s = (dx * b[1] - dy * b[0]) / determinant
-    t = (a[0] * dy - a[1] * dx) / determinant
-    mask = (s >= -1e-8) & (t >= -1e-8) & (s + t <= 1 + 1e-8)
-    mask &= missing[y, x] & ~occupied[y, x]
-    if not np.any(mask):
-        return
-    source_points = original[0] + s[mask, None] * (original[1] - original[0]) + t[mask, None] * (original[2] - original[0])
-    source_x = np.clip(np.rint(source_points[:, 0]).astype(int), 0, width - 1)
-    source_y = np.clip(np.rint(source_points[:, 1]).astype(int), 0, height - 1)
-    valid = ~missing[source_y, source_x]
-    result[y[mask][valid], x[mask][valid]] = source[source_y[valid], source_x[valid]]
-    occupied[y[mask][valid], x[mask][valid]] = True
-
-
-def _fill_seam_pixels(result: np.ndarray, coordinates: np.ndarray, edges) -> int:
-    height, width = result.shape[:2]
-    seam_image = Image.new("1", (width, height), 0)
-    draw = ImageDraw.Draw(seam_image)
-    for destination, _ in edges:
-        draw.line([tuple(coordinates[index]) for index in destination[:2]], fill=3)
-    seam = np.asarray(seam_image, dtype=bool)
-    result[seam, 1] = 255
-    missing = np.isclose(np.sum(result[:, :, 0:2], axis=2), 0)
-    if result.shape[2] == 4:
-        missing |= result[:, :, 3] == 0
-    to_fill = seam & missing
-    print(f"Pixels to fill: {np.count_nonzero(seam)} {np.count_nonzero(to_fill)}")
-    y, x = np.nonzero(to_fill)
-    while len(y):
-        counts = np.zeros(len(y), dtype=np.int16)
-        total = np.zeros((len(y), result.shape[2]), dtype=np.float64)
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dx == 0 and dy == 0:
-                    continue
-                ny, nx = y + dy, x + dx
-                inside = (ny >= 0) & (ny < height) & (nx >= 0) & (nx < width)
-                indices = np.flatnonzero(inside)
-                indices = indices[~missing[ny[indices], nx[indices]]]
-                total[indices] += result[ny[indices], nx[indices]]
-                counts[indices] += 1
-        fill = counts > 0
-        if not np.any(fill):
+def _expand_ring_faces(face_triangles, edge_adj, start_vertices, n, allowed_faces=None):
+    """Return faces within n vertex rings of a seam, restricted to one chart."""
+    allowed = None if allowed_faces is None else set(allowed_faces)
+    expanded = set()
+    frontier = set(start_vertices)
+    for _ in range(n):
+        new_faces = {
+            face for vertex in frontier for face in edge_adj[vertex]
+            if face not in expanded and (allowed is None or face in allowed)
+        }
+        expanded.update(new_faces)
+        frontier = {int(vertex) for face in new_faces for vertex in face_triangles[face]}
+        if not frontier:
             break
-        result[y[fill], x[fill]] = np.rint(total[fill] / counts[fill, None]).astype(np.uint8)
-        missing[y[fill], x[fill]] = False
-        y, x = y[~fill], x[~fill]
-    return len(y)
+    return expanded
 
 
-def _remainder_fill_red(result: np.ndarray):
-    """ Any unfilled pixels are filled in with the mean of the surrounding pixels. """
-    height, width = result.shape[:2]
-    for indx in range(0, 2):
-        empty = np.isclose(np.sum(result[:, :, 0:2], axis=2), 0)
-        print(f"Iteration {indx}, empty pixels: {np.count_nonzero(empty)}")
-        ys, xs = np.nonzero(empty)
-        for x, y in zip(xs, ys):
-            if x < 5 or x > width - 5 or y < 5 or y > height - 5:
-                continue
-            patch = result[y-5:y+5, x-5:x+5]
-            empty_patch = empty[y-5:y+5, x-5:x+5]
-            if not np.any(~empty_patch):
-                continue
-            patch_color = np.mean(patch[~empty_patch], axis=0)
-            result[y, x, 0:3] = patch_color
-    
-
-def flood_fill_texture_map(
-    input_path: Path, mesh_path: Path, seam_path: Path, output_path: Path
-) -> Path:
-    """Reproject five vertex rings across each seam, keeping seam UVs fixed.
-
-    Copy non-white, non-transparent source pixels into missing pixels outside
-    the original charts. Pixels outside the projected neighborhoods are unchanged.
-    """
-    input_path, mesh_path, seam_path, output_path = map(
-        Path, (input_path, mesh_path, seam_path, output_path)
+def _boundary_edges(face_triangles, faces):
+    counts = Counter(
+        tuple(sorted((int(face[i]), int(face[(i + 1) % 3]))))
+        for face_id in faces for face in (face_triangles[face_id],) for i in range(3)
     )
+    return {edge for edge, count in counts.items() if count == 1}
+
+
+def _fill_patch_holes(face_triangles, vertex_faces, faces, grown_faces):
+    """Include enclosed faces that a vertex-ring expansion left behind."""
+    remaining = grown_faces - faces
+    grown_boundary = _boundary_edges(face_triangles, grown_faces)
+    while remaining:
+        seed = remaining.pop()
+        component = {seed}
+        frontier = [seed]
+        reaches_boundary = False
+        while frontier:
+            face = face_triangles[frontier.pop()]
+            for i in range(3):
+                a, b = int(face[i]), int(face[(i + 1) % 3])
+                if tuple(sorted((a, b))) in grown_boundary:
+                    reaches_boundary = True
+                adjacent = set(vertex_faces[a]).intersection(vertex_faces[b], remaining)
+                remaining.difference_update(adjacent)
+                component.update(adjacent)
+                frontier.extend(adjacent)
+        if not reaches_boundary:
+            faces.update(component)
+    return faces
+
+
+def _shortest_cut(adjacency, start, targets, forbidden):
+    distances = {start: 0.0}
+    previous = {}
+    queue = [(0.0, start)]
+    while queue:
+        distance, vertex = heapq.heappop(queue)
+        if distance != distances[vertex]:
+            continue
+        if vertex in targets:
+            path = [vertex]
+            while path[-1] != start:
+                path.append(previous[path[-1]])
+            return list(reversed(path))
+        for neighbor, length in adjacency[vertex]:
+            if neighbor in forbidden:
+                continue
+            new_distance = distance + length
+            if new_distance < distances.get(neighbor, float("inf")):
+                distances[neighbor] = new_distance
+                previous[neighbor] = vertex
+                heapq.heappush(queue, (new_distance, neighbor))
+    raise ValueError("Cannot connect the seam to the outer ring.")
+
+
+def _get_outer_boundary(face_triangles, edge_adj, start_vertices, n, *,
+                        allowed_faces, vertices, adjacency):
+    """Find an ordered outer ring and a shortest cut from the seam to it."""
+    seam = list(start_vertices)
+    if len(seam) > 1 and seam[0] == seam[-1]:
+        seam.pop()
+    faces = _expand_ring_faces(face_triangles, edge_adj, seam, n, allowed_faces)
+    if not faces:
+        raise ValueError("No faces found next to the seam.")
+    grown_faces = _expand_ring_faces(face_triangles, edge_adj, seam, n + 1, allowed_faces)
+    faces = _fill_patch_holes(face_triangles, edge_adj, faces, grown_faces)
+    boundary = _boundary_edges(face_triangles, faces)
+    seam_edges = {
+        tuple(sorted((seam[i], seam[(i + 1) % len(seam)])))
+        for i in range(len(seam))
+    }
+    if not seam_edges.issubset(boundary):
+        raise ValueError("The seam is not a closed boundary of the selected faces.")
+    outer_edges = boundary - seam_edges
+    neighbors = defaultdict(list)
+    for a, b in outer_edges:
+        neighbors[a].append(b)
+        neighbors[b].append(a)
+    if not neighbors or any(len(adjacent) != 2 for adjacent in neighbors.values()):
+        raise ValueError("The expanded seam does not have a single closed outer boundary.")
+    patch_vertices = {int(v) for face in faces for v in face_triangles[face]}
+    patch_edges = {
+        tuple(sorted((int(face[i]), int(face[(i + 1) % 3]))))
+        for face_id in faces for face in (face_triangles[face_id],) for i in range(3)
+    }
+    patch_adjacency = [
+        [(neighbor, length) for neighbor, length in adjacent
+         if tuple(sorted((vertex, neighbor))) in patch_edges]
+        if vertex in patch_vertices else []
+        for vertex, adjacent in enumerate(adjacency)
+    ]
+    cut = _shortest_cut(patch_adjacency, seam[0], set(neighbors), set(seam[1:]))
+    start = cut[-1]
+    first, second = neighbors[start]
+    directed_boundary = {
+        (int(face[i]), int(face[(i + 1) % 3]))
+        for face_id in faces for face in (face_triangles[face_id],) for i in range(3)
+        if tuple(sorted((int(face[i]), int(face[(i + 1) % 3])))) in boundary
+    }
+    seam_forward = (seam[0], seam[1]) in directed_boundary
+    if ((start, first) in directed_boundary) == seam_forward:
+        first = second
+    outer = [start, first]
+    while True:
+        choices = [vertex for vertex in neighbors[outer[-1]] if vertex != outer[-2]]
+        if len(choices) != 1:
+            raise ValueError("The outer boundary is not a simple ring.")
+        if choices[0] == start:
+            break
+        if choices[0] in outer:
+            raise ValueError("The outer boundary is not a simple ring.")
+        outer.append(choices[0])
+    if len(outer) != len(neighbors):
+        raise ValueError("The expanded seam has multiple outer boundaries.")
+    return faces, outer, cut
+
+
+def _solve_patch(face_nodes, fixed):
+    neighbors = defaultdict(set)
+    for face in face_nodes:
+        for i, node in enumerate(face):
+            neighbors[node].update((face[(i + 1) % 3], face[(i + 2) % 3]))
+    interior = sorted(set(neighbors) - set(fixed))
+    result = dict(fixed)
+    if not interior:
+        return result
+    indices = {node: i for i, node in enumerate(interior)}
+    rows, cols, values = [], [], []
+    rhs = np.zeros((len(interior), 2))
+    for node, row in indices.items():
+        rows.append(row)
+        cols.append(row)
+        values.append(len(neighbors[node]))
+        for neighbor in neighbors[node]:
+            if neighbor in indices:
+                rows.append(row)
+                cols.append(indices[neighbor])
+                values.append(-1)
+            else:
+                rhs[row] += fixed[neighbor]
+    matrix = coo_matrix((values, (rows, cols)), shape=(len(interior), len(interior))).tocsr()
+    solution = spsolve(matrix, rhs)
+    if not np.isfinite(solution).all():
+        raise ValueError("Could not project the seam patch.")
+    result.update({node: solution[row] for node, row in indices.items()})
+    return result
+
+
+def _split_patch(face_triangles, faces, cut):
+    """Split the patch at a cut so its closed boundaries can map to lines."""
+    face_ids = sorted(faces)
+    parent = list(range(3 * len(face_ids)))
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    cut_edges = {tuple(sorted(pair)) for pair in zip(cut, cut[1:])}
+    edge_corners = defaultdict(list)
+    for index, face_id in enumerate(face_ids):
+        face = face_triangles[face_id]
+        for i in range(3):
+            a, b = int(face[i]), int(face[(i + 1) % 3])
+            edge_corners[tuple(sorted((a, b)))].append({a: 3 * index + i, b: 3 * index + (i + 1) % 3})
+    for edge, sides in edge_corners.items():
+        if edge in cut_edges:
+            continue
+        for side in sides[1:]:
+            for vertex in edge:
+                union(sides[0][vertex], side[vertex])
+    nodes = []
+    node_vertices = {}
+    for index, face_id in enumerate(face_ids):
+        face_nodes = []
+        for i, vertex in enumerate(face_triangles[face_id]):
+            node = find(3 * index + i)
+            node_vertices[node] = int(vertex)
+            face_nodes.append(node)
+        nodes.append(face_nodes)
+    return face_ids, nodes, node_vertices
+
+
+def _line_patch(vertices, face_triangles, faces, seam, outer, cut, start, end, offset):
+    face_ids, face_nodes, node_vertices = _split_patch(face_triangles, faces, cut)
+    seam_locs = compute_edge_locs_line(vertices, seam, start, end) + [end]
+    outer_locs = compute_edge_locs_line(vertices, outer + [outer[0]], start + offset, end + offset)
+    fixed_by_vertex = {v: loc for v, loc in zip(seam[1:], seam_locs[1:-1])}
+    fixed_by_vertex.update({v: loc for v, loc in zip(outer[1:], outer_locs[1:-1])})
+    node_neighbors = defaultdict(set)
+    for nodes in face_nodes:
+        for node in nodes:
+            node_neighbors[node].update(node_vertices[other] for other in nodes if other != node)
+    fixed = {}
+    for node, vertex in node_vertices.items():
+        if vertex in fixed_by_vertex:
+            fixed[node] = fixed_by_vertex[vertex]
+        elif vertex in (seam[0], outer[0]):
+            ring = seam if vertex == seam[0] else outer
+            locs = seam_locs if vertex == seam[0] else outer_locs
+            first = ring[1] in node_neighbors[node]
+            last = ring[-1] in node_neighbors[node]
+            if first == last:
+                raise ValueError("Cannot distinguish the two sides of the seam cut.")
+            fixed[node] = locs[0] if first else locs[-1]
+    projected = _solve_patch(face_nodes, fixed)
+    return face_ids, np.asarray([[projected[node] for node in face] for face in face_nodes])
+
+
+def _circle_patch(vertices, face_triangles, faces, seam, outer, seam_uvs, center):
+    face_ids = sorted(faces)
+    face_nodes = [[int(v) for v in face_triangles[face]] for face in face_ids]
+    fixed = dict(zip(seam, seam_uvs))
+    outer_locs = np.asarray(compute_edge_locs_circle(vertices, outer, _CAP_RADIUS * 1.1)) + center
+    fixed.update(zip(outer, outer_locs))
+    projected = _solve_patch(face_nodes, fixed)
+    return face_ids, np.asarray([[projected[node] for node in face] for face in face_nodes])
+
+
+def _side_seam_line(seam, side_faces, face_triangles, face_uv_triangles, uvs, vertices):
+    seam_set = set(seam)
+    uv_by_vertex = defaultdict(list)
+    for face in side_faces:
+        for vertex, uv in zip(face_triangles[face], face_uv_triangles[face]):
+            if vertex in seam_set:
+                uv_by_vertex[int(vertex)].append(uvs[uv])
+    lengths = np.linalg.norm(np.diff(vertices[seam], axis=0), axis=1)
+    if lengths.sum() == 0:
+        raise ValueError("The side seam has zero length.")
+    fractions = np.r_[0.0, np.cumsum(lengths)] / lengths.sum()
+    # Corner faces can use the other corner copy; interior seam UVs determine the line.
+    points = []
+    positions = []
+    for index, vertex in enumerate(seam[1:-1], 1):
+        if vertex in uv_by_vertex:
+            points.append(np.mean(uv_by_vertex[vertex], axis=0))
+            positions.append(fractions[index])
+    if len(points) < 2:
+        raise ValueError("Need at least two interior UVs on each side seam.")
+    coefficients, _, _, _ = np.linalg.lstsq(
+        np.column_stack((np.ones(len(positions)), positions)), np.asarray(points), rcond=None
+    )
+    return coefficients[0], coefficients[0] + coefficients[1]
+
+
+def _side_patch(face_triangles, face_uv_triangles, uvs, vertex_faces, seed_faces,
+                allowed_faces, seam, source_line, target_line):
+    faces = set(seed_faces)
+    frontier = set(seed_faces)
+    for _ in range(2 * (_RINGS - 1)):
+        vertices = {int(v) for face in frontier for v in face_triangles[face]} - set(seam)
+        new = {face for vertex in vertices for face in vertex_faces[vertex]
+               if face in allowed_faces and face not in faces}
+        faces.update(new)
+        frontier = new
+    source_start, source_end = source_line
+    target_start, target_end = target_line
+    source_direction = source_end - source_start
+    target_direction = target_end - target_start
+    source_length = np.linalg.norm(source_direction)
+    target_length = np.linalg.norm(target_direction)
+    if source_length == 0 or target_length == 0:
+        raise ValueError("A side seam has zero UV length.")
+    source_tangent = source_direction / source_length
+    target_tangent = target_direction / target_length
+    source_normal = np.array([-source_tangent[1], source_tangent[0]])
+    target_normal = np.array([-target_tangent[1], target_tangent[0]])
+    chart_center = np.array([0.5, 0.5])
+    if np.dot(chart_center - (source_start + source_end) / 2, source_normal) < 0:
+        source_normal = -source_normal
+    if np.dot(chart_center - (target_start + target_end) / 2, target_normal) > 0:
+        target_normal = -target_normal
+    face_ids = sorted(faces)
+    source_uv = uvs[face_uv_triangles[face_ids]]
+    delta = source_uv - source_start
+    projected = (target_start + (delta @ source_tangent)[..., None] * target_tangent * (target_length / source_length)
+                 + (delta @ source_normal)[..., None] * target_normal)
+    return face_ids, projected
+
+
+def _copy_projected_faces(source, output, occupied, source_pixels, face_uv_triangles,
+                          face_ids, projected_uvs, scratch, scratch_covered, excluded_faces):
+    height, width = source.shape[:2]
+    b_bad_length = width * 0.2
+    for face_id, projected in zip(face_ids, projected_uvs):
+        if face_id in excluded_faces:
+            continue
+        target_pixels = projected * [width - 1, height - 1]
+        target_pixels[:, 1] = height - 1 - target_pixels[:, 1]
+        minimum = np.maximum(np.floor(target_pixels.min(axis=0)).astype(int), 0)
+        maximum = np.minimum(np.ceil(target_pixels.max(axis=0)).astype(int), [width - 1, height - 1])
+        if np.any(minimum > maximum):
+            continue
+        region = np.s_[minimum[1]:maximum[1] + 1, minimum[0]:maximum[0] + 1]
+        _warp_texture_face(np.arange(3), target_pixels, source_pixels[face_uv_triangles[face_id]],
+                           source, scratch, scratch_covered, b_bad_length)
+        eligible = scratch_covered[region] & ~occupied[region]
+        output[region][eligible] = scratch[region][eligible]
+        occupied[region] |= eligible
+        scratch_covered[region] = False
+
+
+def _exclude_long_top_seam_faces(face_ids, projected_uvs, excluded_faces):
+    edge_lengths = np.linalg.norm(projected_uvs - np.roll(projected_uvs, -1, axis=1), axis=2)
+    long_faces = {
+        face for face, lengths in zip(face_ids, edge_lengths)
+        if face not in excluded_faces and np.any(lengths > _MAX_TOP_SEAM_UV_EDGE)
+    }
+    if long_faces:
+        warnings.warn(
+            f"Skipping {len(long_faces)} projected top-seam faces with UV edges longer than "
+            f"{_MAX_TOP_SEAM_UV_EDGE}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return excluded_faces | long_faces
+
+
+def _fill_in_blank_pixels_with_closest_color(output, occupied):
+    pad = 10
+    for indx in range(0, 5):  # Repeat the process a few times to fill in more pixels
+        occupied_boundary = occupied.copy()
+        shift_left = occupied[:, :-1] 
+        shift_right = occupied[:, 1:]
+        shift_up = occupied[:-1, :]
+        shift_down = occupied[1:, :]
+        occupied_boundary[:, 1:] = occupied_boundary[:, 1:] | shift_left
+        occupied_boundary[:, :-1] = occupied_boundary[:, :-1] | shift_right
+        occupied_boundary[1:, :] = occupied_boundary[1:, :] | shift_up
+        occupied_boundary[:-1, :] = occupied_boundary[:-1, :] | shift_down
+        occupied_boundary = occupied_boundary & ~occupied
+        print(f"Iteration {indx+1}, occupied pixels: {np.sum(occupied)}")
+        # Get the x,y values of the non zero pixels in the occupied boundary
+        coords = np.argwhere(occupied_boundary)
+        for pix in coords:
+            y, x = pix
+            if x < pad or x >= output.shape[1] - pad or y < pad or y >= output.shape[0] - pad:
+                continue
+            for xp in range(x-1, x+2):
+                for yp in range(y-1, y+2):
+                    if occupied[yp, xp]:
+                        pix_color = output[yp, xp, :]
+            for fy in range(y - pad, y + pad):
+                for fx in range(x-pad, x+pad):
+                    if not occupied[fy, fx]:
+                        occupied[fy, fx] = True
+                        output[fy, fx, :] = pix_color
+    col = np.mean(output[occupied, :], axis=0)
+    coords = np.argwhere(~occupied)
+    for y, x in coords:
+        output[y, x, :] = col
+
+
+def _expand_pixels(mesh_path, texture_path, seam_path, mesh_data=None):
+    vertices, uvs, _, _, faces, face_uvs, _, _ = (
+        read_obj(mesh_path) if mesh_data is None else mesh_data
+    )
+    with seam_path.open(encoding="utf-8") as stream:
+        topology = SeamTopology.from_dict(json.load(stream))
+    seam_ids = {name: list(topology.seams[name].vertex_ids) for name in ("top", "bottom", "side")}
+    vertex_faces, adjacency = _mesh_adjacency(vertices, faces)
+    excluded_faces = _seam_corner_faces(vertex_faces, seam_ids)
+    blocked = set().union(*map(set, seam_ids.values()))
+    cap_vertices = {}
+    for name in ("top", "bottom"):
+        center = topology.top_vertex if name == "top" else topology.bottom_vertex
+        if center < 0:
+            center = int(np.argmax(vertices[:, 1]) if name == "top" else np.argmin(vertices[:, 1]))
+        cap_vertices[name] = set(bfs_graph(adjacency, center, blocked)) | set(seam_ids[name])
+    regions = {name: set(topology.face_lists[name]) for name in ("top", "bottom", "middle")}
+    for name in ("top", "bottom"):
+        if any(not set(faces[face]).issubset(cap_vertices[name]) for face in regions[name]):
+            raise ValueError(f"The {name} face list disagrees with the seam-separated cap.")
+
+    with Image.open(texture_path) as image:
+        mode = "RGBA" if "A" in image.getbands() or "transparency" in image.info else "RGB"
+        source = np.asarray(image.convert(mode))
+    height, width = source.shape[:2]
+    if min(height, width) < 2:
+        raise ValueError("The texture must be at least 2 by 2 pixels.")
+    source_pixels = uvs * [width - 1, height - 1]
+    source_pixels[:, 1] = height - 1 - source_pixels[:, 1]
+    chart_image = Image.new("1", (width, height))
+    draw = ImageDraw.Draw(chart_image)
+    for face in face_uvs:
+        draw.polygon([tuple(source_pixels[uv]) for uv in face], fill=1)
+    occupied = np.asarray(chart_image, dtype=bool).copy()
+    output = source.copy()
+    scratch = np.zeros_like(source)
+    scratch_covered = np.zeros((height, width), dtype=bool)
+
+    corners = np.array([[0.5, _UV_PADDING], [1 - _UV_PADDING, 0.5],
+                        [0.5, 1 - _UV_PADDING], [_UV_PADDING, 0.5]])
+    for cap_index, name in enumerate(("top", "bottom")):
+        seam = seam_ids[name]
+        cap_uvs = {}
+        for vertex in seam:
+            choices = {int(uv) for face in vertex_faces[vertex] if face in regions[name]
+                       for v, uv in zip(faces[face], face_uvs[face]) if v == vertex}
+            if len(choices) != 1:
+                raise ValueError(f"Expected one {name} cap UV for seam vertex {vertex}.")
+            cap_uvs[vertex] = uvs[choices.pop()]
+        patch, outer, _ = _get_outer_boundary(
+            faces, vertex_faces, seam, _RINGS, allowed_faces=regions["middle"],
+            vertices=vertices, adjacency=adjacency)
+        ids, projected = _circle_patch(vertices, faces, patch, seam, outer,
+                                       [cap_uvs[v] for v in seam], _CAP_CENTERS[cap_index])
+        _copy_projected_faces(source, output, occupied, source_pixels, face_uvs,
+                              ids, projected, scratch, scratch_covered, excluded_faces)
+        patch, outer, cut = _get_outer_boundary(
+            faces, vertex_faces, seam, _RINGS, allowed_faces=regions[name],
+            vertices=vertices, adjacency=adjacency)
+        start, end = (corners[0], corners[1]) if name == "top" else (corners[3], corners[2])
+        direction = end - start
+        normal = np.array([direction[1], -direction[0]])
+        normal /= np.linalg.norm(normal)
+        if np.dot(normal, (start + end) / 2 - [0.5, 0.5]) < 0:
+            normal = -normal
+        ids, projected = _line_patch(vertices, faces, patch, seam, outer, cut, start, end, normal * 0.01)
+        patch_excluded = (_exclude_long_top_seam_faces(ids, projected, excluded_faces)
+                          if name == "top" else excluded_faces)
+        _copy_projected_faces(source, output, occupied, source_pixels, face_uvs,
+                              ids, projected, scratch, scratch_covered, patch_excluded)
+
+    sides = [set(topology.face_lists[name]) - excluded_faces
+             for name in ("left_side_seam", "right_side_seam")]
+    side_lines = [_side_seam_line(seam_ids["side"], side, faces, face_uvs, uvs, vertices) for side in sides]
+    for index in range(2):
+        ids, projected = _side_patch(faces, face_uvs, uvs, vertex_faces, sides[index],
+                                     regions["middle"] - excluded_faces, seam_ids["side"],
+                                     side_lines[index], side_lines[1 - index])
+        _copy_projected_faces(source, output, occupied, source_pixels, face_uvs,
+                              ids, projected, scratch, scratch_covered, excluded_faces)
+
+    _fill_in_blank_pixels_with_closest_color(output, occupied)
+    return output
+
+
+def flood_fill_texture_map(input_path: Path, mesh_path: Path, seam_path: Path, output_path: Path) -> Path:
+    """Extend a normalized mesh's texture, optionally replacing the input texture."""
+    input_path, mesh_path, seam_path, output_path = map(Path, (input_path, mesh_path, seam_path, output_path))
+    if seam_path.suffix.lower() != ".json":
+        raise ValueError("Expected a seam topology JSON for the normalized mesh.")
     if output_path.resolve() in {mesh_path.resolve(), seam_path.resolve()}:
         raise ValueError("The output texture must not overwrite the mesh or seam file.")
-    lines, uvs, faces, material_path = _read_obj(mesh_path)
-    vertices, vertex_faces = _mesh_geometry(lines, mesh_path)
+    mesh_data = read_obj(mesh_path)
+    material_path = mesh_path.parent / mesh_data[-1]
     if output_path.resolve() == material_path.resolve():
         raise ValueError("The output texture must not overwrite the mesh material.")
-    if np.any(uvs < 0) or np.any(uvs > 1):
-        raise ValueError("The mesh UVs must lie within the texture image.")
-    records = (_read_seam_records(seam_path) if seam_path.suffix.lower() == ".json"
-               else _read_legacy_seam_data(seam_path)[0])
-    _, edges, excluded_faces = _seam_edges(uvs, faces, records)
-    uv_vertices = {}
-    for face, vertex_face in zip(faces, vertex_faces):
-        for uv, vertex in zip(face, vertex_face):
-            uv_vertices.setdefault(int(uv), set()).add(int(vertex))
-    with Image.open(input_path) as image:
-        has_alpha = "A" in image.getbands() or "transparency" in image.info
-        pixels = np.array(image.convert("RGBA" if has_alpha else "RGB"))
-    height, width = pixels.shape[:2]
-    if width < 2 or height < 2:
-        raise ValueError("The texture image must be at least 2 by 2 pixels.")
-    missing = np.isclose(np.sum(pixels[:, :, 0:2], axis=2), 0)
-    if has_alpha:
-        missing |= pixels[:, :, 3] == 0
-
-    remainder_fill = _remainder_fill_red(result)
-
-    coordinates = uvs * [width - 1, height - 1]
-    coordinates[:, 1] = height - 1 - coordinates[:, 1]
-    chart_image = Image.new("1", (width, height), 0)
-    chart_draw = ImageDraw.Draw(chart_image)
-    for face in faces:
-        chart_draw.polygon([tuple(coordinates[index]) for index in face], fill=1)
-    occupied = np.array(chart_image, dtype=bool)
-    result = pixels.copy()
-    skipped_faces = 0
-    long_faces = 0
-    for face_ids, pins, seam in _seam_patches(faces, edges, excluded_faces):
-        projected, orientation = _project_patch(
-            vertices, vertex_faces, faces, uvs, face_ids, pins, seam, uv_vertices
-        )
-        if projected == {}:
-            continue
-        for face_id in face_ids:
-            face = faces[face_id]
-            target = np.array([projected[int(index)] for index in face])
-            a, b = target[1] - target[0], target[2] - target[0]
-            if orientation * (a[0] * b[1] - a[1] * b[0]) <= 1e-14:
-                skipped_faces += 1
-                continue
-            if np.any(np.linalg.norm(target - np.roll(target, -1, axis=0), axis=1)
-                      > _MAX_PROJECTED_EDGE_LENGTH):
-                long_faces += 1
-                continue
-            _copy_projected_face(result, pixels, missing, occupied, target, uvs[face].copy())
-    if skipped_faces:
-        warnings.warn(f"Skipped {skipped_faces} flipped or degenerate reprojected seam faces.",
+    pixels = _expand_pixels(mesh_path, input_path, seam_path, mesh_data)
+    if output_path.suffix.lower() in (".jpg", ".jpeg"):
+        warnings.warn("Saving as JPEG can change existing chart pixels; use PNG to preserve them exactly.",
                       RuntimeWarning, stacklevel=2)
-    if long_faces:
-        warnings.warn(f"Skipped {long_faces} reprojected seam faces with UV edges longer than "
-                      f"{_MAX_PROJECTED_EDGE_LENGTH}.", RuntimeWarning, stacklevel=2)
-    #unfilled_seam = _fill_seam_pixels(result, coordinates, edges)
-    #if unfilled_seam:
-    #    warnings.warn(f"Could not fill {unfilled_seam} seam pixels without valid neighbors.",
-    #                  RuntimeWarning, stacklevel=2)
-
-    remainder_fill = _remainder_fill_red(result)
-    if remainder_fill:
-        warnings.warn(f"Could not fill {remainder_fill} remaining pixels without valid neighbors.",
-                      RuntimeWarning, stacklevel=2)
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=output_path.parent, suffix=output_path.suffix, delete=False) as temp:
-        temporary_path = Path(temp.name)
+    with tempfile.NamedTemporaryFile(dir=output_path.parent, suffix=output_path.suffix, delete=False) as temporary:
+        temporary_path = Path(temporary.name)
     try:
-        Image.fromarray(result).save(temporary_path)
+        Image.fromarray(pixels).save(temporary_path)
         os.replace(temporary_path, output_path)
     finally:
         temporary_path.unlink(missing_ok=True)
     return output_path
 
 
+def expand_texture_map(input_path: Path, output_path: Path) -> Path:
+    """Extend cap, body, and side charts across their seams without overwriting charts."""
+    input_path, output_path = Path(input_path), Path(output_path)
+    if output_path.suffix.lower() != ".obj":
+        raise ValueError("The output mesh must be an OBJ file.")
+    seam_path = input_path.with_name(input_path.stem + "_seam_topology.json")
+    mesh_data = read_obj(input_path)
+    material_name = mesh_data[-1]
+    material_path = input_path.parent / material_name
+    texture_path = read_texture(material_path)
+    output_material = output_path.with_suffix(".mtl")
+    output_texture = output_path.with_suffix(".jpg")
+    output_seam = output_path.with_name(output_path.stem + "_seam_topology.json")
+    if {p.resolve() for p in (output_path, output_material, output_texture, output_seam)} & {
+        p.resolve() for p in (input_path, material_path, texture_path, seam_path)
+    }:
+        raise ValueError("Output files must not overwrite the input mesh, material, texture, or seams.")
+    output = _expand_pixels(input_path, texture_path, seam_path, mesh_data)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(output).save(output_texture)
+    with material_path.open(encoding="utf-8") as source_material, output_material.open("w", encoding="utf-8") as target:
+        for line in source_material:
+            target.write(f"map_Kd {shlex.quote(output_texture.name)}\n" if line.split()[:1] == ["map_Kd"] else line)
+    with input_path.open(encoding="utf-8") as source_obj, output_path.open("w", encoding="utf-8") as target:
+        for line in source_obj:
+            target.write(f"mtllib {shlex.quote(output_material.name)}\n" if line.split()[:1] == ["mtllib"] else line)
+    shutil.copyfile(seam_path, output_seam)
+    return output_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("texture", type=Path)
-    parser.add_argument("mesh", type=Path, help="Original full-resolution textured OBJ")
-    parser.add_argument("seams", type=Path, help="Matching seam topology JSON or legacy seam CSV")
-    parser.add_argument("output", type=Path)
+    parser.add_argument("--root-dir", default=Path("/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples"), type=Path)
+    parser.add_argument("--input-path", default=Path("NormalizedTexture/Envy_005_FullRes.obj"), type=Path)
+    parser.add_argument("--output-path", default=Path("FixedTexture/Envy_005_FullRes.obj"), type=Path)
     args = parser.parse_args()
-    flood_fill_texture_map(args.texture, args.mesh, args.seams, args.output)
+    expand_texture_map(args.root_dir / args.input_path, args.root_dir / args.output_path)
 
 
 if __name__ == "__main__":

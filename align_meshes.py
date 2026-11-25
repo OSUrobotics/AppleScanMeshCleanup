@@ -43,7 +43,6 @@ from scipy.spatial.transform import Rotation
 
 from filename_fixing import _apple_name_base
 from obj_geometry import create_adjacency_structure, read_obj, read_texture
-from fix_texture_maps import flood_fill_texture_map
 from seam_topology import SeamTopology
 
 

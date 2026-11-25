@@ -43,11 +43,11 @@ _CAP_CENTERS = np.array([
 
 
 def write_texture_uvs(seam_vs: list[list[list[int]]], uvs: np.ndarray, texture_path: Path):
-    """Write a white 1024x1024 RGB PNG with the top seam marked in green, the bottom in blue, and the side seams in black.
+    """Write a white 4096x4096 RGB PNG with the top seam marked in green, the bottom in blue, and the side seams in black.
       The first set of vs in the top seam are the edge of the middle mesh
       The first set of vs in the bottom seam are the left edge of the middle mesh
       The two triplets are the duplicated corners of the middle mesh"""
-    image_size = 1024
+    image_size = 4096
 
     image_data = np.full((image_size, image_size, 3), 255, dtype=np.uint8)
     # Color all the pixels that belong to vertices grey
@@ -697,6 +697,7 @@ def _parameterize_cut_mesh(
                 face_lists["bottom"] = set(range(n_fs, n_fs + len(local_faces)))
                 n_fs += len(local_faces)
                 chart_id += 1
+                mid_uvs = np.median(packed_uvs, axis=0)
             elif is_top:
                 packed_uvs = _pack_cap_uvs(local_uvs, _CAP_CENTERS[0], chart_id)
                 face_lists["top"] = set(range(n_fs, n_fs + len(local_faces)))
@@ -717,11 +718,13 @@ def _parameterize_cut_mesh(
     print(f"Total top: {len(face_lists['top'])}, bottom: {len(face_lists['bottom'])}, middle: {len(face_lists['middle'])}")
     print(f"Total faces: {len(face_lists['top']) + len(face_lists['bottom']) + len(face_lists['middle'])}")
     print(f"Total faces in mesh: {len(output_faces)}")
+    best_bottom_uv_index = np.argmin(np.linalg.norm(output_uvs - mid_uvs, axis=1))
     return (
         np.asarray(output_mapping, dtype=np.int64),
         np.asarray(output_faces, dtype=np.int64),
         np.asarray(output_uvs, dtype=np.float64),
-        face_lists 
+        face_lists,
+        best_bottom_uv_index
     )
 
 
@@ -894,10 +897,11 @@ def uv_texture(input_path: Path, output_path: Path, seam_topology: SeamTopology)
 
     seam_edges = top_seam_es + bottom_seam_es + side_seam_es
     print("Parameterizing the mesh with the requested seam boundaries...")
-    vmapping, indices, uvs, face_lists = _parameterize_cut_mesh(mesh, seam_edges, side_seam_vertices=side_seam_vs)
+    vmapping, indices, uvs, face_lists, best_bottom_uv_index = _parameterize_cut_mesh(mesh, seam_edges, side_seam_vertices=side_seam_vs)
 
     for name, faces in face_lists.items():
         seam_topology.face_lists[name] = faces
+    seam_topology.bottom_vertex = int(vmapping[best_bottom_uv_index])
 
     # Export the mesh with the uv coordinates, create an image with the seams/vertices marked, and export the seams
     # This is the reverse of vmapping - it says which original vertices correspond to each mapped vertex.

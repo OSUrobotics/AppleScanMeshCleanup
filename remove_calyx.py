@@ -18,8 +18,8 @@ from scipy.sparse.linalg import spsolve
 import numpy as np
 from scipy.sparse import csr_matrix
 from seam_topology import SeamInfo, SeamTopology
-from uv_texture import _find_centers
-from obj_geometry import get_vertex_star
+from obj_geometry import get_vertex_star, create_adjacency_structure, bfs_graph, read_obj, write_obj
+from filename_fixing import write_material_file
 
 
 def _is_y_extremum(
@@ -657,92 +657,199 @@ def check_calyx_and_stem(input_path: Path, output_path: Path) -> Path:
     )
 
 
-def _calyx_faces(vertices, faces, seam, bottom_point):
-    """Find the component inside the ring without relying on seam vertex order."""
-    ids = seam.vertex_ids
-    if len(ids) < 3 or len(set(ids)) != len(ids) or any(
-        not isinstance(v, int) or v < 0 or v >= len(vertices) for v in ids
-    ):
-        raise ValueError("The calyx seam must contain at least three distinct valid vertex IDs.")
-    locations = np.asarray(seam.vertex_locations, dtype=float)
-    if locations.shape != (len(ids), 3) or not np.allclose(
-        vertices[ids], locations, rtol=1e-5, atol=1e-5
-    ):
-        raise ValueError("Calyx seam vertex locations do not match the OBJ.")
-    ring_set = set(ids)
-    edges = {}
-    for face_id, face in enumerate(faces):
-        for a, b in zip(face, np.roll(face, -1)):
-            edges.setdefault(tuple(sorted((int(a), int(b)))), []).append(face_id)
-    ring_edges = {edge for edge in edges if edge[0] in ring_set and edge[1] in ring_set}
-    neighbors = {v: [] for v in ids}
-    for a, b in ring_edges:
-        neighbors[a].append(b)
-        neighbors[b].append(a)
-        if len(edges[(a, b)]) != 2:
-            raise ValueError("Every calyx ring edge must have two adjacent faces.")
-    if any(len(n) != 2 for n in neighbors.values()):
-        raise ValueError("Calyx seam vertices must form one simple mesh-edge ring.")
-    ring = [ids[0]]
-    while True:
-        choices = [v for v in neighbors[ring[-1]] if len(ring) == 1 or v != ring[-2]]
-        following = choices[0]
-        if following == ring[0]:
-            break
-        if following in ring:
-            raise ValueError("Calyx seam contains multiple or intersecting rings.")
-        ring.append(following)
-    if len(ring) != len(ids):
-        raise ValueError("Calyx seam contains multiple rings.")
+def _remove_and_renumber(vertex_loc: np.ndarray, 
+                         vertex_uv: np.ndarray, 
+                         vertex_normals: np.ndarray, 
+                         vertex_uv_ids: np.ndarray,
+                         face_triangles: np.ndarray, 
+                         face_uv_triangles: np.ndarray,
+                         face_norm_triangles: np.ndarray,
+                         topology: SeamTopology,
+                         kill_faces: list[int]
+                         ):
+    """ Remove the faces (and the adjacent vertices) from the mesh and renumber the remaining vertices and faces."""
+    # Get the adjacent vertices for the faces to be killed
+    kill_vs = set()
+    for f_idx in kill_faces:
+        kill_vs.update(face_triangles[f_idx])
 
-    adjacency = [[] for _ in faces]
-    for edge, incident in edges.items():
-        if len(incident) > 2:
-            raise ValueError(f"Non-manifold OBJ edge {edge}.")
-        if edge not in ring_edges and len(incident) == 2:
-            a, b = incident
-            adjacency[a].append(b)
-            adjacency[b].append(a)
-    center = np.asarray(bottom_point, dtype=float)
-    if center.shape != (3,) or not np.isfinite(center).all():
-        raise ValueError("The seam topology must contain a finite bottom center.")
-    candidates = np.array([v for v in np.unique(faces) if v not in ring_set])
-    if not len(candidates):
-        raise ValueError("No vertices are available inside the calyx ring.")
-    polygon = vertices[ring][:, [0, 2]]
-    max_distance = float(np.max(np.linalg.norm(vertices[ring] - center, axis=1)))
-    center_vertex = None
-    for candidate in candidates[np.argsort(np.linalg.norm(vertices[candidates] - center, axis=1))]:
-        if np.linalg.norm(vertices[candidate] - center) > max_distance + 1e-8:
-            break
-        x, z = vertices[candidate, [0, 2]]
-        is_inside = False
-        for a, b in zip(polygon, np.roll(polygon, -1, axis=0)):
-            if (a[1] > z) != (b[1] > z) and x < (b[0] - a[0]) * (z - a[1]) / (b[1] - a[1]) + a[0]:
-                is_inside = not is_inside
-        if is_inside:
-            center_vertex = int(candidate)
-            break
-    if center_vertex is None:
-        raise ValueError("No interior calyx vertex was found within the projected ring.")
-    seed = int(np.flatnonzero(np.any(faces == center_vertex, axis=1))[0])
-    inside = {seed}
-    stack = [seed]
-    while stack:
-        for neighbor in adjacency[stack.pop()]:
-            if neighbor not in inside:
-                inside.add(neighbor)
-                stack.append(neighbor)
-    if any(sum(face in inside for face in edges[edge]) != 1 for edge in ring_edges):
-        raise ValueError("Calyx ring does not separate the mesh into an inside and outside.")
-    # Match the patch winding to the removed faces.
-    for face_id in edges[tuple(sorted((ring[0], ring[1])))]:
-        if face_id in inside:
-            face = list(faces[face_id])
-            if face[(face.index(ring[0]) + 1) % 3] != ring[1]:
-                ring = [ring[0], *reversed(ring[1:])]
-            break
-    return ring, np.array(sorted(inside), dtype=int), center_vertex
+    # Remove the calyx faces from the face triangles
+    map_vs = {}  # Keep track of new vertex ids for renumbering
+    map_uvs_vs = {}  # Keep track of new vertex ids for renumbering
+    n_vertices = vertex_loc.shape[0]
+    count = 0
+    count_vt = 0
+    vts_to_delete = set()
+    new_vertex_loc = []
+    new_vertex_norm = []
+    new_vertex_uv = []
+    for indx in range(0, n_vertices):
+        if indx in kill_vs:
+            # Delete this vertex and its texture coordinates
+            for uv_idx in vertex_uv_ids[indx]:
+                vts_to_delete.add(uv_idx)
+                map_uvs_vs[uv_idx] = -1
+            map_vs[indx] = -1
+        else:
+            map_vs[indx] = count
+            new_vertex_loc.append(vertex_loc[indx, :])
+            new_vertex_norm.append(vertex_normals[indx, :])
+            count += 1
+            for uv_idx in vertex_uv_ids[indx]:
+                map_uvs_vs[uv_idx] = count_vt
+                new_vertex_uv.append(vertex_uv[uv_idx, :])
+                count_vt += 1
+
+    topology.renumber_seams(map_vs)
+    map_fs = {} 
+    count_f = 0  # Keep track of new face ids for renumbering
+    new_face_triangles = []
+    new_face_uv_triangles = []
+    new_face_normals = []
+    for f_idx in range(0, face_triangles.shape[0]):
+        if f_idx in kill_faces:
+            map_fs[f_idx] = -1
+        else:
+            map_fs[f_idx] = count_f
+            new_face_triangles.append([map_vs[vid] for vid in face_triangles[f_idx]])
+            new_face_uv_triangles.append([map_uvs_vs[uv] for uv in face_uv_triangles[f_idx]])
+            new_face_normals.append(face_norm_triangles[f_idx])
+            count_f += 1
+
+    topology.renumber_faces(map_fs)
+    return new_vertex_loc, new_vertex_uv, new_vertex_norm, new_face_triangles, new_face_uv_triangles, new_face_normals
+
+
+def _cutout_calyx_and_save(input_path: Path, output_path: Path):
+    """Find the component inside the ring without relying on seam vertex order."""
+    input_path, output_path = Path(input_path), Path(output_path)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input mesh not found: {input_path}")
+    if input_path.suffix.lower() != ".obj" or output_path.suffix.lower() != ".obj":
+        raise ValueError("Input and output meshes must be OBJ files.")
+    seam_path = Path(seam_path) if seam_path is not None else input_path.with_name(
+        input_path.stem + "_seam_topology.json"
+    )
+    calyx_sub_path = output_path.parent / "Calyx"
+    calyx_path = calyx_sub_path.with_name(output_path.stem + "_calyx.obj")
+    output_seams = calyx_sub_path.with_name(output_path.stem + "_seam_topology.json")
+    calyx_texture = calyx_sub_path.with_suffix(".jpg")
+
+    # This input mesh and topology should have the stem ring and the calyx ring
+    # Do this so it doesn't duplicate vertices
+    vertex_loc, vertex_uv, vert_uv_ids, vertex_normals, face_triangles, face_uv_triangles, face_norm_triangles, mtllibs = read_obj(input_path)
+    seam_file = seam_path / (input_path.stem + "_seam_topology.json")
+    with seam_file.open(encoding="utf-8") as stream:
+        topology = SeamTopology.from_dict(json.load(stream))
+
+    if "calyx" not in topology.seams or "stem" not in topology.seams:
+        raise ValueError("Seam topology must contain a calyx ring and a stem ring.")
+
+    mesh = mn.meshFromFacesVerts(
+        face_triangles.astype(np.int32), vertex_loc.astype(np.float32), duplicateNonManifoldVertices=False
+    )
+
+    bottom_vid = topology.bottom_vertex
+    calyx_seam = topology.seams["calyx"]
+    edge_adj = create_adjacency_structure(mesh, set())
+    adj_vs = bfs_graph(edge_adj, bottom_vid, set(calyx_seam))
+    # Get all the faces adjacent to adj_vs
+    adj_faces = []
+    for f_idx, tri in enumerate(face_triangles):
+        if any(v in adj_vs for v in tri):
+            adj_faces.append(f_idx)
+
+    non_calyx_faces = [f_idx for f_idx in range(face_triangles.shape[0]) if f_idx not in adj_faces] 
+    new_vertex_loc, new_vertex_uv, new_vertex_norm, new_face_triangles, new_face_uv_triangles, new_face_normals = _remove_and_renumber(vertex_loc=vertex_loc, 
+                                                                                                                                       vertex_uv=vertex_uv, 
+                                                                                                                                       vert_uv_ids=vert_uv_ids, 
+                                                                                                                                       vertex_normals=vertex_normals, 
+                                                                                                                                       face_triangles=face_triangles,
+                                                                                                                                       face_uv_triangles=face_uv_triangles,
+                                                                                                                                       face_normals=face_norm_triangles,
+                                                                                                                                       topology=topology,
+                                                                                                                                       remove_fs=adj_faces)
+
+    write_obj(output_path, new_vertex_loc, new_vertex_uv, new_vertex_norm, new_face_triangles, new_face_uv_triangles, new_face_normals, mtllibs)    
+
+    lower = new_vertex_uv.min(axis=0)
+    upper = new_vertex_uv.max(axis=0)
+    extent = float(np.max(upper - lower))
+    if extent <= 0:
+        raise ValueError("Calyx UVs have zero extent.")
+    # Eight output pixels of padding, with a uniform scale to avoid distortion.
+    side = extent * 256 / 240
+    origin = (lower + upper - side) / 2
+    cropped_uvs = (new_vertex_uv - origin) / side
+    with Image.open(calyx_texture) as image:
+        width, height = image.size
+        transform = (side * width / 256, 0, origin[0] * width,
+                     0, side * height / 256, (1 - origin[1] - side) * height)
+        mode = "RGBA" if "A" in image.getbands() or "transparency" in image.info else "RGB"
+        cropped = image.convert(mode).transform((256, 256), Image.Transform.AFFINE, transform,
+                                                resample=Image.Resampling.BICUBIC)
+    cropped.save(calyx_texture)
+
+
+def _remove_calyx_and_save(input_path, seam_path, calyx_texture, output_path):
+    # This input mesh and topology should have the stem ring and the calyx ring
+    # Do this so it doesn't duplicate vertices
+    vertex_loc, vertex_uv, vert_uv_ids, vertex_normals, face_triangles, face_uv_triangles, mtllibs = read_obj(input_path)
+    seam_file = seam_path / (input_path.stem + "_seam_topology.json")
+    with seam_file.open(encoding="utf-8") as stream:
+        topology = SeamTopology.from_dict(json.load(stream))
+
+    vertex_loc, vertex_uv, vert_uv_ids, vertex_normals, face_triangles, face_uv_triangles, face_norm_triangles, mtllibs = read_obj(input_path)
+    seam_file = seam_path / (input_path.stem + "_seam_topology.json")
+    with seam_file.open(encoding="utf-8") as stream:
+        topology = SeamTopology.from_dict(json.load(stream))
+
+    if "calyx" not in topology.seams or "stem" not in topology.seams:
+        raise ValueError("Seam topology must contain a calyx ring and a stem ring.")
+
+    mesh = mn.meshFromFacesVerts(
+        face_triangles.astype(np.int32), vertex_loc.astype(np.float32), duplicateNonManifoldVertices=False
+    )
+
+    bottom_vid = topology.bottom_vertex
+    calyx_seam = topology.seams["calyx"]
+    edge_adj = create_adjacency_structure(mesh, set())
+    adj_vs = bfs_graph(edge_adj, bottom_vid, set(calyx_seam))
+    # Get all the faces adjacent to adj_vs
+    adj_faces = []
+    for f_idx, tri in enumerate(face_triangles):
+        if any(v in adj_vs for v in tri):
+            adj_faces.append(f_idx)
+
+    new_vertex_loc, new_vertex_uv, new_vertex_norm, new_face_triangles, new_face_uv_triangles, new_face_normals = _remove_and_renumber(vertex_loc=vertex_loc, 
+                                                                                                                                       vertex_uv=vertex_uv, 
+                                                                                                                                       vert_uv_ids=vert_uv_ids, 
+                                                                                                                                       vertex_normals=vertex_normals, 
+                                                                                                                                       face_triangles=face_triangles,
+                                                                                                                                       face_uv_triangles=face_uv_triangles,
+                                                                                                                                       face_normals=face_norm_triangles,
+                                                                                                                                       topology=topology,
+                                                                                                                                       remove_fs=adj_faces)
+
+    
+
+    patch_vertices, patch_uvs, patch_faces, center_vid = _grid_patch(vertices=np.array(new_vertex_loc),
+                                                                     vertex_uv=np.array(new_vertex_uv),
+                                                                     face_triangles=np.array(new_face_triangles),
+                                                                     face_uv_triangles=np.array(new_face_uv_triangles),
+                                                                     ring=topology.seams["calyx"],
+                                                                     )
+
+    for indx, v in enumerate(patch_vertices):
+        new_vertex_loc.append(v)
+        new_vertex_uv.append(patch_uvs[indx])
+
+    for indx, faces in enumerate(patch_faces):
+        new_face_triangles.append([count + vid for vid in faces])
+    topology.bottom_vertex = count + center_vid
+    count += len(patch_vertices)
+
+    # Write out the new mesh.
 
 
 def _cross(a, b, c):
@@ -1003,7 +1110,6 @@ def _write_textured_obj(path, vertices, faces, uvs, uv_faces, material_name):
 def remove_calyx(input_path: Path, output_path: Path, seam_path: Path | None = None) -> Path:
     """Write the patched OBJ and a separate textured ``<output>_calyx.obj``."""
 
-    # First run patch_stem_and_ring_calyx to add the calyx ring and stem
     input_path, output_path = Path(input_path), Path(output_path)
     if not input_path.exists():
         raise FileNotFoundError(f"Input mesh not found: {input_path}")
@@ -1012,101 +1118,9 @@ def remove_calyx(input_path: Path, output_path: Path, seam_path: Path | None = N
     seam_path = Path(seam_path) if seam_path is not None else input_path.with_name(
         input_path.stem + "_seam_topology.json"
     )
-    # This input mesh and topology should have the stem ring and the calys ring
-    # Do this so it doesn't duplicate vertices
-    lines, uvs, uv_faces, material_path = read_obj(input_path)
-    vertices, faces = _vertex_geometry(lines, uv_faces, input_path)
-    texture_path = _read_texture(material_path)
-    if np.any(uvs < 0) or np.any(uvs > 1):
-        print(f"WARNING Min and max UV coordinates: {uvs.min()}, {uvs.max()} clipped")
-        uvs = np.clip(uvs, 0, 1)
-    seam_file = seam_path / (input_path.stem + "_seam_topology.json")
-    with seam_file.open(encoding="utf-8") as stream:
-        topology = SeamTopology.from_dict(json.load(stream))
 
-    if "calyx" not in topology.seams:
-        raise ValueError("Seam topology must contain a calyx ring.")
-    
-    calyx_seam = topology.seams["calyx"]
-    _calyx_uv_candidates(lines, uv_faces, uvs, calyx_seam, input_path)
-    ring, inside, center_vertex = _calyx_faces(vertices, faces, calyx_seam, topology.bottom_point)
-
-    material_lines = material_path.read_text(encoding="utf-8").splitlines()
-    material_names = [shlex.split(line, comments=True)[1] for line in material_lines
-                      if shlex.split(line, comments=True)[:1] == ["newmtl"]]
-    material_name = material_names[0]
-    used_materials = {shlex.split(line, comments=True)[1] for line in lines
-                      if shlex.split(line, comments=True)[:1] == ["usemtl"]}
-    if used_materials != {material_name}:
-        raise ValueError("All OBJ faces must use the single diffuse material.")
-
-    calyx_sub_path = output_path.parent / "Calyx"
-    calyx_path = calyx_sub_path.with_name(output_path.stem + "_calyx.obj")
-    output_seams = calyx_sub_path.with_name(output_path.stem + "_seam_topology.json")
-    body_texture = calyx_sub_path.with_suffix(texture_path.suffix)
-    calyx_texture = calyx_sub_path.with_suffix(".png")
-    outputs = [calyx_sub_path, calyx_sub_path.with_suffix(".mtl"), body_texture,
-               calyx_path, calyx_path.with_suffix(".mtl"), calyx_texture, output_seams]
-    sources = {p.resolve() for p in (input_path, seam_path, material_path, texture_path)}
-    if len({p.resolve() for p in outputs}) != len(outputs) or any(p.resolve() in sources for p in outputs):
-        raise ValueError("Output files must be distinct and must not overwrite input files.")
-    patch_vertices, patch_uvs, patch_faces, center_vid = _grid_patch(
-        vertices, faces, uv_faces, uvs, ring, inside, center_vertex, seam.center
-    )
-    topology.bottom_vertex = center_vid
-    
-
-    calyx_uv_faces = uv_faces[inside]
-    selected_uvs = uvs[np.unique(calyx_uv_faces)]
-    lower = selected_uvs.min(axis=0)
-    upper = selected_uvs.max(axis=0)
-    extent = float(np.max(upper - lower))
-    if extent <= 0:
-        raise ValueError("Calyx UVs have zero extent.")
-    # Eight output pixels of padding, with a uniform scale to avoid distortion.
-    side = extent * 256 / 240
-    origin = (lower + upper - side) / 2
-    cropped_uvs = (uvs - origin) / side
-    with Image.open(texture_path) as image:
-        width, height = image.size
-        transform = (side * width / 256, 0, origin[0] * width,
-                     0, side * height / 256, (1 - origin[1] - side) * height)
-        mode = "RGBA" if "A" in image.getbands() or "transparency" in image.info else "RGB"
-        cropped = image.convert(mode).transform((256, 256), Image.Transform.AFFINE, transform,
-                                                resample=Image.Resampling.BICUBIC)
-
-    keep = np.ones(len(faces), dtype=bool)
-    keep[inside] = False
-    patch_ids = np.concatenate((np.asarray(ring), np.arange(len(vertices), len(vertices) + len(patch_vertices) - len(ring))))
-    all_vertices = np.vstack((vertices, patch_vertices[len(ring):]))
-    all_uvs = np.vstack((uvs, patch_uvs))
-    body_faces = np.vstack((faces[keep], patch_ids[patch_faces]))
-    body_uv_faces = np.vstack((uv_faces[keep], len(uvs) + patch_faces))
-    used_vertices = np.unique(body_faces)
-    vertex_map = {int(vertex): index for index, vertex in enumerate(used_vertices)}
-    for saved_seam in topology.seams.values():
-        if any(vertex not in vertex_map for vertex in saved_seam.vertex_ids):
-            raise ValueError(f"The {saved_seam.name} seam contains vertices removed with the calyx.")
-    for boundary in topology.boundary_paths:
-        if any(vertex not in vertex_map for vertex in boundary["vertex_ids"]):
-            raise ValueError("A boundary path contains vertices removed with the calyx.")
-    topology.renumber_seams(vertex_map)
-    topology.bottom_point = patch_vertices[len(ring)].tolist()
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(texture_path, body_texture)
-    cropped.save(calyx_texture)
-    for path, texture in ((output_path, body_texture), (calyx_path, calyx_texture)):
-        with path.with_suffix(".mtl").open("w", encoding="utf-8", newline="\n") as stream:
-            for line in material_lines:
-                parts = shlex.split(line, comments=True)
-                stream.write(f"map_Kd {shlex.quote(texture.name)}\n" if parts[:1] == ["map_Kd"] else line + "\n")
-    _write_textured_obj(output_path, all_vertices, body_faces, all_uvs, body_uv_faces, material_name)
-    _write_textured_obj(calyx_path, vertices, faces[inside], cropped_uvs, calyx_uv_faces, material_name)
-
-    with output_seams.open("w", encoding="utf-8") as stream:
-        json.dump(topology.to_dict(), stream)
-    return output_path
+    _cutout_calyx_and_save(input_path, output_path)
+    _remove_calyx_and_save(input_path, output_path)
 
 
 def main() -> None:
@@ -1114,23 +1128,25 @@ def main() -> None:
     parser.add_argument("--root-dir", type=Path, default=None, help="Directory the paths are relative to")
     parser.add_argument("--input-path", type=Path, required=True, help="Apple scan mesh")
     parser.add_argument("--output-path", type=Path, required=True, help="Patched mesh to write")
-    parser.add_argument("--seam-path", type=Path, help="Calyx seam topology JSON (default: companion JSON)")
+    parser
     args = parser.parse_args()
     input_path, output_path = args.input_path, args.output_path
     if args.root_dir is not None:
         input_path, output_path = args.root_dir / input_path, args.root_dir / output_path
 
-    seam_topology_path = input_path.with_name(input_path.stem + "_seam_topology.json")
-    with open(seam_topology_path, "r") as handle:
-        seam_topology = SeamTopology.from_dict(json.load(handle))
+    patch_stem = false
+    if patch_stem:
+        seam_topology_path = input_path.with_name(input_path.stem + "_seam_topology.json")
+        with open(seam_topology_path, "r") as handle:
+            seam_topology = SeamTopology.from_dict(json.load(handle))
 
-    mesh=mm.loadMesh(str(input_path))
-    # Patch the stem connection with a ring of vertices and add a split ring around the calyx region
-    # Also computes the size of the ring for the bottom part of the apple and center points
-    patched_mesh = patch_stem_and_ring_calyx(
-        mesh=mesh, seam_topology=seam_topology, output_path=output_path, b_do_debug=False
-    )
-    print(f"Wrote {remove_calyx(input_path, output_path, seam_path)}")
+        mesh=mm.loadMesh(str(input_path))
+        # Patch the stem connection with a ring of vertices and add a split ring around the calyx region
+        # Also computes the size of the ring for the bottom part of the apple and center points
+        patched_mesh = patch_stem_and_ring_calyx(
+            mesh=mesh, seam_topology=seam_topology, output_path=output_path, b_do_debug=False
+        )
+    print(f"Wrote {remove_calyx(input_path, output_path)}")
 
 
 if __name__ == "__main__":

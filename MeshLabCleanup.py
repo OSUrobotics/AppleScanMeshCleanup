@@ -33,8 +33,7 @@ from reconstruct_uv_by_projection import reconstruct_uv_by_projection
 from seam_topology import SeamTopology
 from uv_texture import uv_texture, _find_centers
 from filename_fixing import write_material_file, _apple_name_base
-from fix_texture_maps import flood_fill_texture_map
-from obj_geometry import read_obj, read_mesh_no_textures
+from obj_geometry import read_obj, read_mesh_no_textures, write_obj
 
 from remove_calyx import patch_stem_and_ring_calyx, remove_calyx
 
@@ -283,14 +282,9 @@ def downsample_mesh(
     print("Original textured mesh topology")
     print_mesh_topology(input_path)
 
-    _, _, _, source_material = _read_obj(input_path)
-    source_texture = _read_texture(source_material)
-    padded_texture = input_path.with_name(input_path.stem + "_padded" + source_texture.suffix)
-    if padded_texture.resolve() in {input_path.resolve(), source_material.resolve(), source_texture.resolve()}:
-        raise ValueError("The padded texture must not overwrite an input file.")
-    
     seam_path = input_path.with_name(input_path.stem + "_seam_topology.json")
-    flood_fill_texture_map(source_texture, input_path, seam_path, padded_texture)
+    input_texture_path = input_path.with_name(input_path.stem + ".jpg")
+    output_texture_path = output_path.with_name(output_path.stem + ".jpg")
 
     for mlx_script_path in mlx_script_paths:
         tag = mlx_script_path.name.split("_")[-1]
@@ -301,32 +295,32 @@ def downsample_mesh(
         _process_mesh(input_path, output_path, mlx_script_path)
 
         _, seam_topology = _reorient_mesh(output_path=output_path, seam_path=seam_path)
-        _, _, _, material_path = _read_obj(output_path)
-        texture_path = _read_texture(material_path)
-        if texture_path.resolve() in {source_texture.resolve(), padded_texture.resolve()}:
-            raise ValueError("The output texture must not overwrite the source or padded texture.")
-        if texture_path.suffix.lower() != padded_texture.suffix.lower():
-            raise ValueError("The output texture format does not match the padded texture.")
+        vertex_loc, vertex_uv, vert_uv_ids, vertex_normals, face_triangles, face_uv_triangles, face_norm_ids, mtllibs = read_obj(output_path)
         if tag == "lowres":
             # Instead of just copying the file, downsample it by quarter
-            with Image.open(padded_texture) as img:
+            with Image.open(input_texture_path) as img:
                 img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
                 img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
-                img.save(texture_path)
+                img.save(output_texture_path)
         elif tag == "highres":
             # Instead of just copying the file, downsample it by half
-            with Image.open(padded_texture) as img:
+            with Image.open(input_texture_path) as img:
                 img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
-                img.save(texture_path)
+                img.save(output_texture_path)
         else:
-            shutil.copyfile(padded_texture, texture_path)
+            shutil.copyfile(input_texture_path, output_texture_path)
 
-        # These are all invalid now
-        seam_topology.seams = {}
-        output_seam = output_path.with_name(output_path.stem + "_seam_topology.json")
-        with output_seam.open("w", encoding="utf-8", newline="") as handle:
-            json.dump(seam_topology.to_dict(), handle)
-
+        write_obj(
+            output_path,
+            vertex_loc,
+            vertex_uv,
+            vert_uv_ids,
+            vertex_normals,
+            face_triangles,
+            face_uv_triangles,
+            face_norm_ids,
+            mtllibs,
+        )
         print("Downsampled textured mesh topology")
         print_mesh_topology(output_path)
     return output_path
@@ -503,7 +497,7 @@ def reparameterize_and_remove_calyx(input_path: Path, output_path: Path) -> Path
     with open(seam_topology_path, "r") as handle:
         seam_topology = SeamTopology.from_dict(json.load(handle))
 
-    lines, _, uv_faces, _ = _read_obj(input_path)
+    lines, _, uv_faces, _ = read_obj(input_path)
     vertices, faces = _vertex_geometry(lines, uv_faces, input_path)
     mesh = mn.meshFromFacesVerts(
         faces.astype(np.int32), vertices.astype(np.float32), duplicateNonManifoldVertices=False

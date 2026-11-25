@@ -1,4 +1,5 @@
 import csv
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -12,17 +13,27 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image, ImageDraw
 
-from fix_texture_maps import (
-    _copy_projected_face, _fill_seam_pixels, _project_patch, _seam_edges, _seam_patches,
-    flood_fill_texture_map,
+import fix_texture_maps as fixing
+from seam_topology import SeamInfo, SeamTopology
+
+_legacy_available = (
+    importlib.util.find_spec("legacy_seams") is not None
+    and all(hasattr(fixing, name) for name in (
+        "_copy_projected_face", "_fill_seam_pixels", "_project_patch", "_seam_edges", "_seam_patches"
+    ))
 )
-from MeshLabCleanup import downsample_mesh
-import main
-from normalize_uv_projection import _read_obj
-from legacy_seams import _read_legacy_seam_data
-from seam_topology import SeamTopology
+if _legacy_available:
+    from fix_texture_maps import (
+        _copy_projected_face, _fill_seam_pixels, _project_patch, _seam_edges, _seam_patches,
+        flood_fill_texture_map,
+    )
+    from MeshLabCleanup import downsample_mesh
+    import main
+    from normalize_uv_projection import _read_obj
+    from legacy_seams import _read_legacy_seam_data
 
 
+@unittest.skipUnless(_legacy_available, "Legacy seam-filling API and CSV reader are not present.")
 class FillTextureTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -427,6 +438,370 @@ class FillTextureTests(unittest.TestCase):
         with Image.open(source_dir / "texture.png") as original:
             self.assertEqual(original.getpixel((20, 8)), (255, 255, 255))
 
+
+class TextureExpansionTests(unittest.TestCase):
+    def setUp(self):
+        count = 12
+        self.seam = list(range(count))
+        angles = np.arange(count) * (2 * np.pi / count)
+        self.vertices = np.array([
+            [radius * np.cos(angle), radius * np.sin(angle), 0]
+            for radius in (1, 2, 3, 4)
+            for angle in angles
+        ])
+        self.faces = np.array([
+            triangle
+            for ring in range(3)
+            for i in range(count)
+            for triangle in (
+                [ring * count + i, ring * count + (i + 1) % count, (ring + 1) * count + i],
+                [ring * count + (i + 1) % count, (ring + 1) * count + (i + 1) % count,
+                 (ring + 1) * count + i],
+            )
+        ])
+        self.vertex_faces, self.adjacency = fixing._mesh_adjacency(self.vertices, self.faces)
+
+    def test_ring_boundary_and_circle_projection(self):
+        patch, outer, cut = fixing._get_outer_boundary(
+            self.faces, self.vertex_faces, self.seam, 2,
+            allowed_faces=set(range(len(self.faces))), vertices=self.vertices, adjacency=self.adjacency,
+        )
+        self.assertEqual(len(patch), 48)
+        self.assertEqual(set(outer), set(range(24, 36)))
+        self.assertEqual(cut[0], self.seam[0])
+        self.assertEqual(cut[-1], outer[0])
+        center = np.array([0.3, 0.4])
+        seam_uvs = np.asarray(fixing.compute_edge_locs_circle(self.vertices, self.seam, 0.09)) + center
+        face_ids, projected = fixing._circle_patch(
+            self.vertices, self.faces, patch, self.seam, outer, seam_uvs, center,
+        )
+        positions = {}
+        for face, coords in zip(face_ids, projected):
+            for vertex, coord in zip(self.faces[face], coords):
+                positions[int(vertex)] = coord
+        np.testing.assert_allclose([positions[v] for v in self.seam], seam_uvs)
+        np.testing.assert_allclose(
+            [np.linalg.norm(positions[v] - center) for v in outer],
+            fixing._CAP_RADIUS * 1.2,
+        )
+
+    def test_line_projection_splits_and_offsets_the_closed_ring(self):
+        patch, outer, cut = fixing._get_outer_boundary(
+            self.faces, self.vertex_faces, self.seam, 2,
+            allowed_faces=set(range(len(self.faces))), vertices=self.vertices, adjacency=self.adjacency,
+        )
+        start, end = np.array([0., 0.]), np.array([1., 0.])
+        ids, projected = fixing._line_patch(
+            self.vertices, self.faces, patch, self.seam, outer, cut, start, end, np.array([0., -0.2]),
+        )
+        seam_anchor = [coord for face, coords in zip(ids, projected)
+                       for vertex, coord in zip(self.faces[face], coords) if vertex == self.seam[0]]
+        outer_anchor = [coord for face, coords in zip(ids, projected)
+                        for vertex, coord in zip(self.faces[face], coords) if vertex == outer[0]]
+        self.assertTrue(any(np.allclose(point, start) for point in seam_anchor))
+        self.assertTrue(any(np.allclose(point, end) for point in seam_anchor))
+        self.assertTrue(any(np.allclose(point, [0., -0.2]) for point in outer_anchor))
+        self.assertTrue(any(np.allclose(point, [1., -0.2]) for point in outer_anchor))
+        expected = fixing.compute_edge_locs_line(self.vertices, self.seam, start, end)
+        for vertex in self.seam[1:]:
+            positions = [coord for face, coords in zip(ids, projected)
+                         for v, coord in zip(self.faces[face], coords) if v == vertex]
+            np.testing.assert_allclose(positions, np.tile(expected[vertex], (len(positions), 1)))
+
+    def test_outer_boundary_follows_seam_orientation_on_skewed_mesh(self):
+        vertices = self.vertices.copy()
+        vertices[self.seam[1]] = vertices[35] + [0.01, 0, 0]
+        vertex_faces, adjacency = fixing._mesh_adjacency(vertices, self.faces)
+        _, outer, _ = fixing._get_outer_boundary(
+            self.faces, vertex_faces, self.seam, 2,
+            allowed_faces=set(range(len(self.faces))), vertices=vertices, adjacency=adjacency,
+        )
+        self.assertEqual((outer[1] - outer[0]) % len(self.seam), 1)
+
+    def test_ring_expansion_fills_a_hole_touching_outer_boundary_at_one_vertex(self):
+        face_index = 2 * len(self.seam) + 4
+        a, b, c = self.faces[face_index]
+        vertices = np.vstack((self.vertices, self.vertices[[a, b, c]].mean(axis=0)))
+        center = len(vertices) - 1
+        faces = np.vstack((self.faces[:face_index], [[a, b, center], [b, c, center], [c, a, center]],
+                           self.faces[face_index + 1:]))
+        vertex_faces, _ = fixing._mesh_adjacency(vertices, faces)
+        patch = set(range(2 * len(self.seam) * 2 + 2)) - {face_index + 1, face_index + 2}
+        repaired = fixing._fill_patch_holes(faces, vertex_faces, patch, set(range(len(faces))))
+        self.assertTrue({face_index + 1, face_index + 2}.issubset(repaired))
+        self.assertFalse(any(face >= 2 * len(self.seam) * 2 + 2 for face in repaired))
+        boundary = fixing._boundary_edges(faces, repaired)
+        degrees = {}
+        for edge in boundary:
+            for vertex in edge:
+                degrees[vertex] = degrees.get(vertex, 0) + 1
+        self.assertTrue(all(degree == 2 for degree in degrees.values()))
+
+    def test_side_patch_projects_inside_pixels_outside_opposite_side(self):
+        face_triangles = np.array([[0, 1, 4]])
+        face_uvs = np.array([[0, 1, 2]])
+        uvs = np.array([[0.25, 0.25], [0.25, 0.75], [0.35, 0.5]])
+        vertex_faces = [[0], [0], [], [], [0]]
+        ids, projected = fixing._side_patch(
+            face_triangles, face_uvs, uvs, vertex_faces, {0}, {0}, [0, 1, 2, 3],
+            (np.array([0.25, 0.25]), np.array([0.25, 0.75])),
+            (np.array([0.75, 0.25]), np.array([0.75, 0.75])),
+        )
+        self.assertEqual(ids, [0])
+        np.testing.assert_allclose(projected[0, 2], [0.85, 0.5])
+
+    def test_side_patch_does_not_cross_excluded_corner_faces(self):
+        faces = np.array([[0, 1, 2], [1, 2, 3], [3, 4, 5]])
+        uvs = np.array([[0.25, 0.25], [0.3, 0.25], [0.3, 0.5],
+                        [0.35, 0.5], [0.35, 0.75], [0.4, 0.75]])
+        vertex_faces, _ = fixing._mesh_adjacency(np.column_stack((uvs, np.zeros(6))), faces)
+        ids, _ = fixing._side_patch(
+            faces, faces, uvs, vertex_faces, {0}, {0, 2}, [0],
+            (np.array([0.25, 0.25]), np.array([0.25, 0.75])),
+            (np.array([0.75, 0.25]), np.array([0.75, 0.75])),
+        )
+        self.assertEqual(ids, [0])
+
+    def test_copy_preserves_occupied_pixels_and_fills_only_projected_region(self):
+        source = np.full((7, 7, 3), [10, 20, 30], dtype=np.uint8)
+        output = np.zeros_like(source)
+        output[2, 2] = [77, 88, 99]
+        occupied = np.zeros((7, 7), dtype=bool)
+        occupied[2, 2] = True
+        source_pixels = np.array([[1., 1.], [5., 1.], [1., 5.]])
+        projected = np.array([[[1 / 6, 5 / 6], [5 / 6, 5 / 6], [1 / 6, 1 / 6]]])
+        scratch = np.zeros_like(source)
+        scratch_covered = np.zeros((7, 7), dtype=bool)
+        fixing._copy_projected_faces(source, output, occupied, source_pixels, np.array([[0, 1, 2]]),
+                                     [0], projected, scratch, scratch_covered, set())
+        np.testing.assert_array_equal(output[2, 2], [77, 88, 99])
+        np.testing.assert_array_equal(output[1, 1], [10, 20, 30])
+        np.testing.assert_array_equal(output[6, 6], [0, 0, 0])
+        self.assertFalse(scratch_covered.any())
+
+    def test_corner_face_exclusion_includes_shared_and_distinct_seam_vertices(self):
+        faces = np.array([
+            [0, 5, 6], [1, 4, 7], [2, 8, 9], [3, 4, 10],
+            [1, 5, 6], [4, 5, 6], [1, 3, 7], [5, 6, 7],
+        ])
+        vertex_faces, _ = fixing._mesh_adjacency(np.zeros((11, 3)), faces)
+        seam_ids = {"top": [0, 1], "bottom": [2, 3], "side": [0, 2, 4]}
+        self.assertEqual(fixing._seam_corner_faces(vertex_faces, seam_ids), {0, 1, 2, 3})
+
+    def test_copy_skips_excluded_faces(self):
+        source = np.full((9, 9, 3), [10, 20, 30], dtype=np.uint8)
+        output = np.zeros_like(source)
+        occupied = np.zeros((9, 9), dtype=bool)
+        pixels = np.array([[0., 0.], [8., 0.], [0., 8.]])
+        targets = np.array([
+            [[0, 1], [0.5, 1], [0, 0.5]],
+            [[0.5, 0.5], [1, 0.5], [1, 0]],
+        ])
+        fixing._copy_projected_faces(
+            source, output, occupied, pixels, np.array([[0, 1, 2], [0, 1, 2]]),
+            [0, 1], targets, np.zeros_like(source), np.zeros((9, 9), dtype=bool), {0},
+        )
+        np.testing.assert_array_equal(output[1, 1], [0, 0, 0])
+        np.testing.assert_array_equal(output[6, 7], [10, 20, 30])
+
+    def test_top_patch_skips_long_edges_even_when_they_follow_the_seam(self):
+        points = np.array([
+            [[0, 0], [0.01, 0], [0, 0]],
+            [[0, 0], [0.010001, 0], [0, 0]],
+            [[0.5, 0], [1, 0.5], [0.75, 0.25]],
+            [[0, 0], [0.02, 0], [0, 0]],
+        ])
+        already_excluded = {3}
+        with self.assertWarnsRegex(RuntimeWarning, r"2 .*top.*0\.01"):
+            result = fixing._exclude_long_top_seam_faces([0, 1, 2, 3], points, already_excluded)
+        self.assertEqual(result, {1, 2, 3})
+        self.assertEqual(already_excluded, {3})
+
+    def test_refuses_to_replace_input_mesh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mesh.obj"
+            with self.assertRaisesRegex(ValueError, "must not overwrite"):
+                fixing.flood_fill_texture_map(path.with_suffix(".png"), path, path.with_suffix(".json"), path)
+
+    def test_expands_complete_mesh_and_preserves_original_chart_pixels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mesh = root / "input.obj"
+            vertices, uvs, faces, face_uvs = [], [], [], []
+            regions = {name: set() for name in (
+                "top", "bottom", "middle", "left_side_seam", "right_side_seam"
+            )}
+            count, levels, cap_rings = 16, 12, 8
+            angles = np.arange(count) * 2 * np.pi / count
+            body = []
+            for level in range(levels + 1):
+                ring = []
+                for angle in angles:
+                    ring.append(len(vertices))
+                    vertices.append([np.cos(angle), 1 - 2 * level / levels, np.sin(angle)])
+                body.append(ring)
+
+            corners = np.array([[0.5, fixing._UV_PADDING], [1 - fixing._UV_PADDING, 0.5],
+                                [0.5, 1 - fixing._UV_PADDING], [fixing._UV_PADDING, 0.5]])
+            body_uvs = []
+            for level in range(levels + 1):
+                t = level / levels
+                ring = []
+                for i in range(count + 1):
+                    s = i / count
+                    top = (1 - s) * corners[0] + s * corners[1]
+                    bottom = (1 - s) * corners[3] + s * corners[2]
+                    ring.append(len(uvs))
+                    uvs.append((1 - t) * top + t * bottom)
+                body_uvs.append(ring)
+
+            def add_face(region, vertex_ids, uv_ids):
+                face_id = len(faces)
+                regions[region].add(face_id)
+                faces.append(vertex_ids)
+                face_uvs.append(uv_ids)
+                return face_id
+
+            for level in range(levels):
+                for i in range(count):
+                    j = (i + 1) % count
+                    a, b = body[level][i], body[level][j]
+                    c, d = body[level + 1][i], body[level + 1][j]
+                    ua, ub = body_uvs[level][i:i + 2]
+                    uc, ud = body_uvs[level + 1][i:i + 2]
+                    first = add_face("middle", [a, b, c], [ua, ub, uc])
+                    second = add_face("middle", [b, d, c], [ub, ud, uc])
+                    if i == 0:
+                        regions["left_side_seam"].add(first)
+                    if i == count - 1:
+                        regions["right_side_seam"].add(second)
+
+            centers = []
+            for cap_index, name in enumerate(("top", "bottom")):
+                rings = [body[0 if name == "top" else -1]]
+                uv_rings = []
+                center_uv = fixing._CAP_CENTERS[cap_index]
+                height = 1 if name == "top" else -1
+                for ring_index in range(cap_rings):
+                    radius = 1 - ring_index / cap_rings
+                    if ring_index:
+                        ring = []
+                        for angle in angles:
+                            ring.append(len(vertices))
+                            vertices.append([radius * np.cos(angle), height, radius * np.sin(angle)])
+                        rings.append(ring)
+                    uv_ring = []
+                    for angle in angles:
+                        uv_ring.append(len(uvs))
+                        uvs.append(center_uv + 0.09 * radius * np.array([np.cos(angle), np.sin(angle)]))
+                    uv_rings.append(uv_ring)
+                centers.append(len(vertices))
+                vertices.append([0, height, 0])
+                center_uv_index = len(uvs)
+                uvs.append(center_uv)
+                for ring_index in range(cap_rings - 1):
+                    for i in range(count):
+                        j = (i + 1) % count
+                        a, b = rings[ring_index][i], rings[ring_index][j]
+                        c, d = rings[ring_index + 1][i], rings[ring_index + 1][j]
+                        ua, ub = uv_rings[ring_index][i], uv_rings[ring_index][j]
+                        uc, ud = uv_rings[ring_index + 1][i], uv_rings[ring_index + 1][j]
+                        add_face(name, [a, b, c], [ua, ub, uc])
+                        add_face(name, [b, d, c], [ub, ud, uc])
+                for i in range(count):
+                    j = (i + 1) % count
+                    add_face(name, [rings[-1][i], rings[-1][j], centers[-1]],
+                             [uv_rings[-1][i], uv_rings[-1][j], center_uv_index])
+
+            topology = SeamTopology(-1, 1, (0, 1, 0), (0, -1, 0),
+                                    top_vertex=centers[0], bottom_vertex=centers[1],
+                                    face_lists=regions)
+            for name, ids in (("top", body[0]), ("bottom", body[-1]),
+                              ("side", [ring[0] for ring in body])):
+                topology.add_seam(name, SeamInfo(name, ids, [vertices[v] for v in ids], None, None))
+            mesh.with_name("input_seam_topology.json").write_text(json.dumps(topology.to_dict()))
+            mesh.with_suffix(".mtl").write_text("newmtl material_0\nmap_Kd input.png\n")
+            with mesh.open("w") as file:
+                file.write("mtllib input.mtl\n")
+                for vertex in vertices:
+                    file.write("v " + " ".join(map(str, vertex)) + "\n")
+                for uv in uvs:
+                    file.write("vt " + " ".join(map(str, uv)) + "\n")
+                file.write("vn 0 1 0\n")
+                for face, face_uv in zip(faces, face_uvs):
+                    file.write("f " + " ".join(f"{v + 1}/{uv + 1}/1" for v, uv in zip(face, face_uv)) + "\n")
+            image = Image.new("RGB", (256, 256), (0, 0, 0))
+            occupied = Image.new("1", image.size)
+            bottom_mask = Image.new("1", image.size)
+            draw, mask_draw = ImageDraw.Draw(image), ImageDraw.Draw(occupied)
+            bottom_draw = ImageDraw.Draw(bottom_mask)
+            uv_array = np.asarray(uvs)
+            coords = uv_array * 255
+            coords[:, 1] = 255 - coords[:, 1]
+            for region, color in (("middle", (20, 40, 200)), ("top", (200, 30, 30)),
+                                  ("bottom", (30, 200, 30))):
+                for face in regions[region]:
+                    polygon = [tuple(coords[uv]) for uv in face_uvs[face]]
+                    draw.polygon(polygon, fill=color)
+                    mask_draw.polygon(polygon, fill=1)
+                    if region == "bottom":
+                        bottom_draw.polygon(polygon, fill=1)
+            image_pixels = np.array(image)
+            lower_half = np.indices(image_pixels.shape[:2])[0] > (1 - fixing._CAP_CENTERS[1, 1]) * 255
+            image_pixels[np.asarray(bottom_mask, dtype=bool) & lower_half] = [200, 150, 30]
+            image = Image.fromarray(image_pixels)
+            image.save(root / "input.png")
+            output = root / "out" / "result.obj"
+            with (self.assertWarnsRegex(RuntimeWarning, r"projected top-seam faces.*0\.01"),
+                  patch("fix_texture_maps._copy_projected_faces", wraps=fixing._copy_projected_faces) as copy,
+                  patch("fix_texture_maps._side_patch", wraps=fixing._side_patch) as side):
+                fixing.expand_texture_map(mesh, output)
+            vertex_faces, _ = fixing._mesh_adjacency(np.asarray(vertices), np.asarray(faces))
+            seam_ids = {name: topology.seams[name].vertex_ids for name in ("top", "bottom", "side")}
+            excluded = fixing._seam_corner_faces(vertex_faces, seam_ids)
+            self.assertTrue(excluded)
+            self.assertEqual(copy.call_count, 6)
+            for index, call in enumerate(copy.call_args_list):
+                expected_excluded = excluded.copy()
+                if index == 1:
+                    ids, projected = call.args[5:7]
+                    lengths = np.linalg.norm(projected - np.roll(projected, -1, axis=1), axis=2)
+                    expected_excluded.update(
+                        face for face, face_lengths in zip(ids, lengths) if np.any(face_lengths > 0.01)
+                    )
+                self.assertEqual(call.args[-1], expected_excluded)
+            self.assertEqual(side.call_count, 2)
+            for call in side.call_args_list:
+                self.assertFalse(call.args[4] & excluded)
+                self.assertFalse(call.args[5] & excluded)
+            with Image.open(output.with_suffix(".png")) as result:
+                actual = np.asarray(result)
+            original = np.asarray(image)
+            mask = np.asarray(occupied, dtype=bool)
+            np.testing.assert_array_equal(actual[mask], original[mask])
+            self.assertGreater(np.count_nonzero(np.any(actual[~mask] != original[~mask], axis=1)), 100)
+            for center, direction in zip(fixing._CAP_CENTERS, (1, -1)):
+                pixel = np.rint((center + [0, direction * 0.105]) * 255).astype(int)
+                np.testing.assert_array_equal(actual[255 - pixel[1], pixel[0]], [20, 40, 200])
+            for start, end, outward, color in (
+                (corners[0], corners[1], [1, -1], [0, 0, 0]),
+                (corners[3], corners[2], [-1, 1], [30, 200, 30]),
+            ):
+                point = 0.7 * start + 0.3 * end + np.asarray(outward) * (0.05 / np.sqrt(2))
+                pixel = np.rint(point * 255).astype(int)
+                np.testing.assert_array_equal(actual[255 - pixel[1], pixel[0]], color)
+            for fraction, color in ((0.25, [30, 200, 30]), (0.75, [200, 150, 30])):
+                point = ((1 - fraction) * corners[3] + fraction * corners[2]
+                         + np.array([-1, 1]) * (0.03 / np.sqrt(2)))
+                pixel = np.rint(point * 255).astype(int)
+                np.testing.assert_array_equal(actual[255 - pixel[1], pixel[0]], color)
+            self.assertEqual(mesh.with_name("input_seam_topology.json").read_bytes(),
+                             output.with_name("result_seam_topology.json").read_bytes())
+            self.assertIn("map_Kd result.png", output.with_suffix(".mtl").read_text())
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 if __name__ == "__main__":
     unittest.main()

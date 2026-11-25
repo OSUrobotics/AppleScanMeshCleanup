@@ -19,6 +19,7 @@ def read_obj(input_path: Path):
     # Faces are triplets of vertex indices (or uv indices)
     face_vids = []
     face_tex_ids = []
+    face_norm_ids = []
     # Mapping from vertex index to list of associated UV coordinates
     vert_uv_ids = {}  # List of UV coordinates corresponding to each vertex in the faces
     for i in range(len(vert_locs)):
@@ -45,25 +46,29 @@ def read_obj(input_path: Path):
                 raise ValueError(f"Expected triangular OBJ faces in {input_path}.")
             face = []
             uv_face = []
+            norm_face = []
             for corner in parts[1:]:
                 # The format is either vid/vtexid or vid/vtexid/vnormid
                 fields = corner.split("/")
+                norm_index = -1
                 if len(fields) < 2 or not fields[1]:
                     raise ValueError(f"Face is missing texture coordinates: {line}")
+                elif len(fields) == 3:
+                    norm_index = int(fields[2])
                 v_index = int(fields[0])
                 uv_index = int(fields[1])
-                if v_index < 1:
-                    raise ValueError("OBJ vertex indices cannot be zero or negative.")
-                if uv_index < 1:
-                    raise ValueError("OBJ texture indices cannot be zero or negative.")
                 face.append(v_index - 1)
                 uv_face.append(uv_index - 1)
+                if norm_index != -1:
+                    norm_face.append(norm_index - 1)
                 if v_index -1 not in vert_uv_ids:
                     vert_uv_ids[v_index - 1] = [uv_index - 1]
                 else:
                     vert_uv_ids[v_index - 1].append(uv_index - 1)
             face_vids.append(face)
             face_tex_ids.append(uv_face)
+            if norm_face[0] != -1:
+                face_norm_ids.append(norm_face)
         elif parts[0] == "mtllib":
             mtllibs.extend(shlex.split(line)[1:])
 
@@ -75,6 +80,7 @@ def read_obj(input_path: Path):
     # These are the face indices for vertices and UVs
     face_triangles = np.asarray(face_vids, dtype=np.int64)
     face_uv_triangles = np.asarray(face_tex_ids, dtype=np.int64)
+    face_norm_triangles = np.asarray(face_norm_ids, dtype=np.int64)
 
     # These are checks that the vertex and face data are valid
     if vertex_loc.ndim != 2 or vertex_loc.shape[1] != 3 or not np.isfinite(vertex_loc).all():
@@ -85,17 +91,19 @@ def read_obj(input_path: Path):
         raise ValueError(f"Face vertex index is out of range in {input_path}.")
     if face_uv_triangles.min() < 0 or face_uv_triangles.max() >= len(vertex_uv):
         raise ValueError(f"Face UV index is out of range in {input_path}.")
+    if face_norm_triangles.min() < 0 or face_norm_triangles.max() >= len(vertex_normals):
+        raise ValueError(f"Face normal index is out of range in {input_path}.")
     if len(mtllibs) != 1:
         raise ValueError(f"Expected exactly one OBJ material library in {input_path}.")
 
     for indx, uv_ids in vert_uv_ids.items():
         unique_ids = set(uv_ids)
         vert_uv_ids[indx] = list(unique_ids)
-    return vertex_loc, vertex_uv, vert_uv_ids, vertex_normals, face_triangles, face_uv_triangles, mtllibs[0]
+    return vertex_loc, vertex_uv, vert_uv_ids, vertex_normals, face_triangles, face_uv_triangles, face_norm_ids, mtllibs[0]
 
 
 def read_mesh_no_textures(input_path: Path) -> mm.Mesh:
-    vertex_loc, vertex_uv, vert_uv_ids, vertex_normals, face_triangles, face_uv_triangles, mtllibs = read_obj(input_path)
+    vertex_loc, vertex_uv, vert_uv_ids, vertex_normals, face_triangles, face_uv_triangles, face_norm_ids, mtllibs = read_obj(input_path)
 
     mesh = mn.meshFromFacesVerts(
         face_triangles.astype(np.int32), vertex_loc.astype(np.float32), duplicateNonManifoldVertices=False
@@ -184,11 +192,11 @@ def bfs_graph(adjacency: list[list[tuple[int, float]]], start: int, no_cross_vs:
     visited = [False] * len(adjacency)
     queue = [start]
     visited[start] = True
-    order = []
+    adj_vs = []
 
     while queue:
         v = queue.pop(0)
-        order.append(v)
+        adj_vs.append(v)
         for u, _ in adjacency[v]:
             if u in no_cross_vs:
                 continue
@@ -196,7 +204,7 @@ def bfs_graph(adjacency: list[list[tuple[int, float]]], start: int, no_cross_vs:
                 visited[u] = True
                 queue.append(u)
 
-    return order
+    return adj_vs
 
 
 def compute_edge_locs_line(verts: np.ndarray, v_ids: list[int], corner_start: np.ndarray, corner_end: np.ndarray):
@@ -251,6 +259,7 @@ def write_obj(output_path: Path,
               vertex_normals : np.ndarray, 
               triangles : np.ndarray, 
               uv_triangles : np.ndarray, 
+              face_norm_triangles: np.ndarray,
               texture_name: str,
               material_name: str):
 
@@ -265,12 +274,16 @@ def write_obj(output_path: Path,
         for n in vertex_normals:
             obj_file.write(f"vn {n[0]:.9g} {n[1]:.9g} {n[2]:.9g}\n")
 
-        obj_file.write(f"usemtl {material_name}\n")
-        for tri, uv_tri in zip(triangles, uv_triangles):
+        obj_file.write(f"usemtl material_0\n")
+        for tri, uv_tri, norm_tri in zip(triangles, uv_triangles, face_norm_triangles):
             obj_file.write("f")
-            for vi, uvi in zip(tri, uv_tri):
-                if b_has_normals:
-                    obj_file.write(f" {vi+1}/{uvi+1}/{vi+1}")
-                else:
+            if b_has_normals:
+                for vi, uvi, ni in zip(tri, uv_tri, norm_tri):
+                    if b_has_normals:
+                        obj_file.write(f" {vi+1}/{uvi+1}/{ni+1}")
+                    else:
+                        obj_file.write(f" {vi+1}/{uvi+1}")
+            else:
+                for vi, uvi in zip(tri, uv_tri):
                     obj_file.write(f" {vi+1}/{uvi+1}")
             obj_file.write("\n")

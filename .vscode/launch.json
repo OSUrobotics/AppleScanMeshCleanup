@@ -142,6 +142,19 @@
             ]
         },
         {
+            "name": "Debug pad texture map (all)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "internalConsole",
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--operation",
+                "pad_texture_map"
+            ]
+        },
+        {
             "name": "Debug remove calyx (all)",
             "type": "debugpy",
             "request": "launch",
@@ -252,6 +265,21 @@
                 "Parameterized/Envy_001_FullRes_patch.obj",
                 "--seam-path",
                 "Parameterized/Envy_001_FullRes_seam_topology.json"
+            ]
+        },
+        {
+            "name": "Debug pad texture (one)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "fix_texture_maps.py",
+            "console": "internalConsole",
+            "args": [
+                "--root-dir",
+                "/Users/cindygrimm/PycharmProjects/data/ScannedModels/ProsserEnvyApples",
+                "--input-path",
+                "NormalizedTexture/Envy_001_FullRes.obj",
+                "--output-path",
+                "FixedTexture/Envy_001_FullRes.obj",
             ]
         },
     ]

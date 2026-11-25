@@ -32,8 +32,11 @@ def label_vs_and_fs(mesh: mm.Mesh,
     top_vs = top_vs | set(seam_topology.seams["top"].vertex_ids)
 
     # Start the bottom cap at the vertex closest to the user-marked bottom point
-    verts = mn.getNumpyVerts(mesh)
-    bottom_vid = np.argmin(verts[:, 1])
+    if seam_topology.bottom_vertex != -1:
+        bottom_vid = seam_topology.bottom_vertex
+    else:
+        verts = mn.getNumpyVerts(mesh)
+        bottom_vid = np.argmin(verts[:, 1])
     bottom_vs = set(bfs_graph(edge_adj, start=bottom_vid, no_cross_vs=no_cross_vs))
     bottom_vs = bottom_vs | set(seam_topology.seams["bottom"].vertex_ids)
 
@@ -55,7 +58,7 @@ def label_vs_and_fs(mesh: mm.Mesh,
     print(f"Number of seam vs {len(no_cross_vs)}")
     print(f"Number of top vertices: {len(top_vs)}, bottom vertices: {len(bottom_vs)}, middle vertices: {len(middle_vs)}, sum: {len(top_vs) + len(bottom_vs) + len(middle_vs)}")
 
-    return bottom_vs, seam_topology.face_lists["bottom"], top_vs, seam_topology.face_lists["top"], middle_vs, seam_topology.face_lists["middle"], edge_adj
+    return bottom_vs, seam_topology.face_lists["bottom"], top_vs, seam_topology.face_lists["top"], middle_vs, seam_topology.face_lists["middle"], bottom_vid, edge_adj
 
 
 def place_in_square(mesh: mm.Mesh, 
@@ -121,11 +124,15 @@ def place_in_square(mesh: mm.Mesh,
     #.   the 3 corner at the start of the bottom seam and the end of the side seam
     verts = mn.getNumpyVerts(mesh)
     top_vids = seam_topology.seams["top"].vertex_ids    
-    top_locs = compute_edge_locs_line(verts, top_vids, corners[0], corners[1])
+    top_vids_locs = [v for v in top_vids]
+    top_vids_locs.append(top_vids[0])
+    top_locs = compute_edge_locs_line(verts, top_vids_locs, corners[0], corners[1])
     side_1_vids = seam_topology.seams["side"].vertex_ids
     side_1_locs = compute_edge_locs_line(verts, side_1_vids, corners[1], corners[2])
     bottom_vids = list(reversed(seam_topology.seams["bottom"].vertex_ids))
-    bottom_locs = compute_edge_locs_line(verts, bottom_vids, corners[2], corners[3])
+    bottom_vids_locs = [v for v in bottom_vids]
+    bottom_vids_locs.append(bottom_vids[0])
+    bottom_locs = compute_edge_locs_line(verts, bottom_vids_locs, corners[2], corners[3])
     side_2_vids = list(reversed(seam_topology.seams["side"].vertex_ids))
     side_2_locs = compute_edge_locs_line(verts, side_2_vids, corners[3], corners[0])
     # Only pin the middle vertices on the seams - corners are already done. The top and bottom seams start with the corner vertex
@@ -133,9 +140,9 @@ def place_in_square(mesh: mm.Mesh,
             side_1_vids[1:-1],
             bottom_vids[0:-1],
             side_2_vids[1:-1]]
-    locs = [top_locs[1:], 
+    locs = [top_locs[1:-1], 
             side_1_locs[1:-1], 
-            bottom_locs[0:-1], 
+            bottom_locs[1:-1], 
             side_2_locs[1:-1]]
     corner_count = 0
     for vids, locs in zip(vids, locs):
@@ -217,14 +224,25 @@ def place_in_square(mesh: mm.Mesh,
                 else:
                     assert col >= n_edge_and_corner
             else:
-                if count_left > 0 and count_right == 0:
-                    col = map_v[0]
-                elif count_right > 0 and count_left == 0:
-                    col = map_v[1]
+                if neighbor == corner_top:
+                    # This one is backwards
+                    if count_left > 0 and count_right == 0:
+                        col = map_v[1]
+                    elif count_right > 0 and count_left == 0:
+                        col = map_v[0]
+                    else:
+                        for nv, _ in edge_adjacency[neighbor]:
+                            print(f"Neighbor vertex {nv} of vertex {v}")
+                        raise ValueError(f"Neighbor vertex {neighbor} not found on either side of the seam.")
                 else:
-                    for nv, _ in edge_adjacency[neighbor]:
-                        print(f"Neighbor vertex {nv} of vertex {v}")
-                    raise ValueError(f"Neighbor vertex {neighbor} not found on either side of the seam.")
+                    if count_left > 0 and count_right == 0:
+                        col = map_v[0]
+                    elif count_right > 0 and count_left == 0:
+                        col = map_v[1]
+                    else:
+                        for nv, _ in edge_adjacency[neighbor]:
+                            print(f"Neighbor vertex {nv} of vertex {v}")
+                        raise ValueError(f"Neighbor vertex {neighbor} not found on either side of the seam.")
                 assert col < n_edge_and_corner
             rows.append(row)
             cols.append(col)
@@ -390,7 +408,7 @@ def place_in_circle(mesh: mm.Mesh, edge_adjacency, boundary_vs: list[int], insid
 
     # Now place the inside the vertices as 1/n * their neighbors
     for i, v in enumerate(inside_vs):
-        if v in boundary_set:
+        if v in boundary_set or v == center:
             continue
         rows.append(count_constraints)
         cols.append(count_constraints)
@@ -401,6 +419,7 @@ def place_in_circle(mesh: mm.Mesh, edge_adjacency, boundary_vs: list[int], insid
         for neighbor in neighbors:
             map_v = map_vs.get(neighbor, None)
             if map_v is None:
+                print(f"vertex {v}: Neighbor vertex {neighbor} not found in map_vs.")
                 raise ValueError(f"Neighbor vertex {neighbor} not found in map_vs.")
             rows.append(count_constraints)
             cols.append(map_v)

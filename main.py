@@ -37,6 +37,7 @@ from bake_textures import (
 from align_meshes import align_meshes
 
 from normalize_uv_projection import normalize_uv_projection
+from fix_texture_maps import expand_texture_map
 
 from remove_calyx import remove_calyx
 
@@ -63,7 +64,7 @@ def parse_args():
     parser.add_argument(
         "--operation",
         required=True,
-        choices=(*MLX_SCRIPTS, "rename", "parameterize", "parameterize_fullres", "normalize_uv_projection", "bake_textures", "align_meshes", "downsample", "remove_calyx", "check_topology"),
+        choices=(*MLX_SCRIPTS, "rename", "parameterize", "parameterize_fullres", "normalize_uv_projection", "bake_textures", "align_meshes", "downsample", "remove_calyx", "check_topology", "pad_texture_map"),
         help="Operation to run; selects the input/output directories.",
     )
     parser.add_argument(
@@ -182,7 +183,7 @@ def main():
         )
     elif args.operation == "downsample_lowres":
         #
-        input_dir = root_dir / "CalyxRemoved"
+        input_dir = root_dir / "PaddedTexture"
         output_dir = root_dir / "LowRes"
         process_file = partial(
             downsample_mesh,
@@ -190,7 +191,7 @@ def main():
         )
     elif args.operation == "downsample_hires":
         #
-        input_dir = root_dir / "NormalizedTexture"
+        input_dir = root_dir / "PaddedTexture"
         output_dir = root_dir / "HighRes"
         process_file = partial(
             downsample_mesh,
@@ -198,7 +199,7 @@ def main():
         )
     elif args.operation == "downsample_fullres":
         #
-        input_dir = root_dir / "NormalizedTexture"
+        input_dir = root_dir / "PaddedTexture"
         output_dir = root_dir / "FullRes"
         process_file = partial(
             downsample_mesh,
@@ -212,6 +213,13 @@ def main():
         process_file = partial(
             normalize_uv_projection,
             seam_path=seam_dir
+        )
+    elif args.operation == "pad_texture_map":
+        input_dir = root_dir / "NormalizedTexture"
+        output_dir = root_dir / "PaddedTexture"
+
+        process_file = partial(
+            expand_texture_map,
         )
     elif args.operation == "remove_calyx":
         # The meshes with the calyx need to have it removed

@@ -152,6 +152,11 @@ class SeamTopology:
         for name, faces in self.face_lists.items():
             self.face_lists[name] = {vertex_map.get(vid, vid) for vid in faces}
 
+    def renumber_faces(self, face_map: dict) -> None:
+        """Renumber the face ids for all face lists based on a provided mapping from old to new ids."""
+        for name, faces in self.face_lists.items():
+            self.face_lists[name] = {face_map.get(fid, fid) for fid in faces}
+
     def transform(self, translation, rotation) -> None:
         """Apply rotation then translation to 3D points; mesh Y bounds must be recomputed by the caller."""
         translation = np.asarray(translation, dtype=np.float64)
