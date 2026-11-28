@@ -36,7 +36,6 @@ from filename_fixing import write_material_file, _apple_name_base
 from obj_geometry import read_obj, read_mesh_no_textures, write_obj
 
 from patch_stem_calyx_ring import patch_stem_and_ring_calyx
-from remove_calyx import remove_calyx
 
 MeshProcessor = Callable[[Path, Path], Path]
 
@@ -593,11 +592,11 @@ def process_meshes(
                         continue
                 else:
                     continue
-        #try:
-        processed_path = process_file(input_path, output_path)
-        processed_files.append(str(processed_path))
-        #except Exception as exc:
-        #    print(f"Failed to process {input_path.name} to {output_path.name}: {exc}")
+        try:
+            processed_path = process_file(input_path, output_path)
+            processed_files.append(str(processed_path))
+        except Exception as exc:
+            print(f"Failed to process {input_path.name} to {output_path.name}: {exc}")
 
     return processed_files
 

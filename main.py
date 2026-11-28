@@ -39,7 +39,8 @@ from align_meshes import align_meshes
 from normalize_uv_projection import normalize_uv_projection
 from fix_texture_maps import expand_texture_map
 
-from remove_calyx import remove_calyx
+from remove_calyx import cutout_calyx_and_save
+from remove_calyx_and_patch import remove_calyx_and_save
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -227,7 +228,11 @@ def main():
         output_dir = root_dir / "CalyxRemoved"
         seam_topology_path = input_dir
         process_file = partial(
-            remove_calyx,
+            cutout_calyx_and_save,
+            seam_path=seam_topology_path
+        )
+        process_file = partial(
+            remove_calyx_and_save,
             seam_path=seam_topology_path
         )
     elif args.operation == "align_meshes":
@@ -264,13 +269,13 @@ def main():
             input_dir = root_dir / "BlenderStemRemoved"
             output_dir = root_dir / "BlenderNoStemRebaked"
         else:
-            input_dir = root_dir / "Parameterized" 
+            input_dir = root_dir / "NormalizedTexture" 
             output_dir = root_dir / "BlenderRebaked"
 
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        source_dir = root_dir / "BlenderRebaked_v2"
+        source_dir = root_dir / "OriginalRevoScans"
         process_file = partial(
             bake_textures,
             source_dir=source_dir,

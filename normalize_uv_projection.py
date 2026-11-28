@@ -187,7 +187,7 @@ def place_uvs_in_new_locs(mesh: mm.Mesh,
     """ This takes the top and bottom regions and places them with a circle boundary, with each vertex
      at the center of its neighbors and (optionally), the center vertex at the origin
       The middle bit is mapped to a diamond-shaped region. """
-    
+
     # Define the new seam by connecting the top and bottom seams at the mid point
     top_seam_vs = seam_topology.seams["top"].vertex_ids
     bottom_seam_vs = seam_topology.seams["bottom"].vertex_ids
@@ -199,6 +199,14 @@ def place_uvs_in_new_locs(mesh: mm.Mesh,
     # Note that vertices will show up in multiple regions if they are shared across faces
     bottom_vs, bottom_fs, top_vs, top_fs, middle_vs, middle_fs, bottom_vid, edge_adj = labels
 
+    # Use the edge lengths from the UVs to inform the placement of vertices in the new UV layout
+    # Start with changing just the top and bottom faces
+    _use_uv_edge_lengths(edge_adjacency=edge_adj,
+                         vertex_uvs=vertex_uv,
+                         face_vertex_indices=face_vert_ids,
+                         face_triangle_indices=face_uv_ids,
+                         faces=top_fs | bottom_fs)
+
     new_top_locs, map_top, _ = place_in_circle(mesh=mesh, edge_adjacency=edge_adj, boundary_vs=top_seam_vs, inside_vs=top_vs, center=seam_topology.top_vertex, radius=_CAP_RADIUS - 0.01)
     new_bottom_locs, map_bottom, _ = place_in_circle(mesh=mesh, edge_adjacency=edge_adj, boundary_vs=bottom_seam_vs, inside_vs=bottom_vs, center=bottom_vid, radius=_CAP_RADIUS - 0.01)
     new_bottom_locs[:, :] += _CAP_CENTERS[1]
@@ -208,6 +216,14 @@ def place_uvs_in_new_locs(mesh: mm.Mesh,
         [[0.5, _UV_PADDING], [1.0 - _UV_PADDING, 0.5], [0.5, 1.0 - _UV_PADDING], [_UV_PADDING, 0.5]],
         dtype=np.float64,
             )
+
+    # Theoretically, it should only use the edge lengths from the vertices in the
+    # inside of the regions, so we don't really need to seperate this, but doing it anyway
+    _use_uv_edge_lengths(edge_adjacency=edge_adj,
+                         vertex_uvs=vertex_uv,
+                         face_vertex_indices=face_vert_ids,
+                         face_triangle_indices=face_uv_ids,
+                         faces=middle_fs)
 
     new_diamond_locs, map_diamond, _, _, _ = place_in_square(mesh=mesh, 
                                                             edge_adjacency=edge_adj, 
@@ -271,6 +287,31 @@ def place_uvs_in_new_locs(mesh: mm.Mesh,
         print ("Warning: Some UVs were not assigned new locations.")
         # raise ValueError("Some UVs were not assigned new locations.")
     return new_vertex_uv
+
+
+def _use_uv_edge_lengths(edge_adjacency, vertex_uvs, face_vertex_indices, face_triangle_indices, faces):
+    for face in faces:
+        f_vid = face_vertex_indices[face]
+        f_uv_id = face_triangle_indices[face]
+        for indx in range(0, len(f_vid)):
+            vid = f_vid[indx]
+            uv_id = f_uv_id[indx]
+            vid_next = f_vid[(indx + 1) % len(f_vid)]
+            uv_id_next = f_uv_id[(indx + 1) % len(f_uv_id)]
+            edge_len = np.linalg.norm(vertex_uvs[uv_id] - vertex_uvs[uv_id_next])
+            if edge_len < 0.0001:
+                edge_len = 0.0001
+            
+            for v_org, v_next in zip((vid, vid_next), (vid_next, vid)):
+                v_star = [n for n, _ in edge_adjacency[v_org]]
+                b_found = False
+                for n_index, neighbor in enumerate(v_star):
+                    if v_next == neighbor:
+                        edge_adjacency[v_org][n_index] = (v_next, edge_len)
+                        b_found = True
+                        break
+                if not b_found:
+                    raise ValueError(f"Edge ({v_org}, {v_next}) not found in adjacency.")
 
 
 def normalize_uv_projection(input_path: Path, output_path: Path, seam_path: Path) -> Path:

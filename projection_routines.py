@@ -201,8 +201,11 @@ def place_in_square(mesh: mm.Mesh,
         data.append(1.0)
         #a_mat[row, row] = 1.0
         neighbors = [n for n, _ in edge_adjacency[v]]
-        n_neighbors = len(neighbors)
-        perc = 1.0 / n_neighbors
+        edge_lengths = [l for _, l in edge_adjacency[v]]
+        len_sum = np.sum(edge_lengths)
+        edge_lengths = edge_lengths / len_sum
+        #n_neighbors = len(neighbors)
+        #perc = 1.0 / n_neighbors
 
         count_left = 0
         count_right = 0
@@ -212,7 +215,7 @@ def place_in_square(mesh: mm.Mesh,
             if neighbor in vs_on_right_side:
                 count_right += 1
 
-        for neighbor in neighbors:
+        for neighbor, el in zip(neighbors, edge_lengths):
             map_v = map_vs.get(neighbor, None)
             if map_v is None:
                 raise ValueError(f"Neighbor vertex {neighbor} not found in map_vs.")
@@ -246,7 +249,7 @@ def place_in_square(mesh: mm.Mesh,
                 assert col < n_edge_and_corner
             rows.append(row)
             cols.append(col)
-            data.append(-perc)
+            data.append(-el)
             #a_mat[row, col] = -perc
 
     touch_col = np.zeros(n_constraints, dtype=np.int32)
@@ -414,16 +417,19 @@ def place_in_circle(mesh: mm.Mesh, edge_adjacency, boundary_vs: list[int], insid
         cols.append(count_constraints)
         data.append(1.0)
         neighbors = [n for n, _ in edge_adjacency[v]]
-        n_neighbors = len(neighbors)
-        perc = 1.0 / n_neighbors
-        for neighbor in neighbors:
+        edge_lengths = [l for _, l in edge_adjacency[v]]
+        len_sum = np.sum(edge_lengths)
+        edge_lengths = edge_lengths / len_sum
+        #n_neighbors = len(neighbors)
+        #perc = 1.0 / n_neighbors
+        for neighbor, el in zip(neighbors, edge_lengths):
             map_v = map_vs.get(neighbor, None)
             if map_v is None:
                 print(f"vertex {v}: Neighbor vertex {neighbor} not found in map_vs.")
                 raise ValueError(f"Neighbor vertex {neighbor} not found in map_vs.")
             rows.append(count_constraints)
             cols.append(map_v)
-            data.append(-perc)
+            data.append(-el)
         count_constraints += 1
 
     a_mat = csc_array((data, (rows, cols)), shape=(n_constraints, n_constraints))

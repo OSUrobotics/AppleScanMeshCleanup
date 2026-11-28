@@ -4,8 +4,12 @@ import os
 from pathlib import Path
 
 
-def write_material_file(material_path: Path, texture_filename: str):
-    if "Envy" in os.path.basename(material_path):
+def write_material_file(material_path: Path, texture_filename: str, b_use_color_kd: bool=False):
+    if not b_use_color_kd:
+        Ka = (1.0, 1.0, 1.00)
+        Kd = (1.0, 1.0, 1.0)
+        Ks = (0.18, 0.18, 0.18)
+    elif "Envy" in os.path.basename(material_path):
         Ka = (0.15, 0.03, 0.03)
         Kd = (0.65, 0.12, 0.10)
         Ks = (0.18, 0.18, 0.18)

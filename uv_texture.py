@@ -41,6 +41,60 @@ _CAP_CENTERS = np.array([
 ])
 
 
+def check_texture_uvs(seam_topology: SeamTopology, vertex_uvs: np.ndarray, vertex_uv_ids: np.ndarray, face_texture_ids: np.ndarray, b_is_circle: bool) -> None:
+    """ Check that the top, bottom, stem, and calyx rings form are continuous in the texture map.
+    The bottom circle should lie roughly within the circle formed by _CAP_CENTERS[1] and _CAP_RADIUS.
+    The top circle should lie roughly within the circle formed by _CAP_CENTERS[0] and _CAP_RADIUS.
+    The side seam should be have two continuous strips connecting the top and bottom seams.
+    Also writes out the UV texture map as a PNG image.
+    """
+    # Get the UV coordinates for the top and bottom seams by figuring out which uv vertex corresponds to the 
+    # side seam. The face texture ids can be used to determine which faces correspond to which part of the mesh.
+    top_fs = seam_topology.seams["top"].face_ids
+    bottom_fs = seam_topology.seams["bottom"].face_ids
+    middle_fs = seam_topology.seams["middle"].face_ids
+    seam_left_side_fs = seam_topology.seams["left_side_seam"].face_ids
+    seam_right_side_fs = seam_topology.seams["right_side_seam"].face_ids
+    if "calyx" in seam_topology.seams:
+        calyx_fs = seam_topology.seams["calyx"].face_ids
+    # The vertex_uv_ids for the top, bottom, and middle regions
+    all_uv_ids_top = set([f.flatten() for f in top_fs])
+    all_uv_ids_bottom = set([f.flatten() for f in bottom_fs])
+    all_uv_ids_middle = set([f.flatten() for f in middle_fs])
+    all_uv_ids_left_side = set([f.flatten() for f in seam_left_side_fs])
+    all_uv_ids_right_side = set([f.flatten() for f in seam_right_side_fs]) 
+
+    # Just the uv ids for the seams - selects the uv ids corresponding to the seam vertices within each region
+    top_seam_uv_ids = set(vertex_uv_ids[vi].flatten() for vi in seam_topology.seams["top"].vertex_ids) & all_uv_ids_top
+    bottom_seam_uv_ids = set(vertex_uv_ids[vi].flatten() for vi in seam_topology.seams["bottom"].vertex_ids) & all_uv_ids_bottom
+    middle_seam_uv_ids = set(vertex_uv_ids[vi].flatten() for vi in seam_topology.seams["middle"].vertex_ids) & all_uv_ids_middle
+    left_side_seam_uv_ids = set(vertex_uv_ids[vi].flatten() for vi in seam_topology.seams["left_side_seam"].vertex_ids) & all_uv_ids_left_side
+    right_side_seam_uv_ids = set(vertex_uv_ids[vi].flatten() for vi in seam_topology.seams["right_side_seam"].vertex_ids) & all_uv_ids_right_side
+    if "calyx" in seam_topology.seams:
+        calyx_seam_uv_ids = set(vertex_uv_ids[vi].flatten() for vi in seam_topology.seams["calyx"].vertex_ids) & all_uv_ids_bottom
+    if "stem" in seam_topology.seams:
+        stem_seam_uv_ids = set(vertex_uv_ids[vi].flatten() for vi in seam_topology.seams["stem"].vertex_ids) & all_uv_ids_top
+
+    # The top seam vertices in order around the top
+    # This converts the uv ids for each seam into the actual uv coordinates in the order of the seam vertices
+    top_seam_uvs = [vertex_uvs[top_seam_uv_ids[vid]] for vid in seam_topology.seams["top"].vertex_ids]
+    bottom_seam_uvs = [vertex_uvs[bottom_seam_uv_ids[vid]] for vid in seam_topology.seams["bottom"].vertex_ids]
+    middle_seam_uvs = [vertex_uvs[middle_seam_uv_ids[vid]] for vid in seam_topology.seams["middle"].vertex_ids]
+    left_side_seam_uvs = [vertex_uvs[left_side_seam_uv_ids[vid]] for vid in seam_topology.seams["left_side_seam"].vertex_ids]
+    right_side_seam_uvs = [vertex_uvs[right_side_seam_uv_ids[vid]] for vid in seam_topology.seams["right_side_seam"].vertex_ids]
+    if "calyx" in seam_topology.seams:
+        calyx_seam_uvs = [vertex_uvs[calyx_seam_uv_ids[vid]] for vid in seam_topology.seams["calyx"].vertex_ids]
+    else:
+        calyx_seam_uvs = []
+    if "stem" in seam_topology.seams:
+        stem_seam_uvs = [vertex_uvs[stem_seam_uv_ids[vid]] for vid in seam_topology.seams["stem"].vertex_ids]
+    else:
+        stem_seam_uvs = []
+
+    circles = [(_CAP_CENTERS[0], _CAP_RADIUS), (_CAP_CENTERS[1], _CAP_RADIUS), (_CAP_CENTERS[0], 0.1 * _CAP_RADIUS), (_CAP_CENTERS[1], 0.5 * _CAP_RADIUS)]
+    for uvs, circle in zip([top_seam_uvs, bottom_seam_uvs, stem_seam_uvs, calyx_seam_uvs], circles):
+        center, radius = circle
+
 
 def write_texture_uvs(seam_vs: list[list[list[int]]], uvs: np.ndarray, texture_path: Path):
     """Write a white 4096x4096 RGB PNG with the top seam marked in green, the bottom in blue, and the side seams in black.

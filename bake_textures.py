@@ -24,8 +24,8 @@ from pathlib import Path
 
 
 SCENE_PATH = Path(__file__).resolve().parent / "BlenderScripts" / "bake_textures_apples.blend"
-DEFAULT_CAGE_EXTRUSION = 0.2
-DEFAULT_MAX_RAY_DISTANCE = 0.45
+DEFAULT_CAGE_EXTRUSION = 0.55
+DEFAULT_MAX_RAY_DISTANCE = 0.95
 
 
 def _projection_distance(value):
@@ -147,6 +147,7 @@ def _bake_in_blender(target, source, destination, use_smart_uv,
                                 image.reload()
                                 if len(image.pixels) == 0:
                                     raise ValueError(f"Source texture could not be decoded: {image_path}")
+                            
                             source_images.append(image)
     if not source_images:
         raise ValueError(f"Source mesh has no image texture: {source}")

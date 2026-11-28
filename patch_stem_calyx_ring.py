@@ -16,8 +16,7 @@ from scipy.sparse.linalg import spsolve
 import numpy as np
 from scipy.sparse import csr_matrix
 from seam_topology import SeamInfo, SeamTopology
-from obj_geometry import get_vertex_star, create_adjacency_structure, bfs_graph, read_obj, write_obj
-from filename_fixing import write_material_file
+from obj_geometry import get_vertex_star, read_mesh_no_textures
 
 
 def _is_y_extremum(
@@ -345,6 +344,25 @@ def _color_mesh_by_vertex_type(mesh: mm.Mesh, verts_to_color: list[tuple[list[in
     save_settings = mm.SaveSettings()
     save_settings.colors = vertex_colors
     mm.saveMesh(mesh, str(output_path), save_settings)
+
+def write_mesh_with_seams(output_path: Path) -> None:
+    mesh = read_mesh_no_textures(output_path)
+    seam_file = output_path.parent / (output_path.stem + "_seam_topology.json")
+    with seam_file.open(encoding="utf-8") as stream:
+        topology = SeamTopology.from_dict(json.load(stream))
+
+    vs_to_color = []
+    cols = [[0, 0, 255, 255], [0, 255, 0, 255], [255, 0, 0, 255], [255, 0, 255, 255], [0, 0, 0, 255]]
+    cols_mm = []
+    for c in cols:
+        cols_mm.append(mm.Color(c[0], c[1], c[2], c[3]))
+        
+    for indx, seam_name in enumerate(topology.seams):
+        seam = topology.seams[seam_name]
+        vs_to_color.append((seam.vertex_ids, cols_mm[indx]))
+
+    check_path = output_path.with_name(output_path.stem + "_check.obj")
+    _color_mesh_by_vertex_type(mesh=mesh, verts_to_color=vs_to_color, output_path=check_path)
 
 
 def _add_calyx_ring(mesh: mm.Mesh, seam_topology: SeamTopology, center: np.ndarray,
